@@ -11,7 +11,7 @@ A full real-time control panel for your multi-ACE setup.  https://printer-ip/mul
 - **Saveable filament loadouts** - snapshot the current spool configuration and re-apply it on the next print with a single click
 - Dryer Settings per ACE, Slot-Picker, und multilanguage UI (EN / DE, more to come)
 
-See it in action: https://youtu.be/JauKpkZ0omY
+See it in action: https://youtu.be/9uLE1uydWmo
 
 ## What's new in multiACE 0.92b "Vibrant Fungi"
 
