@@ -482,7 +482,7 @@ max_dryer_temperature: 70    # safety cap
 extra_purge_length: 50       # extra mm after flush during toolchange
 swap_default_temp: 250       # fallback swap temp when no heater/RFID target
 
-# swap_retract_length: 900   # mid-print swap retract (default = retract_length)
+swap_retract_length: 900   # mid-print swap retract (default = retract_length)
 ```
 
 ### Per-ACE Length Overrides (optional)
