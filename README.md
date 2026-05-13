@@ -2,6 +2,16 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K610R4F9)
 
+```
+  Post-release issues (will be fixed in the next update)
+
+  If a load or extrude fails during a color swap, use the default Display Load routine before continuing — not Manual Load.
+```
+
+
+
+
+
 Hotfix 2 out - solves FA problems, Retract during swaps and BRAND NEW WEB UI
 
 ## 🌐 Brand-new Reactive Web UI
