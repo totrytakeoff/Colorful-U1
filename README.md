@@ -506,7 +506,7 @@ Lookup priority: `[ace N] load_length_Y` → `[ace N] load_length` → `[ace] lo
 ## Known Limitations
 - **Air Print Detection has to be off** - Looking into that for next hotfix.
 - **Don't turn off automatic load in display** - Throws errors.
-- **Some purge-finetuning is needed**, have to look into that.
+- **Some prime-finetuning is needed**, have to look into that.
 - **Unload before first use** - After a fresh install or when upgrading from a previous version, unload all toolheads before starting multiACE. Filament loaded from a previous installation can cause unexpected behavior since multiACE has no knowledge of the previous state. Use **ACEC__Unload_All** or unload via the display first.
 - **Unload All clears display info** - After **ACEC__Unload_All**, manually set filament types and colors are cleared. By design - reload and set filament info again after unloading.
 
