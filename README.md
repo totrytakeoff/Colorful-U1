@@ -5,7 +5,8 @@
 ```
   Post-release issues (will be fixed in the next update)
 
-  If a load or extrude fails during a color swap, use the default Display Load routine before continuing — not Manual Load.
+  If a load or extrude fails during a color swap, use the default Display Load routine before continuing 
+  — not Manual Load.
 ```
 
 
