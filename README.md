@@ -9,10 +9,6 @@
   — not Manual Load.
 ```
 
-
-
-
-
 Hotfix 2 out - solves FA problems, Retract during swaps and BRAND NEW WEB UI
 
 ## 🌐 Brand-new Reactive Web UI
