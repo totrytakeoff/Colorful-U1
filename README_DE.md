@@ -7,6 +7,8 @@
 
  Web UI funktioniert nur auf paxx Firmware
 
+ Priming Probleme werden in der nächsten Version behoben
+
  Wenn während eines Color-Swaps load oder extrude fehlschlägt, mit der Standard Display Laderoutine wiederholen.
   — nicht Manual Load.
 ```
