@@ -7,6 +7,8 @@
 
   Web UI works on paxx firmware only
 
+  Priming will be fixed in the next version
+
   If a load or extrude fails during a color swap, use the default Display Load routine before continuing 
   - not Manual Load.
 ```
