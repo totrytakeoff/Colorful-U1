@@ -29,6 +29,8 @@ https://drive.google.com/file/d/1SUnXyiJ28iv01P94k4XbRpL4bjl3HbdU/view?usp=shari
 
 **Matched to 1.3 Firmware routines**
 
+**Swap time reduced**
+
 **Priming fixed**
 
 
