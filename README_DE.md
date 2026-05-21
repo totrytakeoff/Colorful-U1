@@ -4,6 +4,9 @@
 
 ## Was ist neu in multiACE 0.97b "Kindred Allies" Hotfix 1 (prerelease)
 
+
+**Hotfix 1 repariert das Update,  USB Lärm und fügt Web Logging hinzu**
+
 **ACE Pro 2 Support - bis zu 4 Geräte oder Mischbetrieb mit ACE-Pro-Einheiten (max. 4, unabhängig vom Typ)**
 
 **PAXX-Firmware mit integriertem mUlt1ACE**
@@ -23,6 +26,7 @@ https://gist.github.com/hakimio/39c71fa7174e699c6470b7c79323b189 Danke nochmal a
 https://drive.google.com/file/d/1SUnXyiJ28iv01P94k4XbRpL4bjl3HbdU/view?usp=sharing
 
 **Online-Updates (`touch /oem/.debug` erforderlich)**
+Lädt von postapocalyptic-diy.com, für mini Updates, in config löschen um nur github für Releases zu benutzen.
 
 **Post-Processing ersetzt durch Web-Preflight - einfach unbearbeiteten G-Code über multiACE-Web hochladen**
 
