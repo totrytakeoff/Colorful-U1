@@ -2,7 +2,7 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K610R4F9)
 
-## What's new in multiACE 0.97b "Kindred Allies" (prerelease)
+## What's new in multiACE 0.97b "Kindred Allies" Hotfix 1 (prerelease)
 
 **ACE Pro 2 Support - up to 4 or mixed mode with ACE 1 Units / 4 Max no matter what type**
 
