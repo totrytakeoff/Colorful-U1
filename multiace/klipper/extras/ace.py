@@ -19,7 +19,7 @@ KNOWN_PROTOCOLS = (AceProtocolV1, AceProtocolV2)
 MULTIACE_VERSION = "0.97b"
 MULTIACE_CODENAME = "Kindred Allies"
 
-MULTIACE_BUILD_TAG = "75b1163"
+MULTIACE_BUILD_TAG = "22c65a9"
 MULTIACE_BUNDLE_SHA1 = "bcfab1f"
 
 def _load_i18n_catalog(i18n_dir, lang):
@@ -338,6 +338,8 @@ class MultiAce:
             'multiace_wiggle', os.path.join(log_dir, 'multiace_wiggle.log'))
         self._fa_log = _setup_file_logger(
             'multiace_fa', os.path.join(log_dir, 'multiace_fa.log'))
+        self._web_log = _setup_file_logger(
+            'multiace_web', os.path.join(log_dir, 'multiace_web.log'))
         self._state_debug_enabled = config.getboolean('state_debug', False)
         self._usb_debug_enabled = config.getboolean('usb_debug', True)
 
@@ -619,6 +621,7 @@ class MultiAce:
         self._wiggle_log.setLevel(gated)
 
         self._fa_log.setLevel(logging.DEBUG if self.fa_debug else logging.WARNING)
+        self._web_log.setLevel(logging.DEBUG if self.fa_debug else logging.WARNING)
 
     def _t(self, key, **params):
         """
@@ -1241,6 +1244,14 @@ class MultiAce:
     def log_always(self, msg: str, color=False):
         c_msg = self._color_message(msg) if color else msg
         self.gcode.respond_raw(c_msg)
+        # When fa_debug is on, mirror to multiace_web.log so silent
+        # early-return paths in cmd_ACE_SWITCH / cmd_ACE_LOAD_HEAD
+        # (only surface via gcode.respond_raw) are diagnosable after
+        # the fact, without spamming klippy.log or Mainsail.
+        try:
+            self._web_log.info(msg)
+        except Exception:
+            pass
 
     def log_error(self, msg):
         self.error_msg = msg
@@ -2816,6 +2827,8 @@ class MultiAce:
                                 want_type = push_type or ''
                                 want_vendor = push_vendor or ''
                                 want_color = (push_color or '').upper()
+                                if len(want_color) == 8:
+                                    want_color = want_color[:6]
                                 for head in target_heads:
                                     cur_type = ptc_types[head] if head < len(ptc_types) else ''
                                     cur_vendor = ptc_vendors[head] if head < len(ptc_vendors) else ''
@@ -6273,6 +6286,7 @@ class MultiAce:
             'active_device': self._active_device_index,
             'device_count': len(self._ace_devices),
             'head_source': self._head_source,
+            'swap_in_progress': self._swap_in_progress,
             'aces': aces,
         }
 

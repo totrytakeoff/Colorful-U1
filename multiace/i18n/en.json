@@ -50,6 +50,7 @@
       "load_all": "Load All",
       "load": "Load",
       "unload": "Unload",
+      "swap_in_progress": "An ACE swap is in progress — please wait until it completes.",
       "dryer": "Dryer",
       "duration": "Duration",
       "aces": "ACEs",

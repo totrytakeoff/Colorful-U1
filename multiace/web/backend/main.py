@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -63,7 +64,29 @@ PLUGIN_PORT_RANGE = os.environ.get("MULTIACE_PLUGIN_PORTS", "8089-8098")
 PLUGIN_DISCOVERY_TTL = float(os.environ.get("MULTIACE_PLUGIN_TTL", "30"))
 DEFAULT_FRONTEND = str((Path(__file__).resolve().parent.parent / "frontend"))
 FRONTEND_DIR = os.environ.get("MULTIACE_FRONTEND_DIR", DEFAULT_FRONTEND)
-VERSION = os.environ.get("MULTIACE_WEB_VERSION", "0.2.0")
+def _resolve_version() -> str:
+    v = os.environ.get("MULTIACE_WEB_VERSION", "")
+    if v:
+        return v
+    for path in ("/home/lava/klipper/klippy/extras/ace.py",
+                 "/home/printer_data/klipper/klippy/extras/ace.py",
+                 "/usr/share/klipper/klippy/extras/ace.py"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        m_ver = re.search(r'^MULTIACE_VERSION\s*=\s*["\']([^"\']+)["\']',
+                          head, re.MULTILINE)
+        m_tag = re.search(r'^MULTIACE_BUILD_TAG\s*=\s*["\']([^"\']+)["\']',
+                          head, re.MULTILINE)
+        if m_ver:
+            return ('%s+%s' % (m_ver.group(1), m_tag.group(1))
+                    if m_tag else m_ver.group(1))
+    return "0.2.0"
+
+
+VERSION = _resolve_version()
 
 ACE_OBJECTS = [
     "ace",
@@ -380,6 +403,7 @@ def _parse_state(status: dict) -> dict:
         "language":           language,
         "display_index_base": idx_base,
         "dryer":              ace.get("dryer_status"),
+        "swap_in_progress":   bool(ace.get("swap_in_progress", False)),
         "aces":               aces_out,
         "toolheads":          toolheads,
         "wiring":             wiring,
@@ -1336,16 +1360,31 @@ async def run_macro(req: MacroRequest) -> dict:
             parts.append(f"{k}={v}")
     script = " ".join(parts)
     try:
-
+        # Moonraker's /printer/gcode/script blocks until Klipper finishes
+        # the gcode. Returns immediately on completion regardless of
+        # timeout value; the timeout only fires if Klipper truly hangs
+        # (e.g. MCU disconnect, deadlock). ACE_SWITCH TARGET=N AUTOLOAD=1
+        # = full unload + load cycle (~14 min observed); worst-case
+        # retry storm on a stuck slot can push toward 25 min. 1800s
+        # gives margin for the worst case while still catching real
+        # hangs.
         result = await _mr_post("/printer/gcode/script",
-                                {"script": script}, timeout=600.0)
+                                {"script": script}, timeout=1800.0)
     except httpx.HTTPStatusError as e:
+        print('[/api/macro] HTTPStatusError on %r: %d %s'
+              % (script, e.response.status_code,
+                 (e.response.text or '').strip()[:300]),
+              file=sys.stderr, flush=True)
         raise HTTPException(
             status_code=e.response.status_code,
             detail=e.response.text,
         )
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+        print('[/api/macro] HTTPError on %r: %s: %s'
+              % (script, type(e).__name__, str(e) or '(no message)'),
+              file=sys.stderr, flush=True)
+        raise HTTPException(status_code=502,
+            detail='moonraker: %s' % (str(e) or type(e).__name__))
     return {"script": script, "result": result}
 
 def _extract_params(text: str) -> tuple[dict[str, str], dict[int, dict[str, str]]]:

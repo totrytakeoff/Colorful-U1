@@ -591,6 +591,16 @@ class FilamentFeed:
         return self.reactor.NEVER
 
     def _set_channel_state(self, channel, state, save=False):
+        prev_state = self.channel_state[channel]
+        if prev_state != state:
+            import traceback as _tb
+            stack = _tb.extract_stack(limit=6)[:-1]
+            caller = ' <- '.join(
+                '%s:%d:%s' % (f.filename.rsplit('/', 1)[-1], f.lineno, f.name)
+                for f in reversed(stack))
+            logging.info(
+                "[feed][state] channel[%d]: %s -> %s save=%s | %s",
+                channel, prev_state, state, save, caller)
         systime = self.reactor.monotonic()
         systime += FEED_MIN_TIME
         print_time = self.light[channel].get_mcu().estimated_print_time(systime)
@@ -820,6 +830,13 @@ class FilamentFeed:
 
                 if self.ace is not None and getattr(self.ace, '_swap_in_progress', False):
                     logging.info("[multiACE] _do_feed: blocking FILAMENT_RUNOUT during swap")
+                    return
+                if (self.channel_state[ch] == FEED_STA_LOAD_FINISH
+                        and self.runout_sensor[ch] is not None
+                        and self.runout_sensor[ch].get_status(0).get('filament_detected')):
+                    logging.info(
+                        "[feed][runout] channel[%d] flicker ignored - motion sensor back True, "
+                        "state LOAD_FINISH preserved", ch)
                     return
                 if self._port[ch].get_filament_detected() == True:
                     self._set_channel_state(ch, FEED_STA_PRELOAD_FINISH, True)
@@ -2216,9 +2233,21 @@ class FilamentFeed:
                 if filament_entangle_detect is not None:
                     filament_entangle_detect.skip_entangle_check(True)
                 self._do_feed(channel, FEED_ACT_LOAD)
+                logging.info(
+                    "[feed][load] channel[%d] _do_feed returned: state=%s error=%s error_state=%s sensor=%s",
+                    channel, self.channel_state[channel], self.channel_error[channel],
+                    self.channel_error_state[channel],
+                    self.runout_sensor[channel].get_status(0)['filament_detected']
+                        if self.runout_sensor[channel] is not None else 'no-sensor')
             except Exception as e:
                 raw_msg =  self.printer.extract_coded_message_field(str(e))
                 logging.error("[feed][load] channel[%d] auto load error: %s", channel, raw_msg)
+                logging.info(
+                    "[feed][load] channel[%d] post-exception: state=%s error=%s error_state=%s sensor=%s",
+                    channel, self.channel_state[channel], self.channel_error[channel],
+                    self.channel_error_state[channel],
+                    self.runout_sensor[channel].get_status(0)['filament_detected']
+                        if self.runout_sensor[channel] is not None else 'no-sensor')
                 if self._is_keep_raw_error_info(self.channel_error[channel]):
                     raise
             finally:
@@ -2232,6 +2261,12 @@ class FilamentFeed:
                     else:
                         self.gcode.run_script_from_command("SET_MAIN_STATE MAIN_STATE=IDLE ACTION=IDLE")
                     self.toolhead.wait_moves()
+                logging.info(
+                    "[feed][load] channel[%d] post-finally: state=%s error=%s error_state=%s sensor=%s",
+                    channel, self.channel_state[channel], self.channel_error[channel],
+                    self.channel_error_state[channel],
+                    self.runout_sensor[channel].get_status(0)['filament_detected']
+                        if self.runout_sensor[channel] is not None else 'no-sensor')
 
             if self.channel_state[channel] != FEED_STA_LOAD_FINISH or self.channel_error[channel] != FEED_OK:
                 self.gcode.respond_raw(f'{self.channel_state[channel] != FEED_STA_LOAD_FINISH} {self.channel_error[channel] != FEED_OK}')
@@ -2292,7 +2327,7 @@ class FilamentFeed:
                 ace = self.printer.lookup_object('ace', None)
                 if ace is not None and hasattr(ace, 'notify_external_load'):
                     ace.notify_external_load(
-                        module=self.name, channel=channel,
+                        module=self.module_name, channel=channel,
                         head=self.filament_ch[channel])
             except Exception as e:
                 logging.info('[feed][auto] notify_external_load err: %s' % e)
@@ -2426,7 +2461,7 @@ class FilamentFeed:
                 ace = self.printer.lookup_object('ace', None)
                 if ace is not None and hasattr(ace, 'notify_external_load'):
                     ace.notify_external_load(
-                        module=self.name, channel=channel,
+                        module=self.module_name, channel=channel,
                         head=self.filament_ch[channel])
             except Exception as e:
                 logging.info('[feed][manual] notify_external_load err: %s' % e)

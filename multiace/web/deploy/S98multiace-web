@@ -15,7 +15,11 @@ DAEMON="/usr/bin/python3"
 ARGS="-m uvicorn main:app --host 127.0.0.1 --port 7126 --log-level warning"
 PIDFILE="/tmp/multiace_web.pid"
 LOGFILE="/home/lava/printer_data/logs/multiace_web.log"
-USER="lava"
+# Service runs as root: Snapmaker U1 ships without sudo, but the
+# update endpoint has to cp into root-owned dirs (klipper extras,
+# /etc/init.d). Closed appliance, attack surface is bound to 127.0.0.1
+# behind nginx auth - net risk is minor compared to a broken updater.
+USER="root"
 
 export MOONRAKER_URL="${MOONRAKER_URL:-http://127.0.0.1:7125}"
 export MULTIACE_CFG_PATH="${MULTIACE_CFG_PATH:-/home/lava/printer_data/config/extended/ace.cfg}"
@@ -45,12 +49,12 @@ start() {
         sleep 1
         n=$((n + 1))
     done
-    # busybox start-stop-daemon -c USER does setuid only, not a login -
-    # HOME stays as root's, so Python can't find lava's --user site
-    # (where uvicorn/fastapi/httpx live). Set HOME/USER/PATH explicitly.
+    # Service runs as root (see USER= above) but Python deps were
+    # pip-installed under lava's --user site. Point HOME at /home/lava
+    # so /home/lava/.local/lib/python3.11/site-packages is discovered.
     HOME_LAVA="/home/lava"
     PATH_LAVA="${HOME_LAVA}/.local/bin:/usr/bin:/bin"
-    start-stop-daemon -S -b -m -p "$PIDFILE" -c "$USER" \
+    start-stop-daemon -S -b -m -p "$PIDFILE" \
         -x /bin/sh -- -c "
             export HOME='$HOME_LAVA' USER='$USER' PATH='$PATH_LAVA';
             cd '$DAEMON_DIR' || exit 1;

@@ -176,6 +176,22 @@ cmd_apply() {
         esac
         shift
     done
+    if [ "$(id -u)" -ne 0 ]; then
+        SUDO_BIN=""
+        for c in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo; do
+            if [ -x "$c" ]; then SUDO_BIN="$c"; break; fi
+        done
+        if [ -z "$SUDO_BIN" ] && command -v sudo >/dev/null 2>&1; then
+            SUDO_BIN="sudo"
+        fi
+        if [ -n "$SUDO_BIN" ]; then
+            echo "STATUS: re-execing as root via $SUDO_BIN (klipper extras dir is root-owned)"
+            exec "$SUDO_BIN" -n "$0" apply ${FORCE:+--force} ${KEEP_WEB:+--keep-web} $INSTALL_WEB_FLAG
+        else
+            echo "ERROR: must run as root - klipper extras dir is not writable as $(id -un); sudo not found" >&2
+            return 1
+        fi
+    fi
     CUR="$(current_version || true)"
     resolve_latest || return 1
     cur_norm="$(normalize_version "$CUR")"

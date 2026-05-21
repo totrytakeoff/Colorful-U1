@@ -108,6 +108,7 @@ createApp({
       active_device: null, device_count: 0,
       mode: "normal",
       dryer: null,
+      swap_in_progress: false,
       aces: [], toolheads: [], wiring: [],
       save_variables: {},
     });
@@ -158,6 +159,7 @@ createApp({
       state.device_count  = s.device_count ?? 0;
       state.mode          = s.mode || "normal";
       state.dryer         = s.dryer ?? null;
+      state.swap_in_progress = !!s.swap_in_progress;
       state.aces          = Array.isArray(s.aces) ? s.aces : [];
       state.toolheads     = Array.isArray(s.toolheads) ? s.toolheads : [];
       state.wiring        = Array.isArray(s.wiring) ? s.wiring : [];
@@ -243,6 +245,13 @@ createApp({
       if (cmdQueueRunning) return;
       if (cmdPaused.value) return;
       if (cmdQueue.value.length === 0) return;
+      // Klipper processes gcode serially: a Load/Unload swap holds
+      // its slot for 5-15 min. POSTing /api/macro while
+      // state.swap_in_progress would just block waiting for the
+      // current swap and eventually hit httpx's ReadTimeout. Let
+      // queued items wait visible in the queue; a watcher on
+      // state.swap_in_progress re-invokes us when Klipper clears.
+      if (state.swap_in_progress) return;
       const arr = cmdQueue.value;
       let target = null;
       for (let i = arr.length - 1; i >= 0; i--) {
@@ -423,6 +432,11 @@ createApp({
         requestAnimationFrame(recomputeWiring);
       });
     }
+    // Resume the queue automatically the moment Klipper's swap flag
+    // flips back to false. Without this the queue would only advance
+    // on the next user action.
+    watch(() => state.swap_in_progress, (v) => { if (!v) _scheduleAdvance(); });
+
     watch(() => state.wiring, scheduleWiringRecompute, {deep: true});
     watch(() => state.aces.length, scheduleWiringRecompute);
     watch(() => state.toolheads.length, scheduleWiringRecompute);

@@ -50,6 +50,7 @@
       "load_all": "Alle laden",
       "load": "Laden",
       "unload": "Entladen",
+      "swap_in_progress": "ACE-Wechsel läuft — bitte warten bis abgeschlossen.",
       "dryer": "Trockner",
       "duration": "Dauer",
       "aces": "ACEs",
