@@ -2,7 +2,7 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K610R4F9)
 
-## Was ist neu in multiACE 0.97b "Kindred Allies" (prerelease)
+## Was ist neu in multiACE 0.97b "Kindred Allies" Hotfix 1 (prerelease)
 
 **ACE Pro 2 Support - bis zu 4 Geräte oder Mischbetrieb mit ACE-Pro-Einheiten (max. 4, unabhängig vom Typ)**
 
