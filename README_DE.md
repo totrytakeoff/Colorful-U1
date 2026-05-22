@@ -7,7 +7,9 @@
 
 **- Hotfix 1 repariert das Update,  USB Lärm und fügt Web Logging hinzu**
 
-**ACE Pro 2 Support - bis zu 4 Geräte oder Mischbetrieb mit ACE-Pro-Einheiten (max. 4, unabhängig vom Typ)**
+## ACE Pro 2 Support 
+
+**- bis zu 4 Geräte oder Mischbetrieb mit ACE-Pro-Einheiten (max. 4, unabhängig vom Typ)**
 
 ACE Pro 2 Unit muss auf Firmware: 1.1.31 sein, ein Update ist nötig.
 
@@ -19,7 +21,7 @@ https://drive.google.com/file/d/1SUnXyiJ28iv01P94k4XbRpL4bjl3HbdU/view?usp=shari
 
 Anleitung für das Kabel in der Hardware Sektion dieser readme.
 
-**PAXX-Firmware mit integriertem mUlt1ACE**
+## PAXX-Firmware mit integriertem mUlt1ACE
 
 Bin Files & Manuals @ 
 
