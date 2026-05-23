@@ -146,7 +146,7 @@ Dafür gibt es die Fluidd-Makros **ACEA__Switch_0..3**.
 ## Voraussetzungen
 
 - Snapmaker U1
-- Snapmaker- oder PAXX-Firmware (getestet mit Snapmaker  1.3 und PAXX 12-16, 12-17)
+- Snapmaker- oder PAXX-Firmware (getestet mit Snapmaker  1.3 und PAXX 12-16)
 - 1-4 Anycubic ACE Pro (V1) oder ACE 2 (V2) über USB - Mischbetrieb V1/V2 unterstützt (mit 3 und 2/2 getestet)
 - SSH-Zugang zum Drucker
 - Fluidd-Weboberfläche
