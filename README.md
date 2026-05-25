@@ -3,7 +3,7 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K610R4F9)
 
-[![Guides & Downloads](visit-button.png)](https://postapocalyptic-diy.com/multiace/)
+[![Guides & Downloads](visitbutton.png)](https://postapocalyptic-diy.com/multiace/)
 
 ## What's new in multiACE 0.97b "Kindred Allies" Hotfix 1 (prerelease)
 
