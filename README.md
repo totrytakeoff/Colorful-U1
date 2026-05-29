@@ -10,9 +10,9 @@
 
 **-  SSH Install version throws 0003 errors during homing when flow calibration and bedmesh are active, use bin version, Hotfix 2 will fix this**
 
-**- Slow retract speeds will stop Colorswaps, Hotfix 2 **
+**- Slow retract speeds will stop Colorswaps, Hotfix 2**
 
-**- Turning on Heater during print can raise 0003 errors, do it before starting a print, patched in Hotfix 2 **
+**- Turning on Heater during print can raise 0003 errors, do it before starting a print, patched in Hotfix 2**
 
 
 ## What's new in multiACE 0.97b "Kindred Allies" Hotfix 1 (prerelease)
