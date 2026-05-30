@@ -8,6 +8,8 @@
 
 ## Post releaase issues
 
+**Underextrusion on some files printed with the ACE 2, will be adressed in Hotfix 2**
+
 **-  SSH Install version throws 0003 errors during homing when flow calibration and bedmesh are active, use bin version, Hotfix 2 will fix this**
 
 **- Slow retract speeds can stop Colorswaps, Hotfix 2**
