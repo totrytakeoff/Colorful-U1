@@ -19,7 +19,7 @@ KNOWN_PROTOCOLS = (AceProtocolV1, AceProtocolV2)
 MULTIACE_VERSION = "0.97.2b"
 MULTIACE_CODENAME = "Kindred Allies"
 
-MULTIACE_BUILD_TAG = "4ac2ff2"
+MULTIACE_BUILD_TAG = "6335ce7"
 MULTIACE_BUNDLE_SHA1 = "d27478b"
 
 def _load_i18n_catalog(i18n_dir, lang):
@@ -1422,7 +1422,7 @@ class MultiAce:
                 '[multiACE] Swap PAUSE: T-switch back to %s failed: %s'
                 % (orig_ext_name, e))
 
-    def _pause_for_recovery(self, phase, display_msg, detail_msg, recovery_steps):
+    def _pause_for_recovery(self, gcmd, phase, display_msg, detail_msg, recovery_steps):
 
         short = display_msg[:20]
 
@@ -1453,14 +1453,17 @@ class MultiAce:
             'steps': recovery_steps,
         })
 
-        try:
-            short_msg = ('[multiACE] %s: %s' % (phase, detail_msg)).replace('"', "'")
-            self.gcode.run_script_from_command(
-                'RAISE_EXCEPTION ID=522 INDEX=0 CODE=0 '
-                'MSG="%s" LEVEL=2' % short_msg[:200])
-        except Exception:
-            pass
-        self.gcode.run_script_from_command('PAUSE')
+        short_msg = ('[multiACE] %s: %s' % (phase, detail_msg)).replace('"', "'")
+        active = self.toolhead.get_extruder().get_name() if self.toolhead else 'extruder'
+        idx = 0 if active == 'extruder' else int(active.replace('extruder', '') or 0)
+        raise gcmd.error(
+            message=short_msg[:200],
+            action='pause',
+            id=525,
+            index=idx,
+            code=0,
+            oneshot=1,
+            level=2)
 
     def save_variable(self, variable, value, write=False):
         self.save_variables.allVariables[variable] = value
@@ -4840,6 +4843,7 @@ class MultiAce:
                 'context': self._fa_context,
             })
             self._pause_for_recovery(
+                gcmd,
                 phase='swap slot_empty (pre-unload)',
                 display_msg='A%dS%d leer' % (ace_index, slot),
                 detail_msg=('ACE %d Slot %d leer - siehe Fluidd log fuer Recovery'
@@ -4967,16 +4971,20 @@ class MultiAce:
                     swap_status = 'unload_failed'
                     self._swap_back_to_orig_for_pause(
                         switched_head, orig_ext_name)
+                    self._restore_pos_for_pause(saved_pos)
+                    _uA, _uS = self._disp(_src_ace), self._disp(_src_slot)
+                    _lA, _lS = self._disp(ace_index), self._disp(slot)
                     self._pause_for_recovery(
+                        gcmd,
                         phase='swap unload_failed',
-                        display_msg='Unload H%d jam' % head,
-                        detail_msg=('Head %d unload jam - siehe Fluidd log fuer Recovery'
-                                    % head),
+                        display_msg='Jam U:A%dS%d L:A%dS%d' % (_uA, _uS, _lA, _lS),
+                        detail_msg=('Head %d unload jam. Unload A%dS%d, load A%dS%d, '
+                                    'then resume (see fluidd log)'
+                                    % (head, _uA, _uS, _lA, _lS)),
                         recovery_steps=[
-                            'ACE_UNLOAD_HEAD HEAD=%d           (try unload again)' % head,
-                            'ACE_SWITCH TARGET=%d             (switch to target ACE)' % ace_index,
-                            'ACE_LOAD_HEAD HEAD=%d            (load target filament)' % head,
-                            'RESUME                           (continue the print)',
+                            'unload A%dS%d' % (_uA, _uS),
+                            'load A%dS%d' % (_lA, _lS),
+                            'resume',
                         ],
                     )
                     return
@@ -4994,6 +5002,7 @@ class MultiAce:
                     switched_head, orig_ext_name)
                 self._restore_pos_for_pause(saved_pos)
                 self._pause_for_recovery(
+                    gcmd,
                     phase='swap slot_empty (post-unload)',
                     display_msg='A%dS%d leer' % (ace_index, slot),
                     detail_msg=('ACE %d Slot %d leer (post-unload) - siehe Fluidd log'
@@ -5029,6 +5038,7 @@ class MultiAce:
                     switched_head, orig_ext_name)
                 self._restore_pos_for_pause(saved_pos)
                 self._pause_for_recovery(
+                    gcmd,
                     phase='swap load_failed',
                     display_msg='Load H%d slip' % head,
                     detail_msg=('Head %d Load slip - siehe Fluidd log fuer Recovery'
