@@ -8,15 +8,15 @@
 
 ## What's new in multiACE 0.97b "Kindred Allies" Hotfix 2 (prerelease)
 
-**- Underextrusion on some files printed with the ACE 2, solved**
+**- Under-extrusion on some files printed with the ACE 2 - solved**
 
-**-  SSH Install version throws 0003 errors during homing when flow calibration and bedmesh are active, use bin version, masked via TRSYNC, still investigating**
+**-  SSH-install version throws 0003 errors during homing when flow calibration and bed mesh are active. Use the baked (bin) version; masked via TRSYNC on the SSH install; still under investigation.**
 
-**- Slow retract speeds can stop Colorswaps, solved**
+**- Slow retract speeds could stall color swaps - solved**
 
-**- Turning on Heater during print can raise 0003 errors, do it before starting a print, solved**
+**- Turning on a heater during a print could trigger 0003 errors - set it before starting the print; solved.**
 
-**- 1 Recovery path could lead to head ramming, fixed**
+**- One recovery path could lead to head ramming - fixed.**
 
 ## What's new in multiACE 0.97b "Kindred Allies" Hotfix 1 (prerelease)
 
