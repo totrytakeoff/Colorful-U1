@@ -10,7 +10,7 @@
 
 **- Underextrusion on some files printed with the ACE 2, solved**
 
-**-  SSH Install version throws 0003 errors during homing when flow calibration and bedmesh are active, use bin version, fixed through TRSYNC, still investigating**
+**-  SSH Install version throws 0003 errors during homing when flow calibration and bedmesh are active, use bin version, masked via TRSYNC, still investigating**
 
 **- Slow retract speeds can stop Colorswaps, solved**
 
