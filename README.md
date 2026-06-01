@@ -8,6 +8,8 @@
 
 ## What's new in multiACE 0.97b "Kindred Allies" Hotfix 2 (prerelease)
 
+**- Material sensitive Web-Preflight**
+
 **- Under-extrusion on some files printed with the ACE 2 - solved**
 
 **-  SSH-install version throws 0003 errors during homing when flow calibration and bed mesh are active. Use the baked (bin) version; masked via TRSYNC on the SSH install; still under investigation.**
