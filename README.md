@@ -8,7 +8,6 @@
 ## Post-release notes
 
 - Paxx 12-17 version available
-- If you downloaded 0.97.2 bin from my homepage, please redownload, 0003 patch missing
 
 ## What's new in multiACE 0.97b "Kindred Allies" Hotfix 2 (prerelease)
 
