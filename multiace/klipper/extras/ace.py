@@ -118,6 +118,8 @@ class MultiAce:
         self._ace_present = set()
 
         self.ace_device_count = config.getint('ace_device_count', 1, minval=1, maxval=8)
+        legacy_route_mode = config.get('ace_route_mode', None)
+        legacy_primary_head = config.get('ace_primary_head', None)
         self._ace_route_error = None
         self._head_modes_explicit = False
         self._head_modes = []
@@ -149,12 +151,17 @@ class MultiAce:
                 self._ace_route_mode = 'multi_head'
                 self._ace_primary_head = target_heads[0]
         else:
-            self._ace_route_mode = config.getchoice(
-                'ace_route_mode',
-                {'standard': 'standard', 'single_head': 'single_head'},
-                'standard')
-            self._ace_primary_head = config.getint(
-                'ace_primary_head', 0, minval=0, maxval=3)
+            self._ace_route_mode = (
+                legacy_route_mode
+                if legacy_route_mode in ('standard', 'single_head')
+                else 'standard')
+            try:
+                self._ace_primary_head = int(
+                    legacy_primary_head
+                    if legacy_primary_head is not None else 0)
+            except (TypeError, ValueError):
+                self._ace_primary_head = 0
+            self._ace_primary_head = max(0, min(3, self._ace_primary_head))
             if self._ace_route_mode == 'single_head':
                 self._head_modes = [
                     'ace' if h == self._ace_primary_head else 'native'
