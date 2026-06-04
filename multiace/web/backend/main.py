@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -1573,6 +1574,15 @@ _MACRO_BUCKETS = (
     ("status", lambda m: m.startswith("ACEG__")),
 )
 
+_macro_jobs: dict[str, dict[str, Any]] = {}
+_MACRO_JOB_TTL = 3600.0
+
+def _prune_macro_jobs() -> None:
+    cutoff = time.time() - _MACRO_JOB_TTL
+    for job_id, job in list(_macro_jobs.items()):
+        if job.get("updated", job.get("created", 0.0)) < cutoff:
+            _macro_jobs.pop(job_id, None)
+
 @app.get("/api/macros")
 async def list_macros() -> dict:
     """
@@ -1627,6 +1637,68 @@ async def run_macro_batch(req: MacroBatchRequest) -> dict:
     asyncio.create_task(_dispatch())
     _trace.info("macro-batch: dispatched %d commands to Moonraker", len(lines))
     return {"ok": True, "count": len(lines), "script_lines": lines}
+
+@app.post("/api/macro-async", status_code=202)
+async def run_macro_async(req: MacroRequest) -> dict:
+    _validate_macro_request(req.name, req.args)
+    parts = [req.name]
+    if req.args:
+        for k, v in req.args.items():
+            parts.append(f"{k}={v}")
+    script = " ".join(parts)
+    _prune_macro_jobs()
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    _macro_jobs[job_id] = {
+        "id": job_id,
+        "script": script,
+        "status": "queued",
+        "error": None,
+        "created": now,
+        "updated": now,
+    }
+
+    async def _dispatch():
+        job = _macro_jobs.get(job_id)
+        if job is not None:
+            job["status"] = "running"
+            job["updated"] = time.time()
+        try:
+            result = await _mr_post("/printer/gcode/script",
+                                    {"script": script}, timeout=None)
+            job = _macro_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "done"
+                job["result"] = result
+                job["updated"] = time.time()
+        except httpx.HTTPStatusError as e:
+            detail = e.response.text or str(e)
+            job = _macro_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "error"
+                job["error"] = detail
+                job["updated"] = time.time()
+            _trace.warning("macro-async dispatch failed for %r: %s",
+                           script, detail[:300])
+        except Exception as e:
+            job = _macro_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "error"
+                job["error"] = str(e) or type(e).__name__
+                job["updated"] = time.time()
+            _trace.warning("macro-async dispatch failed for %r: %s", script, e)
+
+    asyncio.create_task(_dispatch())
+    _trace.info("macro-async: dispatched %s job=%s", script, job_id)
+    return {"ok": True, "script": script, "job_id": job_id}
+
+@app.get("/api/macro-jobs/{job_id}")
+async def get_macro_job(job_id: str) -> dict:
+    _prune_macro_jobs()
+    job = _macro_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="macro job not found")
+    return job
 
 @app.post("/api/macro")
 async def run_macro(req: MacroRequest) -> dict:

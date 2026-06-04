@@ -211,7 +211,8 @@
     "queue": {
       "send_all_tooltip": "将所有排队命令发送到打印机（之后可以关闭界面）",
       "send_all_done": "已向打印机发送 {count} 条命令",
-      "send_all_failed": "发送失败"
+      "send_all_failed": "发送失败",
+      "long_timeout": "命令执行超过 20 分钟仍未完成"
     }
   }
 }

@@ -213,7 +213,8 @@
     "queue": {
       "send_all_tooltip": "Send all queued commands to the printer (UI can be closed afterwards)",
       "send_all_done": "{count} commands sent to the printer",
-      "send_all_failed": "Send failed"
+      "send_all_failed": "Send failed",
+      "long_timeout": "Command still has not finished after 20 minutes"
     }
   },
   "msg": {

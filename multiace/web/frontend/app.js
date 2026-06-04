@@ -173,6 +173,7 @@ createApp({
       for (const a of state.aces) {
         if (!dryerCfg[a.idx]) dryerCfg[a.idx] = {temp: 50, duration: 240};
       }
+      _checkAsyncQueueItems();
     }
     async function reloadState() {
       try {
@@ -202,6 +203,14 @@ createApp({
     const visibleQueue = computed(() => cmdQueue.value.filter(it => !it.silent));
     const cmdPaused = ref(false);
     let cmdQueueRunning = false;
+    const ASYNC_QUEUE_MACROS = new Set([
+      'ACE_LOAD_HEAD',
+      'ACE_SWAP_HEAD',
+      'ACE_UNLOAD_HEAD',
+      'ACE_UNLOAD_ALL_HEADS',
+    ]);
+    const ASYNC_QUEUE_MIN_SETTLE_MS = 3000;
+    const ASYNC_QUEUE_TIMEOUT_MS = 20 * 60 * 1000;
     function _newId() {
       return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     }
@@ -243,6 +252,16 @@ createApp({
           status: 'queued',
           error: '',
           silent: !!(opts && opts.silent),
+          async: false,
+          submitted: false,
+          startedAt: 0,
+          submittedAt: 0,
+          submittedStateSeen: false,
+          sawBusy: false,
+          jobId: '',
+          jobStatus: '',
+          jobError: '',
+          jobLastPoll: 0,
           _resolve: resolve,
         });
         cmdQueue.value.unshift(it);
@@ -267,6 +286,7 @@ createApp({
       if (cmdQueueRunning) return;
       if (cmdPaused.value) return;
       if (cmdQueue.value.length === 0) return;
+      if (cmdQueue.value.some(it => it.status === 'running')) return;
       // Klipper processes gcode serially: a Load/Unload swap holds
       // its slot for 5-15 min. POSTing /api/macro while
       // state.swap_in_progress would just block waiting for the
@@ -295,13 +315,16 @@ createApp({
     async function _runItem(it) {
       cmdQueueRunning = true;
       it.status = 'running';
+      it.startedAt = Date.now();
+      let deferResolve = false;
       const parts = [it.cmd];
       for (const [k, v] of Object.entries(it.args || {})) {
         parts.push(`${k}=${v}`);
       }
       const script = parts.join(' ');
       try {
-        const r = await fetch(`${API}/macro`, {
+        const asyncMacro = ASYNC_QUEUE_MACROS.has(it.cmd);
+        const r = await fetch(`${API}/${asyncMacro ? 'macro-async' : 'macro'}`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({name: it.cmd, args: it.args || {}}),
@@ -312,6 +335,20 @@ createApp({
           it.error = String(j.detail || `HTTP ${r.status}`);
           it.silent = false;
           cmdPaused.value = true;
+        } else if (asyncMacro) {
+          it.async = true;
+          it.submitted = true;
+          it.jobId = j.job_id || '';
+          it.jobStatus = '';
+          it.jobError = '';
+          it.jobLastPoll = 0;
+          it.submittedAt = Date.now();
+          it.submittedStateSeen = false;
+          it.sawBusy = false;
+          deferResolve = true;
+          cmdQueueRunning = false;
+          _checkAsyncQueueItems();
+          return;
         } else {
           const idx = cmdQueue.value.indexOf(it);
           if (idx >= 0) cmdQueue.value.splice(idx, 1);
@@ -324,9 +361,118 @@ createApp({
         cmdPaused.value = true;
       } finally {
         cmdQueueRunning = false;
-        if (it._resolve) it._resolve(it.status !== 'error');
+        if (!deferResolve && it._resolve) {
+          it._resolve(it.status !== 'error');
+          it._resolve = null;
+        }
       }
       _scheduleAdvance();
+    }
+    function _queueDone(it) {
+      const idx = cmdQueue.value.indexOf(it);
+      if (idx >= 0) cmdQueue.value.splice(idx, 1);
+      it.status = 'done';
+      if (it._resolve) {
+        it._resolve(true);
+        it._resolve = null;
+      }
+    }
+    function _queueError(it, msg) {
+      it.status = 'error';
+      it.error = String(msg || 'command failed');
+      it.silent = false;
+      cmdPaused.value = true;
+      if (it._resolve) {
+        it._resolve(false);
+        it._resolve = null;
+      }
+    }
+    function _toolheadByIdx(idx) {
+      return state.toolheads.find(t => Number(t.idx) === Number(idx));
+    }
+    function _toolheadBusy(th) {
+      return !!_phaseFor(th && th.channel_state);
+    }
+    function _asyncItemHeads(it) {
+      const a = it.args || {};
+      if ('HEAD' in a) {
+        const th = _toolheadByIdx(a.HEAD);
+        return th ? [th] : [];
+      }
+      return state.toolheads.slice();
+    }
+    function _asyncItemDone(it) {
+      const a = it.args || {};
+      const settleMs = Date.now() - (it.submittedAt || it.startedAt || Date.now());
+      if (settleMs < ASYNC_QUEUE_MIN_SETTLE_MS) return false;
+      if (!it.sawBusy && it.jobStatus !== 'done') return false;
+      if (it.cmd === 'ACE_LOAD_HEAD' || it.cmd === 'ACE_SWAP_HEAD') {
+        const th = _toolheadByIdx(a.HEAD);
+        return !!(th
+          && th.head_source_known
+          && Number(th.ace) === Number(a.ACE)
+          && Number(th.slot) === Number(a.SLOT)
+          && !_toolheadBusy(th));
+      }
+      if (it.cmd === 'ACE_UNLOAD_HEAD') {
+        const th = _toolheadByIdx(a.HEAD);
+        return !!(th && !th.head_source_known && !_toolheadBusy(th));
+      }
+      if (it.cmd === 'ACE_UNLOAD_ALL_HEADS') {
+        return state.toolheads.every(th => !th.head_source_known && !_toolheadBusy(th));
+      }
+      return false;
+    }
+    function _asyncItemError(it) {
+      if (it.jobStatus === 'error') {
+        return it.jobError || 'command failed';
+      }
+      for (const th of _asyncItemHeads(it)) {
+        const err = th && th.channel_error;
+        if (err && err !== 'ok') return `T${dispIdx(th.idx)}: ${err}`;
+      }
+      if (Date.now() - (it.startedAt || Date.now()) > ASYNC_QUEUE_TIMEOUT_MS) {
+        return t("ui.queue.long_timeout");
+      }
+      return '';
+    }
+    async function _pollAsyncJob(it) {
+      if (!it.jobId) return;
+      const now = Date.now();
+      if (now - (it.jobLastPoll || 0) < 1500) return;
+      it.jobLastPoll = now;
+      try {
+        const r = await fetch(`${API}/macro-jobs/${encodeURIComponent(it.jobId)}`);
+        if (!r.ok) return;
+        const j = await r.json();
+        it.jobStatus = j.status || '';
+        it.jobError = j.error || '';
+      } catch (_) {}
+    }
+    function _checkAsyncQueueItems() {
+      let changed = false;
+      for (const it of [...cmdQueue.value]) {
+        if (it.status !== 'running' || !it.async || !it.submitted) continue;
+        _pollAsyncJob(it);
+        if (!it.submittedStateSeen) {
+          it.submittedStateSeen = true;
+          continue;
+        }
+        if (_asyncItemHeads(it).some(th => _toolheadBusy(th))) {
+          it.sawBusy = true;
+        }
+        const err = _asyncItemError(it);
+        if (err) {
+          _queueError(it, err);
+          changed = true;
+          continue;
+        }
+        if (_asyncItemDone(it)) {
+          _queueDone(it);
+          changed = true;
+        }
+      }
+      if (changed) _scheduleAdvance();
     }
     function run(name, args) { return enqueue(name, args); }
     function clearAllErrors() {

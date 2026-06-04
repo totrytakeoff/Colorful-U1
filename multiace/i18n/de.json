@@ -213,7 +213,8 @@
     "queue": {
       "send_all_tooltip": "Alle Queue-Befehle an den Drucker senden (UI darf danach geschlossen werden)",
       "send_all_done": "{count} Befehle an den Drucker gesendet",
-      "send_all_failed": "Senden fehlgeschlagen"
+      "send_all_failed": "Senden fehlgeschlagen",
+      "long_timeout": "Befehl ist nach 20 Minuten noch nicht abgeschlossen"
     }
   },
   "msg": {
