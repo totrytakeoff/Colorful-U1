@@ -3,18 +3,71 @@ import sys, re, os, json
 import urllib.request, urllib.error
 from collections import defaultdict
 
-def rewrite(gcode):
+def _normalize_ace_targets(ace_targets=None):
+    """Return {ace_index: physical_head}. Missing entries deliberately
+    fall back to the legacy head=slot mapping so standalone CLI use
+    remains usable when no printer route is available."""
+    out = {}
+    if not ace_targets:
+        return out
+    if isinstance(ace_targets, str):
+        try:
+            ace_targets = json.loads(ace_targets)
+        except ValueError:
+            return out
+    if not isinstance(ace_targets, dict):
+        return out
+    for k, v in ace_targets.items():
+        if v is None or v == '':
+            continue
+        try:
+            ace = int(k)
+            head = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= ace <= 15 and 0 <= head <= 3:
+            out[ace] = head
+    return out
+
+def _route_virtual_tool(t_index, ace_targets=None, slots_per_ace=4):
+    ace_targets = _normalize_ace_targets(ace_targets)
+    ace = int(t_index) // slots_per_ace
+    slot = int(t_index) % slots_per_ace
+    head = ace_targets.get(ace, slot)
+    return head, ace, slot
+
+def _route_ace_targets_from_slots(live_slots):
+    targets = {}
+    for s in live_slots or []:
+        try:
+            ace = int(s.get('ace'))
+            head = s.get('target_head')
+            if head is None:
+                continue
+            targets[ace] = int(head)
+        except (TypeError, ValueError):
+            continue
+    return targets
+
+def _initial_marker(head, ace, slot):
+    return '; multiACE initial-load HEAD=%d ACE=%d SLOT=%d' % (
+        head, ace, slot)
+
+def rewrite(gcode, ace_targets=None):
+    ace_targets = _normalize_ace_targets(ace_targets)
 
     def _fix_m104(m):
-        return re.sub(r'T([4-9]|1[0-5])',
-                      lambda t: 'T' + str(int(t.group(1)) % 4),
+        return re.sub(r'T(1[0-5]|[0-9])',
+                      lambda t: 'T%d' % _route_virtual_tool(
+                          int(t.group(1)), ace_targets)[0],
                       m.group(0))
     gcode = re.sub(r'^M10[49][^\n]*',
                    _fix_m104, gcode, flags=re.MULTILINE)
 
     gcode = re.sub(
-        r'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=([4-9]|1[0-5])\n?',
-        '',
+        r'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=(1[0-5]|[0-9])',
+        lambda m: 'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=%d'
+        % _route_virtual_tool(int(m.group(1)), ace_targets)[0],
         gcode)
 
     split_re = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+',
@@ -25,21 +78,23 @@ def rewrite(gcode):
     else:
         pre, body = gcode[:m.start()], gcode[m.start():]
 
-    pre = re.sub(r'^T([4-9]|1[0-5])\s*$',
-                 lambda x: 'T' + str(int(x.group(1)) % 4),
-                 pre, flags=re.MULTILINE)
+    def _expand_initial(m):
+        head, ace, slot = _route_virtual_tool(int(m.group(1)), ace_targets)
+        return 'T%d\n%s' % (head, _initial_marker(head, ace, slot))
+
+    pre = re.sub(r'^T(1[0-5]|[0-9])\s*$',
+                 _expand_initial, pre, flags=re.MULTILINE)
 
     def _expand_swap(m):
         n = int(m.group(1))
-        head = n % 4
-        ace = n // 4
+        head, ace, slot = _route_virtual_tool(n, ace_targets)
         return 'T%d\nACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d' % (
-            head, head, ace, head)
+            head, head, ace, slot)
 
-    body = re.sub(r'^T([4-9]|1[0-5])\s*$',
+    body = re.sub(r'^T(1[0-5]|[0-9])\s*$',
                   _expand_swap, body, flags=re.MULTILINE)
 
-    head_loaded = {0: (0, 0), 1: (0, 1), 2: (0, 2), 3: (0, 3)}
+    head_loaded = {}
     filtered_lines = []
     lines = body.splitlines()
     i = 0
@@ -50,25 +105,7 @@ def rewrite(gcode):
 
         m_t = re.match(r'^T([0-3])\s*$', line)
         if m_t:
-            head = int(m_t.group(1))
-
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines) and lines[j].startswith('ACE_SWAP_HEAD'):
-
-                filtered_lines.append(line)
-            else:
-
-                initial_key = (0, head)
-                if head_loaded.get(head) != initial_key:
-                    filtered_lines.append(line)
-                    filtered_lines.append(
-                        'ACE_SWAP_HEAD HEAD=%d ACE=0 SLOT=%d' % (head, head))
-                    swapbacks += 1
-                    head_loaded[head] = initial_key
-                else:
-                    filtered_lines.append(line)
+            filtered_lines.append(line)
             i += 1
             continue
         m_s = re.match(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$', line)
@@ -152,6 +189,7 @@ def lookup_live_slots(host, port=80, path='/multiace/api/state', timeout=5.0):
                 out.append({
                     'ace': ace_idx,
                     'slot': slot.get('idx'),
+                    'target_head': slot.get('target_head'),
                     'material': material,
                     'color': color,
                 })
@@ -1462,10 +1500,9 @@ def inject_auto_load(gcode):
     (ACE, slot) hit the 'already on' short-circuit (no-op). Mismatched
     loaded heads get unloaded + reloaded.
 
-    Initial mapping per head is discovered from the first ACE_SWAP_HEAD
-    line for that head. Heads that appear only as bare T<n> get the
-    default mapping (ACE 0, slot=head) - that's the state the rewrite
-    assumes for the initial loadout.
+    Initial mapping per head is discovered only from explicit
+    ACE_SWAP_HEAD HEAD/ACE/SLOT commands. Bare T<n> commands are not
+    enough to infer the ACE slot and are left alone.
 
     Returns (gcode_with_injection, count_of_heads_loaded).
     """
@@ -1510,16 +1547,23 @@ def inject_auto_load(gcode):
                 inject_idx = idx
                 break
     initial = {}
-    used_heads = set()
 
     body_start = inject_idx if inject_idx is not None else 0
+    initial_marker_re = re.compile(
+        r'^;\s*multiACE initial-load HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
+    if inject_idx is not None:
+        for line in lines[:body_start]:
+            m = initial_marker_re.match(line.strip())
+            if not m:
+                continue
+            initial[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+
     for i in range(body_start, len(lines)):
         line = lines[i]
         ls = line.strip()
         m_t = re.match(r'^T([0-3])\s*$', ls)
         if m_t:
             head = int(m_t.group(1))
-            used_heads.add(head)
             if head not in initial:
 
                 j = i + 1
@@ -1532,19 +1576,13 @@ def inject_auto_load(gcode):
                         lines[j].strip())
                 if ace_m and int(ace_m.group(1)) == head:
                     initial[head] = (int(ace_m.group(2)), int(ace_m.group(3)))
-                else:
-                    initial[head] = (0, head)
             continue
         m = re.match(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$', ls)
         if m:
             head = int(m.group(1))
-            used_heads.add(head)
             if head not in initial:
                 initial[head] = (int(m.group(2)), int(m.group(3)))
 
-    for head in used_heads:
-        if head not in initial:
-            initial[head] = (0, head)
     if inject_idx is None or not initial:
         return gcode, 0
     inject = ['', '; multiACE auto-load: load initial filaments']
@@ -1675,26 +1713,28 @@ def apply_remap_to_file(in_path, out_path, remap, progress=None):
         except Exception:
             pass
 
-def rewrite_to_file(in_path, out_path, progress=None):
+def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None):
     """Streaming equivalent of rewrite(gcode). Same M104/M109 +
     SM_PRINT_PREEXTRUDE_FILAMENT handling, same body T4-T15 expansion
     + ACE_SWAP_HEAD dedupe + swap-back insertion. Returns
     (active_swaps, skipped_swaps, swapback_count) matching the
     in-memory version's contract."""
     m104_re   = re.compile(r'^M10[49]\b')
-    drop_pre  = re.compile(r'^SM_PRINT_PREEXTRUDE_FILAMENT INDEX=([4-9]|1[0-5])\b')
+    preextr_re = re.compile(r'^(SM_PRINT_PREEXTRUDE_FILAMENT INDEX=)(1[0-5]|[0-9])(\b.*)$')
     change_t  = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+')
-    bare_hi   = re.compile(r'^T([4-9]|1[0-5])\s*$')
+    ace_targets = _normalize_ace_targets(ace_targets)
+    bare_hi   = re.compile(r'^T(1[0-5]|[0-9])\s*$')
     bare_lo   = re.compile(r'^T([0-3])\s*$')
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
 
     def fix_m104(line):
-        return re.sub(r'T([4-9]|1[0-5])',
-                      lambda t: 'T' + str(int(t.group(1)) % 4),
+        return re.sub(r'T(1[0-5]|[0-9])',
+                      lambda t: 'T%d' % _route_virtual_tool(
+                          int(t.group(1)), ace_targets)[0],
                       line)
 
     in_body = False
-    head_loaded = {0: (0, 0), 1: (0, 1), 2: (0, 2), 3: (0, 3)}
+    head_loaded = {}
     active = 0
     skipped = 0
     swapbacks = 0
@@ -1717,16 +1757,10 @@ def rewrite_to_file(in_path, out_path, progress=None):
             return
         head = pending_head
         pending_head = None
-        initial_key = (0, head)
         fout.write('T%d\n' % head)
         for b in pending_blanks:
             fout.write(b)
         pending_blanks.clear()
-        if head_loaded.get(head) != initial_key:
-            fout.write('ACE_SWAP_HEAD HEAD=%d ACE=0 SLOT=%d\n' % (head, head))
-            swapbacks += 1
-            active += 1
-            head_loaded[head] = initial_key
 
     def flush_pending_paired(fout):
         """Pending bare T was followed by ACE_SWAP_HEAD - emit it
@@ -1754,9 +1788,13 @@ def rewrite_to_file(in_path, out_path, progress=None):
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 
-            if drop_pre.match(stripped):
+            m_pre = preextr_re.match(stripped)
+            if m_pre:
                 if pending_head is not None:
                     flush_pending_unmatched(fout)
+                head, _ace, _slot = _route_virtual_tool(
+                    int(m_pre.group(2)), ace_targets)
+                fout.write('%s%d%s\n' % (m_pre.group(1), head, m_pre.group(3)))
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 
@@ -1768,7 +1806,10 @@ def rewrite_to_file(in_path, out_path, progress=None):
                     flush_pending_unmatched(fout)
                 m = bare_hi.match(stripped)
                 if m:
-                    fout.write('T%d\n' % (int(m.group(1)) % 4))
+                    head, ace, slot = _route_virtual_tool(
+                        int(m.group(1)), ace_targets)
+                    fout.write('T%d\n' % head)
+                    fout.write(_initial_marker(head, ace, slot) + '\n')
                 else:
                     fout.write(line)
                 last_pr = _emit_progress(progress, seen, total, last_pr)
@@ -1803,17 +1844,16 @@ def rewrite_to_file(in_path, out_path, progress=None):
             m = bare_hi.match(stripped)
             if m:
                 n = int(m.group(1))
-                head = n % 4
-                ace = n // 4
+                head, ace, slot = _route_virtual_tool(n, ace_targets)
                 fout.write('T%d\n' % head)
-                key = (ace, head)
+                key = (ace, slot)
                 if head_loaded.get(head) == key:
                     fout.write('; ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d  ; skipped (already loaded)\n' % (
-                        head, ace, head))
+                        head, ace, slot))
                     skipped += 1
                 else:
                     fout.write('ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d\n' % (
-                        head, ace, head))
+                        head, ace, slot))
                     head_loaded[head] = key
                     active += 1
                 last_pr = _emit_progress(progress, seen, total, last_pr)
@@ -1846,11 +1886,9 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
          anchor types) and the byte ranges of any pre-existing auto-
          load block(s) to strip.
       B. Re-scan from the anchor onwards (skipping stripped ranges) to
-         build initial[head] = (ace, slot) with the same logic as the
-         in-memory inject_auto_load: bare T<head> peeks ahead for a
-         paired ACE_SWAP_HEAD HEAD=<head>; if absent the head defaults
-         to (0, head). Heads first seen as a direct ACE_SWAP_HEAD use
-         that swap's (ace, slot).
+         build initial[head] = (ace, slot) only from explicit
+         ACE_SWAP_HEAD HEAD/ACE/SLOT commands. Bare T<head> is not
+         enough to infer the ACE slot.
       C. Write the output, injecting the auto-load block right before
          the anchor line and dropping any old-block lines.
 
@@ -1872,6 +1910,8 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
     chg_re     = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*(\d+)')
     swap_re    = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
     bare_t_re  = re.compile(r'^T([0-3])\s*$')
+    initial_re = re.compile(
+        r'^;\s*multiACE initial-load HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
     auto_load_re = re.compile(r'^;\s*multiACE auto-load:\s')
 
     first_huaqi   = None
@@ -1926,12 +1966,17 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
             in_block_set.add(j)
 
     initial: dict[int, tuple[int, int]] = {}
-    used_heads: set[int] = set()
     pending_t_head: int | None = None
 
     if anchor_line_no is not None:
         with open(in_path, 'r', encoding='utf-8', errors='replace') as fin:
             for line_no, line in enumerate(fin):
+                if line_no < anchor_line_no and line_no not in in_block_set:
+                    m_i = initial_re.match(line.strip())
+                    if m_i:
+                        initial[int(m_i.group(1))] = (
+                            int(m_i.group(2)), int(m_i.group(3)))
+                    continue
                 if line_no < anchor_line_no:
                     continue
                 if line_no in in_block_set:
@@ -1946,18 +1991,13 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
                         if pending_t_head not in initial:
                             initial[pending_t_head] = (int(m_s.group(2)),
                                                        int(m_s.group(3)))
-                        used_heads.add(pending_t_head)
                         pending_t_head = None
                         continue
-                    if pending_t_head not in initial:
-                        initial[pending_t_head] = (0, pending_t_head)
-                    used_heads.add(pending_t_head)
                     pending_t_head = None
 
                 m_t = bare_t_re.match(stripped)
                 if m_t:
                     head = int(m_t.group(1))
-                    used_heads.add(head)
                     if head not in initial:
                         pending_t_head = head
                     continue
@@ -1965,17 +2005,8 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
                 m_s = swap_re.match(stripped)
                 if m_s:
                     head = int(m_s.group(1))
-                    used_heads.add(head)
                     if head not in initial:
                         initial[head] = (int(m_s.group(2)), int(m_s.group(3)))
-
-        if pending_t_head is not None and pending_t_head not in initial:
-            initial[pending_t_head] = (0, pending_t_head)
-            used_heads.add(pending_t_head)
-
-    for head in used_heads:
-        if head not in initial:
-            initial[head] = (0, head)
 
     inject_block: list[str] = []
     if initial:
@@ -2211,7 +2242,7 @@ def main():
             sys.exit(1)
         if not live_slots:
             print('ERROR: live-lookup returned 0 loaded slots - load filaments '
-                  'first (e.g. ACEB__Load_All) and try again.',
+                  'from the multiACE dashboard first and try again.',
                   file=sys.stderr)
             sys.exit(1)
 
@@ -2240,7 +2271,7 @@ def main():
                                    ('  (needed by ' + ts_str + ')') if ts_str else ''),
                       file=sys.stderr)
             print('Load filament of the missing material(s) into any slot '
-                  '(e.g. ACEB__Load_All) and re-run.', file=sys.stderr)
+                  'from the multiACE dashboard and re-run.', file=sys.stderr)
             sys.exit(1)
 
         live_remap, match_info, _ = match_colors_to_slots(
@@ -2352,7 +2383,10 @@ def main():
             print('T remap (old -> new): %s' % ', '.join(
                 'T%d->T%d' % (k, v) for k, v in sorted(remap.items())))
 
-    gcode, active_swaps, skipped_swaps, swapback_count = rewrite(gcode)
+    ace_targets = _route_ace_targets_from_slots(live_slots) if live_lookup_host is not None else None
+
+    gcode, active_swaps, skipped_swaps, swapback_count = rewrite(
+        gcode, ace_targets=ace_targets)
     if active_swaps + skipped_swaps + swapback_count > 0:
         print('Rewrite: %d active ACE_SWAP_HEAD, %d skipped, %d swap-backs inserted' % (
             active_swaps, skipped_swaps, swapback_count))

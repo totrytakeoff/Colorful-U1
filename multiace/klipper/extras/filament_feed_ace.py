@@ -235,7 +235,19 @@ class FeedPort:
 
     def get_filament_detected(self):
         if self.ace is not None:
-            return self.ace.gate_status[self.index] == 1
+            slot = self.index
+            try:
+                source = self.ace._head_source.get(self.index)
+                if source is not None:
+                    slot = int(source.get('slot', self.index))
+            except Exception:
+                slot = self.index
+            if slot < 0 or slot >= len(self.ace.gate_status):
+                logging.info(
+                    "[multiACE] feed port route invalid: head=%d slot=%s",
+                    self.index, slot)
+                return False
+            return self.ace.gate_status[slot] == 1
         else:
             return self._filament_detected
 
@@ -735,6 +747,32 @@ class FilamentFeed:
         else:
             return False
 
+    def _ace_route_for_channel(self, ch):
+        head_idx = self.filament_ch[ch]
+        ace_idx = self.ace._active_device_index
+        slot_idx = head_idx
+        source = None
+        if self.ace is not None:
+            source = self.ace._head_source.get(head_idx)
+            if source is not None:
+                ace_idx = int(source.get('ace_index', ace_idx))
+                slot_idx = int(source.get('slot', slot_idx))
+            else:
+                head_modes = getattr(self.ace, '_head_modes', [])
+                if (0 <= head_idx < len(head_modes)
+                        and head_modes[head_idx] == 'ace'):
+                    raise ValueError(
+                        '[multiACE] missing route for ACE toolhead T%d. '
+                        'Use ACE_LOAD_HEAD HEAD=%d ACE=<n> SLOT=<n> so '
+                        'the ACE slot is explicit; refusing to guess '
+                        'slot=%d from the toolhead index.'
+                        % (head_idx, head_idx, slot_idx))
+        if slot_idx < 0 or slot_idx > 3:
+            raise ValueError(
+                '[multiACE] invalid ACE route: head=%d ace=%d slot=%d'
+                % (head_idx, ace_idx, slot_idx))
+        return head_idx, ace_idx, slot_idx, source
+
     def _snapshot_inner_resume_state(self):
 
         try:
@@ -1046,9 +1084,18 @@ class FilamentFeed:
                         one_step_cnt = self.wheel[ch].ppr * 2.0 * 10.0 / FEED_WHEEL_CIRCUMFERENCE
 
                         if self.ace is not None:
-                            ace_idx = self.ace._active_device_index
-                            self.ace._fa_trace('feed phase enter: ace=%d ch=%d head=%d'
-                                               % (ace_idx, ch, self.filament_ch[ch]))
+                            head_idx, ace_idx, ace_slot, _source = self._ace_route_for_channel(ch)
+                            if ace_idx != self.ace._active_device_index:
+                                logging.info(
+                                    '[multiACE] FEED_AUTO LOAD: switching to ACE %d for head=%d slot=%d',
+                                    ace_idx, head_idx, ace_slot)
+                                self.ace._switch_ace_for_head_target(ace_idx)
+                            self.ace._fa_trace(
+                                'feed phase enter: ace=%d ch=%d head=%d slot=%d'
+                                % (ace_idx, ch, head_idx, ace_slot))
+                            logging.info(
+                                '[multiACE] FEED_AUTO LOAD route: head=%d ace=%d slot=%d channel=%d',
+                                head_idx, ace_idx, ace_slot, ch)
 
                             if ace_idx in self.ace._fa_load_disable:
                                 logging.info(
@@ -1065,12 +1112,11 @@ class FilamentFeed:
                                     if load_attempt > 0:
                                         logging.info("[feed_loading] retry %d/%d: retracting %dmm",
                                                      load_attempt, load_retries, load_retry_retract)
-                                        self.ace._retract(self.filament_ch[ch], load_retry_retract, self.ace.retract_speed)
+                                        self.ace._retract(ace_slot, load_retry_retract, self.ace.retract_speed)
                                         self.ace.wait_ace_ready()
 
-                                    _head_idx = self.filament_ch[ch]
-                                    _ll = self.ace.get_load_length(self.ace._active_device_index, _head_idx)
-                                    self.ace._feed(_head_idx, _ll, self.ace.feed_speed, 0)
+                                    _ll = self.ace.get_load_length(ace_idx, ace_slot)
+                                    self.ace._feed(ace_slot, _ll, self.ace.feed_speed, 0)
                                     self.reactor.pause(self.reactor.monotonic() + 4.0)
 
                                     load_found = False
@@ -1080,14 +1126,14 @@ class FilamentFeed:
                                         runout_detect = self.runout_sensor[ch].get_status(0)['filament_detected']
 
                                         if runout_detect == True:
-                                            self.ace._stop_feeding(self.filament_ch[ch])
+                                            self.ace._stop_feeding(ace_slot)
 
                                             overshoot = getattr(
                                                 self.ace, 'seat_overshoot_length', 0)
                                             if overshoot > 0:
                                                 self.ace.wait_ace_ready()
                                                 self.ace._feed(
-                                                    self.filament_ch[ch],
+                                                    ace_slot,
                                                     overshoot,
                                                     self.ace.feed_speed)
                                                 self.ace.wait_ace_ready()
@@ -1122,12 +1168,13 @@ class FilamentFeed:
                     if self.ace is not None and self.ace._active_device_index not in self.ace._fa_load_disable:
 
                         self.ace.wait_ace_ready()
-                        head_idx = self.filament_ch[ch]
+                        head_idx, ace_idx, ace_slot, _source = self._ace_route_for_channel(ch)
+                        if ace_idx != self.ace._active_device_index:
+                            self.ace._switch_ace_for_head_target(ace_idx)
                         logging.info('[multiACE] FEED_AUTO LOAD: about to call _arm_fa_for idx=%d slot=%d auto_feed=%s fa_context=%s' % (
-                            self.ace._active_device_index, head_idx, self.ace._auto_feed_enabled, self.ace._fa_context))
+                            ace_idx, ace_slot, self.ace._auto_feed_enabled, self.ace._fa_context))
                         try:
-                            self.ace._arm_fa_for(
-                                self.ace._active_device_index, head_idx)
+                            self.ace._arm_fa_for(ace_idx, ace_slot)
                         except Exception as fa_e:
                             logging.info(
                                 '[multiACE] FEED_AUTO LOAD: _arm_fa_for failed: %s'
@@ -1503,10 +1550,10 @@ class FilamentFeed:
                     self._set_channel_state(ch, FEED_STA_LOAD_FINISH, True)
 
                     if self.ace is not None and getattr(self.ace, '_ace_mode', '') == 'multi':
-                        head_idx = self.filament_ch[ch]
-                        ace_slot = head_idx
-                        ace_idx = self.ace._active_device_index
-                        slot_info = self.ace._info.get('slots', [{}] * 4)
+                        head_idx, ace_idx, ace_slot, _source = self._ace_route_for_channel(ch)
+                        info = self.ace._info_per_ace.get(
+                            ace_idx, self.ace._make_default_info(ace_idx))
+                        slot_info = info.get('slots', [{}] * 4)
                         if ace_slot < len(slot_info):
                             si = slot_info[ace_slot]
                         else:
@@ -1657,16 +1704,16 @@ class FilamentFeed:
                             if getattr(self.ace, '_swap_in_progress', False):
                                 self.gcode.run_script_from_command(
                                     "M104 S%d\r\n" % filament_feed_temp)
-                            head_idx = self.filament_ch[ch]
-                            source = self.ace._head_source.get(head_idx)
-                            if source and source['ace_index'] != self.ace._active_device_index:
-                                logging.info('[multiACE] FEED_AUTO UNLOAD: switching to ACE %d for retract' % source['ace_index'])
-                                self.ace._switch_ace_for_head_target(source['ace_index'])
+                            head_idx, ace_idx, ace_slot, source = self._ace_route_for_channel(ch)
+                            if source and ace_idx != self.ace._active_device_index:
+                                logging.info('[multiACE] FEED_AUTO UNLOAD: switching to ACE %d for head=%d slot=%d',
+                                             ace_idx, head_idx, ace_slot)
+                                self.ace._switch_ace_for_head_target(ace_idx)
 
                             unload_max = self.ace.unload_retry if self.ace is not None else 3
                             unload_ok = False
                             for unload_attempt in range(unload_max):
-                                self.ace.retract_fil(self.filament_ch[ch])
+                                self.ace.retract_fil(ace_slot)
                                 self.ace.wait_ace_ready()
 
                                 try:
@@ -1788,16 +1835,16 @@ class FilamentFeed:
                             if getattr(self.ace, '_swap_in_progress', False):
                                 self.gcode.run_script_from_command(
                                     "M104 S%d\r\n" % filament_feed_temp)
-                            head_idx = self.filament_ch[ch]
-                            source = self.ace._head_source.get(head_idx)
-                            if source and source['ace_index'] != self.ace._active_device_index:
-                                logging.info('[multiACE] FEED_AUTO UNLOAD: switching to ACE %d for retract' % source['ace_index'])
-                                self.ace._switch_ace_for_head_target(source['ace_index'])
+                            head_idx, ace_idx, ace_slot, source = self._ace_route_for_channel(ch)
+                            if source and ace_idx != self.ace._active_device_index:
+                                logging.info('[multiACE] FEED_AUTO UNLOAD: switching to ACE %d for head=%d slot=%d',
+                                             ace_idx, head_idx, ace_slot)
+                                self.ace._switch_ace_for_head_target(ace_idx)
 
                             unload_max = self.ace.unload_retry if self.ace is not None else 3
                             unload_ok = False
                             for unload_attempt in range(unload_max):
-                                self.ace.retract_fil(self.filament_ch[ch])
+                                self.ace.retract_fil(ace_slot)
                                 self.ace.wait_ace_ready()
 
                                 try:

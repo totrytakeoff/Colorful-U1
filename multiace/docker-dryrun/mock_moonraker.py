@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -13,6 +13,7 @@ from pydantic import BaseModel
 STATE_PATH = Path("/data/state.json")
 GCODE_LOG = Path("/data/gcode.log")
 CFG_PATH = Path("/data/ace.cfg")
+UPLOAD_DIR = Path("/data/uploaded")
 
 app = FastAPI(title="multiACE dry-run Moonraker")
 
@@ -180,65 +181,51 @@ def _apply_cfg_route(state: dict[str, Any]) -> None:
         state["ace"]["active_device"] = 0
 
     head_modes: dict[str, str] = {}
-    explicit = False
     for h in range(4):
         raw = str(cfg.get(f"head{h}_mode", "")).strip().lower()
         if raw in ("ace", "native"):
-            explicit = True
             head_modes[str(h)] = raw
         else:
-            head_modes[str(h)] = "native"
+            head_modes[str(h)] = "ace" if h == 0 else "native"
 
-    if explicit:
-        ace_heads = [int(h) for h, m in head_modes.items() if m == "ace"]
-        ace_targets: dict[str, int | None] = {}
-        error = None
-        for ace_idx in range(count):
-            raw = str(cfg.get(f"ace{ace_idx}_head", "")).strip().lower()
-            if raw in ("", "none", "native", "off", "-1"):
+    ace_heads = [int(h) for h, m in head_modes.items() if m == "ace"]
+    ace_targets: dict[str, int | None] = {}
+    error = None
+    for ace_idx in range(count):
+        raw = str(cfg.get(f"ace{ace_idx}_head", "")).strip().lower()
+        if raw in ("", "none", "native", "off", "-1"):
+            target = None
+        else:
+            try:
+                target = int(raw)
+            except ValueError:
                 target = None
-            else:
-                try:
-                    target = int(raw)
-                except ValueError:
-                    target = None
-                    error = f"ace{ace_idx}_head must be 0..3 or none, got {raw}"
-                if target is not None and (target < 0 or target > 3):
-                    error = f"ace{ace_idx}_head must be 0..3 or none, got {raw}"
-                    target = None
-                if target is not None and target not in ace_heads:
-                    error = f"ace{ace_idx}_head targets T{target}, but head{target}_mode is not ace"
-            ace_targets[str(ace_idx)] = target
-        target_heads = sorted({h for h in ace_targets.values() if h is not None})
-        if len(target_heads) == 1:
-            mode = "single_head"
-            primary = target_heads[0]
-        elif not target_heads:
-            mode = "native_only"
-            primary = None
-        else:
-            mode = "multi_head"
-            primary = target_heads[0]
+                error = f"ace{ace_idx}_head must be 0..3 or none, got {raw}"
+            if target is not None and (target < 0 or target > 3):
+                error = f"ace{ace_idx}_head must be 0..3 or none, got {raw}"
+                target = None
+            if target is not None and target not in ace_heads:
+                error = f"ace{ace_idx}_head targets T{target}, but head{target}_mode is not ace"
+        ace_targets[str(ace_idx)] = target
+    if count >= 1 and ace_targets.get("0") is None and len(ace_heads) == 1:
+        ace_targets["0"] = ace_heads[0]
+    target_heads = sorted({h for h in ace_targets.values() if h is not None})
+    unassigned = [h for h in ace_heads if h not in target_heads]
+    if unassigned:
+        error = "head(s) %s are configured as ACE but no aceN_head targets them" % (
+            ", ".join(f"T{h}" for h in unassigned))
+    if len(target_heads) == 1:
+        mode = "single_head"
+        primary = target_heads[0]
+    elif not target_heads:
+        mode = "native_only"
+        primary = None
     else:
-        mode = cfg.get("ace_route_mode", "standard")
-        if mode not in ("standard", "single_head"):
-            mode = "standard"
-        try:
-            primary = int(cfg.get("ace_primary_head", "0"))
-        except ValueError:
-            primary = 0
-        primary = max(0, min(3, primary))
-        error = None
-        if mode == "single_head":
-            head_modes = {str(h): ("ace" if h == primary else "native") for h in range(4)}
-            ace_targets = {str(ace): primary for ace in range(count)}
-        else:
-            head_modes = {str(h): "ace" for h in range(4)}
-            ace_targets = {str(ace): (ace if ace < 4 else None) for ace in range(count)}
+        mode = "multi_head"
+        primary = target_heads[0]
 
     slot_targets = {
-        str(slot): primary if mode == "single_head"
-        else (slot if mode == "standard" else None)
+        str(slot): primary if mode == "single_head" else None
         for slot in range(4)
     }
     state["ace"]["route"] = {
@@ -308,12 +295,12 @@ def _check_load_route(state: dict[str, Any], head: int, ace: int, slot: int) -> 
             raise ValueError(f"ACE {ace} is assigned to HEAD {target}, not HEAD {head}")
         return
 
-    mode = route.get("mode", "standard")
+    mode = route.get("mode", "single_head")
     if mode == "single_head":
         target = route.get("primary_head")
         if target is None or int(target) != head:
             raise ValueError(f"HEAD {head} is not the configured ACE toolhead")
-    elif mode != "standard":
+    else:
         raise ValueError(f"route mode {mode} requires explicit ACE target")
 
 
@@ -340,17 +327,21 @@ def _apply_script(script: str) -> None:
         with GCODE_LOG.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
         if cmd == "ACE_LOAD_HEAD":
+            if "HEAD" not in args or "ACE" not in args or "SLOT" not in args:
+                raise ValueError("ACE_LOAD_HEAD requires HEAD, ACE and SLOT")
             head = int(args.get("HEAD", "0"))
             ace = int(args.get("ACE", "0"))
-            slot = int(args.get("SLOT", str(head)))
+            slot = int(args.get("SLOT", "0"))
             _check_load_route(state, head, ace, slot)
             _set_head_loaded(state, head, ace, slot)
         elif cmd == "ACE_UNLOAD_HEAD":
             _set_head_empty(state, int(args.get("HEAD", "0")))
         elif cmd == "ACE_SWAP_HEAD":
+            if "HEAD" not in args or "ACE" not in args or "SLOT" not in args:
+                raise ValueError("ACE_SWAP_HEAD requires HEAD, ACE and SLOT")
             head = int(args.get("HEAD", "0"))
             ace = int(args.get("ACE", "0"))
-            slot = int(args.get("SLOT", str(head)))
+            slot = int(args.get("SLOT", "0"))
             _check_load_route(state, head, ace, slot)
             _set_head_loaded(state, head, ace, slot)
         elif cmd == "ACE_UNLOAD_ALL_HEADS":
@@ -408,6 +399,28 @@ async def gcode_script(payload: ScriptPayload) -> dict[str, Any]:
 @app.post("/printer/restart")
 async def printer_restart() -> dict[str, Any]:
     return {"result": "ok"}
+
+
+@app.post("/server/files/upload")
+async def files_upload(
+    file: UploadFile = File(...),
+    root: str = Form("gcodes"),
+    print: str = Form("false"),
+) -> dict[str, Any]:
+    safe_name = Path(file.filename or "upload.gcode").name
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = UPLOAD_DIR / safe_name
+    dest.write_bytes(await file.read())
+    return {
+        "result": {
+            "item": {
+                "root": root,
+                "path": safe_name,
+                "size": dest.stat().st_size,
+            },
+            "print_started": str(print).lower() == "true",
+        }
+    }
 
 
 @app.post("/machine/reboot")

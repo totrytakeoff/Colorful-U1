@@ -28,6 +28,13 @@ import sys
 SECTION_RE = re.compile(r'^\[\s*(ace(?:\s+\d+)?)\s*\]\s*$')
 KEY_RE = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)$')
 COMMENTED_KEY_RE = re.compile(r'^#\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)$')
+OBSOLETE_KEYS = {
+    'ace': {
+        'ace_route_mode',
+        'ace_primary_head',
+        'print_mode',
+    },
+}
 
 def is_section_header(stripped: str) -> bool:
     return stripped.startswith('[') and stripped.endswith(']')
@@ -60,6 +67,8 @@ def parse_user_values(path: str) -> dict[str, dict[str, str]]:
             m = KEY_RE.match(stripped)
             if m:
                 key, val = m.group(1), m.group(2).strip()
+                if key in OBSOLETE_KEYS.get(current, set()):
+                    continue
                 out[current][key] = val
     return out
 

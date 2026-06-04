@@ -178,7 +178,7 @@ def _parse_state(status: dict) -> dict:
     active_device = int(ace.get("active_device", 0))
     head_source = ace.get("head_source", {}) or {}
     route = ace.get("route", {}) or {}
-    route_mode = route.get("mode", "standard")
+    route_mode = route.get("mode", "single_head")
     raw_primary_head = route.get("primary_head", 0)
     route_primary_head = None if raw_primary_head is None else int(raw_primary_head or 0)
     route_slot_targets = route.get("slot_targets", {}) or {}
@@ -237,8 +237,6 @@ def _parse_state(status: dict) -> dict:
         mode = route_head_modes.get(str(head), route_head_modes.get(head))
         if mode in ("ace", "native"):
             return mode
-        if route_mode == "standard":
-            return "ace"
         if route_mode == "single_head" and route_primary_head == head:
             return "ace"
         return "native"
@@ -458,7 +456,7 @@ def _parse_state(status: dict) -> dict:
 
     sv = status.get("save_variables", {})
     sv_vars = sv.get("variables", {}) if isinstance(sv, dict) else {}
-    mode = sv_vars.get("ace__mode", "normal")
+    mode = "multi"
 
     ps = status.get("print_stats", {}) or {}
     it = status.get("idle_timeout", {}) or {}
@@ -532,6 +530,26 @@ class MacroBatchRequest(BaseModel):
 class ConfigUpdate(BaseModel):
     content: str
     restart_klipper: bool = False
+
+OBSOLETE_ACE_CONFIG_KEYS = {
+    "ace_route_mode",
+    "ace_primary_head",
+    "print_mode",
+}
+
+OBSOLETE_GCODE_MACROS = {
+    "SET_ACE_MODE",
+    "ACEB__Load_0",
+    "ACEB__Load_1",
+    "ACEB__Load_2",
+    "ACEB__Load_3",
+    "ACEC__Load_T0",
+    "ACEC__Load_T1",
+    "ACEC__Load_T2",
+    "ACEC__Load_T3",
+    "ACEF__Mode_Normal",
+    "ACEF__Mode_Multi",
+}
 
 class SnapshotSave(BaseModel):
     name: str
@@ -641,6 +659,7 @@ async def _live_slots_async() -> list[dict]:
             out.append({
                 "ace":      ace.get("idx"),
                 "slot":     slot.get("idx"),
+                "target_head": slot.get("target_head"),
                 "material": (slot.get("material") or "").strip(),
                 "color":    (slot.get("color") or "").strip().lower(),
             })
@@ -1028,6 +1047,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
 
         live_slots = await _live_slots_async()
+        ace_targets = pp._route_ace_targets_from_slots(live_slots)
         num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
         missing_mats = pp.check_material_availability(slicer_types, live_slots)
         if missing_mats:
@@ -1041,6 +1061,9 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                 fuzzy_max_distance=_PREFLIGHT_FUZZY,
             )
         else:
+            raise RuntimeError(
+                "optimize/layer print modes are disabled for the "
+                "single-toolhead ACE MVP; use slicer mode")
             _set_stage(state, mode, 1.0)
             sa_result = await asyncio.to_thread(
                 pp.plan_loadout_from_file, str(src), num_aces) or {}
@@ -1076,6 +1099,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             pp.rewrite_to_file,
             str(cur), str(nxt),
             _stage_progress(state, 45.0, 30.0),
+            ace_targets,
         )
         cur, nxt = nxt, cur
 
@@ -1133,6 +1157,11 @@ class _PreflightPrint(BaseModel):
 async def preflight_print(req: _PreflightPrint) -> dict:
     if req.mode not in ("slicer", "optimize", "layer"):
         raise HTTPException(status_code=400, detail="invalid mode")
+    if req.mode != "slicer":
+        raise HTTPException(
+            status_code=400,
+            detail=("optimize/layer print modes are disabled for the "
+                    "single-toolhead ACE MVP; use slicer mode"))
     if not re.fullmatch(r"[0-9a-f]{32}", req.token or ""):
         raise HTTPException(status_code=400, detail="invalid token")
     gpath = _PREFLIGHT_DIR / (req.token + ".gcode")
@@ -1412,10 +1441,9 @@ async def get_debug() -> dict:
 _MACRO_PREFIX = "gcode_macro "
 _MACRO_BUCKETS = (
     ("switch", lambda m: m.startswith("ACEA__Switch")),
-    ("load",   lambda m: m.startswith("ACEB__Load") or m.startswith("ACEC__Load")),
+    ("load",   lambda m: m.startswith("ACEC__Load")),
     ("unload", lambda m: m.startswith("ACEC__Unload")),
     ("dry",    lambda m: m.startswith("ACED__Dry")),
-    ("mode",   lambda m: m.startswith("ACEF__Mode") or m == "SET_ACE_MODE"),
     ("status", lambda m: m.startswith("ACEG__")),
 )
 
@@ -1435,7 +1463,7 @@ async def list_macros() -> dict:
         o[len(_MACRO_PREFIX):]
         for o in objs
         if isinstance(o, str) and o.startswith(_MACRO_PREFIX)
-        and ("ACE" in o or o.endswith(" SET_ACE_MODE"))
+        and "ACE" in o
     )
     cats: dict[str, list[str]] = {name: [] for name, _ in _MACRO_BUCKETS}
     cats["other"] = []
@@ -1533,6 +1561,39 @@ def _extract_params(text: str) -> tuple[dict[str, str], dict[int, dict[str, str]
             per_ace.setdefault(section, {})[key] = val
     return main, per_ace
 
+def _sanitize_config_content(text: str) -> str:
+    """Drop obsolete topology/mode keys and removed macro blocks.
+
+    This runs on every config write, including raw-editor saves, so stale
+    normal/multi/standard routing cannot be reintroduced through the web API.
+    """
+    out: list[str] = []
+    section: str | None = None
+    skip_macro = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            name = s[1:-1].strip()
+            if name.startswith("gcode_macro "):
+                macro = name[len("gcode_macro "):].strip()
+                skip_macro = macro in OBSOLETE_GCODE_MACROS
+            else:
+                skip_macro = False
+            section = name
+            if skip_macro:
+                continue
+            out.append(raw)
+            continue
+        if skip_macro:
+            continue
+        if section == "ace" and ":" in s and not s.startswith("#"):
+            key = s.split(":", 1)[0].strip()
+            if key in OBSOLETE_ACE_CONFIG_KEYS:
+                continue
+        out.append(raw)
+    trailing_newline = "\n" if text.endswith("\n") else ""
+    return "\n".join(out) + trailing_newline
+
 @app.get("/api/config")
 async def get_config() -> dict:
     p = Path(MULTIACE_CFG_PATH)
@@ -1549,7 +1610,8 @@ async def update_config(payload: ConfigUpdate) -> dict:
         raise HTTPException(404, f"config file not found: {MULTIACE_CFG_PATH}")
     backup = p.with_suffix(p.suffix + ".bak")
     backup.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
-    p.write_text(payload.content, encoding="utf-8")
+    clean_content = _sanitize_config_content(payload.content)
+    p.write_text(clean_content, encoding="utf-8")
     restart: dict | None = None
     if payload.restart_klipper:
         try:

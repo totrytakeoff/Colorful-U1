@@ -195,9 +195,27 @@ header h1 .hl { color: var(--accent); }
 .dry-fade-enter-from, .dry-fade-leave-to { opacity: 0; max-height: 0; }
 .dry-fade-enter-to, .dry-fade-leave-from { opacity: 1; max-height: 200px; }
 .th-section-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap;
 }
 .th-section-head > span {  }
+.th-section-head .topology-actions {
+  display: flex; align-items: center; gap: .45rem; margin-left: auto;
+}
+.topology-dirty { color: var(--warn); font-size: .75rem; font-weight: 500; }
+.topology-apply,
+.topology-discard {
+  background: var(--card); color: var(--fg); border: 1px solid var(--border);
+  padding: .35rem .75rem; border-radius: 4px; cursor: pointer; font-size: .8rem;
+  text-transform: none; letter-spacing: 0; font-weight: 500;
+}
+.topology-apply:not(:disabled) {
+  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+  font-weight: 600;
+}
+.topology-apply:disabled,
+.topology-discard:disabled {
+  opacity: .45; cursor: not-allowed;
+}
 .th-section-head .unload-all-btn {
   background: var(--card); color: var(--fg); border: 1px solid var(--border);
   padding: .35rem .9rem; border-radius: 4px; cursor: pointer; font-size: .8rem;

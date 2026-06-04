@@ -118,17 +118,18 @@ class MultiAce:
         self._ace_present = set()
 
         self.ace_device_count = config.getint('ace_device_count', 1, minval=1, maxval=8)
-        legacy_route_mode = config.get('ace_route_mode', None)
-        legacy_primary_head = config.get('ace_primary_head', None)
         self._ace_route_error = None
-        self._head_modes_explicit = False
         self._head_modes = []
+        default_head_modes = ['ace', 'native', 'native', 'native']
         for head in range(4):
             raw_mode = config.get('head%d_mode' % head, None)
             if raw_mode is None:
-                self._head_modes.append('native')
+                mode = default_head_modes[head]
+                logging.info(
+                    '[multiACE] head%d_mode missing; using safe default %s'
+                    % (head, mode))
+                self._head_modes.append(mode)
                 continue
-            self._head_modes_explicit = True
             mode = str(raw_mode).strip().lower()
             if mode not in ('native', 'ace'):
                 raise config.error(
@@ -136,51 +137,43 @@ class MultiAce:
                         head, raw_mode))
             self._head_modes.append(mode)
 
-        if self._head_modes_explicit:
-            ace_heads = [h for h, m in enumerate(self._head_modes) if m == 'ace']
-            self._ace_targets = self._read_ace_targets(config, ace_heads)
-            target_heads = sorted(set([
-                h for h in self._ace_targets.values() if h is not None]))
-            if len(target_heads) == 1:
-                self._ace_route_mode = 'single_head'
-                self._ace_primary_head = target_heads[0]
-            elif len(target_heads) == 0:
-                self._ace_route_mode = 'native_only'
-                self._ace_primary_head = None
-            else:
-                self._ace_route_mode = 'multi_head'
-                self._ace_primary_head = target_heads[0]
-        else:
-            self._ace_route_mode = (
-                legacy_route_mode
-                if legacy_route_mode in ('standard', 'single_head')
-                else 'standard')
-            try:
-                self._ace_primary_head = int(
-                    legacy_primary_head
-                    if legacy_primary_head is not None else 0)
-            except (TypeError, ValueError):
-                self._ace_primary_head = 0
-            self._ace_primary_head = max(0, min(3, self._ace_primary_head))
-            if self._ace_route_mode == 'single_head':
-                self._head_modes = [
-                    'ace' if h == self._ace_primary_head else 'native'
-                    for h in range(4)]
-                self._ace_targets = {
-                    ace: self._ace_primary_head for ace in range(self.ace_device_count)
-                }
-            else:
-                self._head_modes = ['ace', 'ace', 'ace', 'ace']
-                self._ace_targets = {
-                    ace: ace if ace < 4 else None
-                    for ace in range(self.ace_device_count)
-                }
+        ace_heads = [h for h, m in enumerate(self._head_modes) if m == 'ace']
+        self._ace_targets = self._read_ace_targets(config, ace_heads)
 
-        cfg_print_mode = config.get('print_mode', None)
-        if cfg_print_mode is not None:
+        if (self.ace_device_count >= 1
+                and self._ace_targets.get(0) is None
+                and len(ace_heads) == 1):
+            self._ace_targets[0] = ace_heads[0]
             logging.info(
-                '[multiACE] print_mode=%s ignored (obsolete in v0.82+)'
-                % cfg_print_mode)
+                '[multiACE] ace0_head missing; using only ACE toolhead T%d'
+                % ace_heads[0])
+
+        target_heads = sorted(set([
+            h for h in self._ace_targets.values() if h is not None]))
+        unassigned_ace_heads = [
+            h for h in ace_heads
+            if h not in target_heads
+        ]
+        if unassigned_ace_heads:
+            self._ace_route_error = (
+                'head(s) %s are configured as ACE but no aceN_head targets '
+                'them' % ', '.join('T%d' % h for h in unassigned_ace_heads))
+
+        if len(target_heads) == 1:
+            self._ace_route_mode = 'single_head'
+            self._ace_primary_head = target_heads[0]
+        elif len(target_heads) == 0:
+            self._ace_route_mode = 'native_only'
+            self._ace_primary_head = None
+        else:
+            self._ace_route_mode = 'multi_head'
+            self._ace_primary_head = target_heads[0]
+
+        for legacy_key in ('ace_route_mode', 'ace_primary_head', 'print_mode'):
+            if config.get(legacy_key, None) is not None:
+                logging.info(
+                    '[multiACE] %s is obsolete and ignored; use '
+                    'headN_mode + aceN_head topology instead' % legacy_key)
 
         self.feed_speed = config.getint('feed_speed', 50)
         self.retract_speed = config.getint('retract_speed', 50)
@@ -776,13 +769,13 @@ class MultiAce:
         return None
 
     def _slot_target_head(self, slot, ace_index=None):
-        if ace_index is not None and self._head_modes_explicit:
+        if ace_index is not None:
             return self._ace_target_head(ace_index)
         if self._ace_route_mode == 'native_only':
             return None
         if self._single_head_mode():
             return self._ace_primary_head
-        return slot
+        return None
 
     def _check_routed_head(self, gcmd, head, action, ace_index=None):
         if self._ace_route_error:
@@ -792,7 +785,7 @@ class MultiAce:
             raise gcmd.error(
                 '[multiACE] %s refused: no toolhead is configured as ACE' %
                 action)
-        if ace_index is not None and self._head_modes_explicit:
+        if ace_index is not None:
             target = self._ace_target_head(ace_index)
             if target is None:
                 raise gcmd.error(
@@ -804,85 +797,47 @@ class MultiAce:
                     'not HEAD=%d' % (action, ace_index, target, head))
             return
         ace_heads = [h for h, m in enumerate(self._head_modes) if m == 'ace']
-        if self._ace_route_mode == 'multi_head':
-            if head not in ace_heads:
-                raise gcmd.error(
-                    '[multiACE] %s refused: HEAD=%d is not configured as ACE'
-                    % (action, head))
+        if head in ace_heads:
             return
-        if not self._single_head_mode():
-            return
-        if head != self._ace_primary_head:
-            raise gcmd.error(
-                '[multiACE] %s refused: HEAD=%d is not the configured '
-                'ACE toolhead T%d' % (
-                    action, head, self._ace_primary_head))
+        raise gcmd.error(
+            '[multiACE] %s refused: HEAD=%d is not configured as ACE'
+            % (action, head))
 
     def _plan_head_for_ace(self, ace_index):
-        if self._head_modes_explicit:
-            return self._ace_target_head(ace_index)
-        if self._single_head_mode():
-            return self._ace_primary_head
-        return ace_index if 0 <= ace_index <= 3 else None
+        return self._ace_target_head(ace_index)
 
     def _plan_default_slot(self, head, ace_index):
-        if self._head_modes_explicit:
-            return 0
-        return head
-
-    def _configured_ace_for_head(self, head):
-        matches = [
-            ace for ace, target in self._ace_targets.items()
-            if target == head
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return 0
 
     def _append_plan_load_for_ace(self, gcmd, steps, ace):
-        if self._head_modes_explicit or self._single_head_mode():
+        head = self._plan_head_for_ace(ace)
+        if head is None:
+            raise gcmd.error(
+                '[multiACE] ACE %d has no configured ACE toolhead target'
+                % ace)
+        steps.append({
+            'action': 'LOAD',
+            'head': head,
+            'ace': ace,
+            'slot': self._plan_default_slot(head, ace),
+        })
+
+    def _append_plan_default_loads(self, steps):
+        for ace in range(self.ace_device_count):
             head = self._plan_head_for_ace(ace)
             if head is None:
-                raise gcmd.error(
-                    '[multiACE] ACE %d has no configured ACE toolhead target'
-                    % ace)
+                continue
             steps.append({
                 'action': 'LOAD',
                 'head': head,
                 'ace': ace,
                 'slot': self._plan_default_slot(head, ace),
             })
-            return
-        for head in range(4):
-            steps.append({
-                'action': 'LOAD',
-                'head': head,
-                'ace': ace,
-                'slot': head,
-            })
-
-    def _append_plan_default_loads(self, steps):
-        if self._head_modes_explicit or self._single_head_mode():
-            for ace in range(self.ace_device_count):
-                head = self._plan_head_for_ace(ace)
-                if head is None:
-                    continue
-                steps.append({
-                    'action': 'LOAD',
-                    'head': head,
-                    'ace': ace,
-                    'slot': self._plan_default_slot(head, ace),
-                })
-            return
-        self._refresh_ace_devices('plan')
-        for i in range(min(len(self._ace_devices), 4)):
-            steps.append({'action': 'LOAD', 'head': i, 'ace': i, 'slot': i})
 
     def _route_status(self):
         slot_targets = {}
         for slot in range(4):
-            if (self._head_modes_explicit
-                    and self._ace_route_mode == 'multi_head'):
+            if self._ace_route_mode == 'multi_head':
                 slot_targets[str(slot)] = None
             else:
                 slot_targets[str(slot)] = self._slot_target_head(slot)
@@ -1209,19 +1164,23 @@ class MultiAce:
         logging.info('[multiACE] Version %s (%s) build=%s file=%s' % (
             MULTIACE_VERSION, MULTIACE_CODENAME, MULTIACE_BUILD_TAG, ace_timestamp))
 
-        self._ace_mode = 'normal'
+        saved_mode = None
         if self.save_variables:
-            self._ace_mode = self.save_variables.allVariables.get('ace__mode', 'normal')
-        if self._ace_mode == 'normal':
-            logging.info('[multiACE] Normal mode - skipping ACE detection')
-            return
+            saved_mode = self.save_variables.allVariables.get('ace__mode', None)
+        self._ace_mode = 'multi'
+        if saved_mode != 'multi':
+            logging.info(
+                '[multiACE] legacy ace__mode=%s ignored; topology mode is always multi'
+                % saved_mode)
+            try:
+                self.gcode.run_script_from_command(
+                    "SAVE_VARIABLE VARIABLE=ace__mode VALUE=\"'multi'\"")
+            except Exception as e:
+                logging.info('[multiACE] failed to normalize ace__mode: %s' % e)
 
-        if self._ace_mode == 'multi':
-            self._restore_head_source()
-            self.printer.register_event_handler(
-                'extruder:activate_extruder', self._on_extruder_change)
-        else:
-            logging.info('[multiACE] SingleACE mode - no head_source tracking')
+        self._restore_head_source()
+        self.printer.register_event_handler(
+            'extruder:activate_extruder', self._on_extruder_change)
 
         self._disable_stock_entangle_detect()
 
@@ -1399,66 +1358,15 @@ class MultiAce:
         return self.retract_speed
 
     def _sync_ptc_to_active_ace(self):
-        """Push SET_PRINT_FILAMENT_CONFIG for slots 0..3 of the currently
-        active ACE so the Snapmaker display reflects the live slot
-        belegung after an unload.
+        """Explicit topology does not mirror ACE slots into toolhead PTC.
 
-        No-op when any toolhead still carries filament - Snapmaker's
-        print_task_config holds the per-extruder filament profile during
-        a print, and clobbering it mid-print would lie to the firmware
-        about what's loaded. Safe to call from every head_source[h] = None
-        site: the guard makes it a no-op except when the last head went
-        empty.
-
-        Data source priority per slot:
-          1. self._slot_overrides[ace_slot]   (user labels via Web UI)
-          2. self._info_per_ace[ace].slots[]  (RFID from ACE hardware)
-          3. Empty marker (NONE / 000000FF) for unconfigured slots.
-
-        Failures are logged but never raised - display drift is cosmetic,
-        not a print-blocking concern.
+        Toolhead filament display is updated only when a specific
+        HEAD/ACE/SLOT is loaded. ACE slot labels remain owned by the web
+        slot override/RFID path.
         """
-        if any(self._head_source.get(h) is not None for h in range(4)):
-            return
-        ace_idx = self._active_device_index
-        info = self._info_per_ace.get(ace_idx) or {}
-        slots_by_index = {s.get('index', n): s
-                          for n, s in enumerate(info.get('slots') or [])
-                          if isinstance(s, dict)}
-        lines = []
-        for slot_idx in range(4):
-            ov = self._slot_overrides.get('%d_%d' % (ace_idx, slot_idx)) or {}
-            s = slots_by_index.get(slot_idx) or {}
-            mat = (ov.get('material') or s.get('material')
-                   or s.get('type') or '').strip()
-            sub = (ov.get('subtype') or s.get('sku') or '').strip()
-            brand = (ov.get('brand') or s.get('brand') or '').strip()
-            color = (ov.get('color') or '').strip().lstrip('#').upper()
-            if not color:
-                rgb = s.get('color')
-                if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
-                    try:
-                        color = '%02X%02X%02X' % tuple(int(v) for v in rgb[:3])
-                    except (TypeError, ValueError):
-                        color = ''
-            push_type = mat if mat else 'NONE'
-            push_vendor = brand if brand else 'NONE'
-            push_color = (color + 'FF') if color else '000000FF'
-            push_subtype = sub
-            self._expect_ptc_push(slot_idx, push_type, push_color,
-                                  push_vendor, push_subtype)
-            lines.append(
-                'SET_PRINT_FILAMENT_CONFIG CONFIG_EXTRUDER=%d '
-                'FILAMENT_TYPE="%s" FILAMENT_COLOR_RGBA=%s '
-                'VENDOR="%s" FILAMENT_SUBTYPE="%s"' % (
-                    slot_idx, push_type, push_color, push_vendor, push_subtype))
-        try:
-            self.gcode.run_script_from_command('\n'.join(lines))
-            logging.info(
-                '[multiACE] PTC sync -> ACE %d (4 slots, all heads empty)'
-                % ace_idx)
-        except Exception as e:
-            logging.info('[multiACE] PTC sync failed: %s' % e)
+        logging.info(
+            '[multiACE] PTC sync skipped for explicit topology; '
+            'slot labels stay on ACE slots until a toolhead is loaded')
 
     def _fa_trace(self, msg):
         """Log FA/load transitions to multiace_fa.log. Helps diagnose
@@ -3213,35 +3121,6 @@ class MultiAce:
                                         push_color,
                                         push_brand,
                                         push_subtype))
-                        elif is_active and not self._head_modes_explicit:
-
-                            source = self._head_source.get(i)
-                            if not (source and source['ace_index']
-                                    != self._active_device_index):
-
-                                override_a = self._override_for(idx, i)
-                                if override_a is not None:
-                                    push_type    = override_a.get('material') or new_slot.get('type', 'PLA')
-                                    push_color   = self._override_color_to_rgba(override_a.get('color', ''))
-                                    push_brand   = override_a.get('brand') or new_slot.get('brand', 'Generic')
-                                    push_subtype = override_a.get('subtype', '') or ''
-                                else:
-                                    push_type    = new_slot.get('type', 'PLA')
-                                    push_color   = self.rgb2hex(*new_slot.get('color', (0, 0, 0)))
-                                    push_brand   = new_slot.get('brand', 'Generic')
-                                    push_subtype = ''
-                                self.log_always(self._t('msg.find_rfid_fallback',
-                                    slot=self._disp(i), head=i))
-                                self.log_always(self._t('msg.raw_slot_dump', slot=new_slot))
-                                self._expect_ptc_push(i, push_type, push_color, push_brand, push_subtype)
-                                self.gcode.run_script_from_command(
-                                    'SET_PRINT_FILAMENT_CONFIG '
-                                    'CONFIG_EXTRUDER=%d '
-                                    'FILAMENT_TYPE="%s" '
-                                    'FILAMENT_COLOR_RGBA=%s '
-                                    'VENDOR="%s" '
-                                    'FILAMENT_SUBTYPE="%s"' % (
-                                        i, push_type, push_color, push_brand, push_subtype))
                     gate_list = self._gate_status_per_ace.setdefault(
                         idx, [GATE_UNKNOWN] * 4)
                     gate_list[i] = GATE_EMPTY if new_slot.get('status') == 'empty' else GATE_AVAILABLE
@@ -3665,7 +3544,7 @@ class MultiAce:
             request={"method": "stop_feed_filament", "params": {"index": index}},
             callback=callback)
 
-    cmd_ACE_SWITCH_help = 'Switch active ACE unit. Usage: ACE_SWITCH TARGET=0 [AUTOLOAD=1]'
+    cmd_ACE_SWITCH_help = 'Switch active ACE unit. Usage: ACE_SWITCH TARGET=0'
 
     EXTRUDER_MAP = {
         0: ('left', 1),
@@ -3864,14 +3743,11 @@ class MultiAce:
             ace_idx = int(src.get('ace_index', 0))
             slot_idx = int(src.get('slot', 0))
         else:
-            if self._head_modes_explicit or self._single_head_mode():
-                logging.info(
-                    '[multiACE] display edit ignored for unloaded routed '
-                    'head %d (no head_source)' % head)
-                return
-
-            ace_idx = self._active_device_index
-            slot_idx = head
+            logging.info(
+                '[multiACE] display edit ignored for unloaded head %d '
+                '(no head_source; explicit topology will not guess an '
+                'ACE slot)' % head)
+            return
 
         key = '%d_%d' % (ace_idx, slot_idx)
         existing = self._slot_overrides.get(key) or {}
@@ -3929,8 +3805,6 @@ class MultiAce:
     def _push_rfid_info(self):
         logging.info('[multiACE] _push_rfid_info: active_device=%d, head_source=%s' % (
             self._active_device_index, str({k: (v['ace_index'] if v else None) for k, v in self._head_source.items()})))
-        active = self._active_device_index
-
         lines = []
         for head in range(4):
             source = self._head_source.get(head)
@@ -3975,46 +3849,9 @@ class MultiAce:
                         'FILAMENT_SUBTYPE=""' % (
                             head, fallback_type, fallback_color, fallback_brand))
             else:
-
-                if self._head_modes_explicit or self._single_head_mode():
-                    logging.info(
-                        '[multiACE] _push_rfid_info: head %d - empty routed '
-                        'head, clearing display' % head)
-                    self._expect_ptc_push(head, '', '000000FF', '', '')
-                    lines.append(
-                        'SET_PRINT_FILAMENT_CONFIG '
-                        'CONFIG_EXTRUDER=%d '
-                        'FILAMENT_TYPE="" '
-                        'FILAMENT_COLOR_RGBA=000000FF '
-                        'VENDOR="" '
-                        'FILAMENT_SUBTYPE=""' % head)
-                    continue
-
-                empty_override = self._override_for(active, head)
-                if empty_override is not None:
-                    ace_info = self._info_per_ace.get(active, {}) or {}
-                    aslots = ace_info.get('slots', []) or []
-                    aslot = aslots[head] if head < len(aslots) else {}
-                    push_type = empty_override.get('material') or aslot.get('type', 'PLA')
-                    push_color = self._override_color_to_rgba(empty_override.get('color', ''))
-                    push_brand = empty_override.get('brand') or aslot.get('brand', 'Generic')
-                    push_subtype = empty_override.get('subtype', '') or ''
-                    logging.info(
-                        '[multiACE] _push_rfid_info: head %d - unloaded, '
-                        'pushing override (active ACE %d / slot %d)' % (
-                            head, active, head))
-                    self._expect_ptc_push(head, push_type, push_color, push_brand, push_subtype)
-                    lines.append(
-                        'SET_PRINT_FILAMENT_CONFIG '
-                        'CONFIG_EXTRUDER=%d '
-                        'FILAMENT_TYPE="%s" '
-                        'FILAMENT_COLOR_RGBA=%s '
-                        'VENDOR="%s" '
-                        'FILAMENT_SUBTYPE="%s"' % (
-                            head, push_type, push_color, push_brand, push_subtype))
-                    continue
                 logging.info(
-                    '[multiACE] _push_rfid_info: head %d - empty, clearing display' % head)
+                    '[multiACE] _push_rfid_info: head %d - empty routed '
+                    'head, clearing display' % head)
                 self._expect_ptc_push(head, '', '000000FF', '', '')
                 lines.append(
                     'SET_PRINT_FILAMENT_CONFIG '
@@ -4036,6 +3873,11 @@ class MultiAce:
     def cmd_ACE_SWITCH(self, gcmd):
         target = gcmd.get_int('TARGET')
         autoload = gcmd.get_int('AUTOLOAD', 0)
+        if autoload:
+            raise gcmd.error(
+                '[multiACE] ACE_SWITCH AUTOLOAD is obsolete and disabled. '
+                'Use ACE_LOAD_HEAD/ACE_SWAP_HEAD with explicit HEAD, ACE '
+                'and SLOT from the configured topology.')
 
         if self._swap_in_progress:
             self.log_always(self._t('msg.switch_in_progress'))
@@ -4043,29 +3885,17 @@ class MultiAce:
         self._swap_in_progress = True
 
         try:
-            self._perform_switch(gcmd, target, autoload)
+            self._perform_switch(gcmd, target)
         finally:
             self._swap_in_progress = False
 
-    def _perform_switch(self, gcmd, target, autoload):
+    def _perform_switch(self, gcmd, target):
 
         self._refresh_ace_devices('switch')
 
         if not self._ace_devices:
             self.log_always(self._t('msg.no_ace_devices_detected'))
             return
-        if self._ace_route_error and autoload:
-            raise gcmd.error('[multiACE] ACE_SWITCH AUTOLOAD refused: %s' %
-                             self._ace_route_error)
-        if self._ace_route_mode == 'native_only' and autoload:
-            raise gcmd.error(
-                '[multiACE] ACE_SWITCH AUTOLOAD refused: no toolhead is '
-                'configured as ACE')
-        if self._head_modes_explicit and autoload:
-            raise gcmd.error(
-                '[multiACE] ACE_SWITCH AUTOLOAD is disabled with custom '
-                'toolhead/ACE routing. Use ACE_LOAD_HEAD/ACE_SWAP_HEAD '
-                'with explicit HEAD, ACE and SLOT.')
 
         if not self._is_ace_present(target):
             self._usb_log.info('RETRY [switch] target=%d not present, starting retries', target)
@@ -4083,88 +3913,31 @@ class MultiAce:
 
         switching_ace = target != self._active_device_index
 
-        if not switching_ace and not autoload:
+        if not switching_ace:
             self.log_always(self._t('msg.ace_already_active',
                 ace=self._disp(target)))
             return
 
-        if not switching_ace and autoload:
-            self.log_always(self._t('msg.ace_already_active_loading',
+        if target >= len(self._ace_devices) or not self._connected_per_ace.get(target, False):
+            self.log_always(self._t('msg.ace_not_connected',
                 ace=self._disp(target)))
-        else:
-            if target >= len(self._ace_devices) or not self._connected_per_ace.get(target, False):
-                self.log_always(self._t('msg.ace_not_connected',
-                    ace=self._disp(target)))
-                return
+            return
 
-            current_slot = self._feed_assist_per_ace.get(self._active_device_index, -1)
-            if current_slot != -1:
-                try:
-                    self._disarm_fa_for(self._active_device_index)
-                except Exception as e:
-                    logging.info('[multiACE] switch: stop_feed_assist failed: %s' % e)
+        current_slot = self._feed_assist_per_ace.get(self._active_device_index, -1)
+        if current_slot != -1:
+            try:
+                self._disarm_fa_for(self._active_device_index)
+            except Exception as e:
+                logging.info('[multiACE] switch: stop_feed_assist failed: %s' % e)
 
-                self.wait_ace_ready()
+            self.wait_ace_ready()
 
-            if autoload:
-                self.log_always(self._t('msg.switch_unloading_from',
-                    ace=self._disp(self._active_device_index)))
-                for gate in range(4):
-                    sensor = self.printer.lookup_object(
-                        'filament_motion_sensor e%d_filament' % gate, None)
-                    filament_in_head = sensor and sensor.get_status(0)['filament_detected']
-                    module, channel = self.EXTRUDER_MAP[gate]
-                    if filament_in_head:
-                        self.log_always(self._t('msg.switch_extruder_full_unload',
-                            head=gate))
-                        self.gcode.run_script_from_command(
-                            "FEED_AUTO MODULE=%s CHANNEL=%d EXTRUDER=%d UNLOAD=1 STAGE=prepare" % (module, channel, gate))
-                        self.gcode.run_script_from_command(
-                            "FEED_AUTO MODULE=%s CHANNEL=%d EXTRUDER=%d UNLOAD=1 STAGE=doing" % (module, channel, gate))
-                    else:
-                        self.log_always(self._t('msg.switch_extruder_skip_unload',
-                            head=gate))
-                machine_state_manager = self.printer.lookup_object('machine_state_manager', None)
-                if machine_state_manager is not None:
-                    self.gcode.run_script_from_command("SET_MAIN_STATE MAIN_STATE=IDLE ACTION=IDLE")
-                self.log_always(self._t('msg.switch_unload_complete'))
+        self.log_always(self._t('msg.switch_activating',
+            ace=self._disp(target)))
+        self._set_active_idx(target)
+        self._push_rfid_info()
 
-            self.log_always(self._t('msg.switch_activating',
-                ace=self._disp(target)))
-            self._set_active_idx(target)
-            self._push_rfid_info()
-
-        if autoload:
-            self.log_always(self._t('msg.switch_loading_from',
-                ace=self._disp(target)))
-            loaded_any = False
-
-            for gate in range(4):
-                sensor = self.printer.lookup_object(
-                    'filament_motion_sensor e%d_filament' % gate, None)
-                filament_in_head = sensor and sensor.get_status(0)['filament_detected']
-
-                if filament_in_head:
-                    self.log_always(self._t('msg.switch_extruder_already_loaded',
-                        head=gate))
-                elif self.gate_status[gate] == GATE_AVAILABLE:
-                    module, channel = self.EXTRUDER_MAP[gate]
-                    self.log_always(self._t('msg.switch_extruder_loading',
-                        head=gate))
-                    self.gcode.run_script_from_command(
-                        "FEED_AUTO MODULE=%s CHANNEL=%d EXTRUDER=%d LOAD=1" % (module, channel, gate))
-                    loaded_any = True
-                else:
-                    self.log_always(self._t('msg.switch_extruder_no_filament',
-                        head=gate))
-
-            if loaded_any:
-                self.log_always(self._t('msg.switch_load_complete',
-                    ace=self._disp(target)))
-            else:
-                self.log_always(self._t('msg.switch_nothing_to_load'))
-
-        self._audit_state('SWITCH', {'target': target, 'autoload': autoload})
+        self._audit_state('SWITCH', {'target': target})
 
     def _get_heads_for_ace_slot(self, ace_index, slot):
 
@@ -4439,12 +4212,12 @@ class MultiAce:
             'ace_changed': prev_active != target_ace,
         })
 
-    cmd_ACE_LOAD_HEAD_help = '[multiACE] Load a toolhead from ACE. Usage: ACE_LOAD_HEAD HEAD=0 [ACE=0] [SLOT=0]'
+    cmd_ACE_LOAD_HEAD_help = '[multiACE] Load a toolhead from ACE. Usage: ACE_LOAD_HEAD HEAD=0 ACE=0 SLOT=0'
     def cmd_ACE_LOAD_HEAD(self, gcmd):
 
         head = gcmd.get_int('HEAD')
-        ace_index = gcmd.get_int('ACE', self._active_device_index)
-        slot = gcmd.get_int('SLOT', head)
+        ace_index = gcmd.get_int('ACE')
+        slot = gcmd.get_int('SLOT')
         self._last_load_ok = True
 
         if head < 0 or head > 3:
@@ -4640,22 +4413,13 @@ class MultiAce:
                         '[multiACE] Failed to connect to ACE %d for unload!' % ace_index)
         else:
             self.log_always(self._t('msg.unload_head_no_mapping', head=head))
-            if self._head_modes_explicit:
-                ace_index = self._configured_ace_for_head(head)
-                if ace_index is None:
-                    raise gcmd.error(
-                        '[multiACE] ACE_UNLOAD_HEAD refused: HEAD=%d has '
-                        'no saved source and no unique configured ACE target'
-                        % head)
-                if not self._ensure_ace_available(ace_index):
-                    raise gcmd.error(
-                        '[multiACE] ACE_UNLOAD_HEAD refused: configured ACE '
-                        '%d for HEAD=%d is not available' % (ace_index, head))
-                if ace_index != self._active_device_index:
-                    if not self._switch_ace_for_head_target(ace_index):
-                        raise gcmd.error(
-                            '[multiACE] Failed to connect to ACE %d for '
-                            'unload!' % ace_index)
+            raise gcmd.error(
+                '[multiACE] ACE_UNLOAD_HEAD refused: HEAD=%d has '
+                'filament but no saved ACE/slot source. Refusing to '
+                'guess the slot. Recover by running ACE_LOAD_HEAD '
+                'HEAD=%d ACE=<n> SLOT=<n> for the slot that is already '
+                'loaded, then unload again.'
+                % (head, head))
 
         def _noop_cb(self, response):
             pass
@@ -5068,12 +4832,12 @@ class MultiAce:
             % (head, self.swap_default_temp))
         return self.swap_default_temp
 
-    cmd_ACE_SWAP_HEAD_help = '[multiACE] Mid-print filament swap. Usage: ACE_SWAP_HEAD HEAD=0 ACE=1 [SLOT=0]'
+    cmd_ACE_SWAP_HEAD_help = '[multiACE] Mid-print filament swap. Usage: ACE_SWAP_HEAD HEAD=0 ACE=1 SLOT=0'
     def cmd_ACE_SWAP_HEAD(self, gcmd):
 
         head = gcmd.get_int('HEAD')
         ace_index = gcmd.get_int('ACE')
-        slot = gcmd.get_int('SLOT', head)
+        slot = gcmd.get_int('SLOT')
 
         if head < 0 or head > 3:
             raise gcmd.error('[multiACE] HEAD must be 0-3')
@@ -5087,8 +4851,8 @@ class MultiAce:
                 '[multiACE] SWAP refused: head %d is a ghost (filament at '
                 'toolhead but no head_source mapping recorded). FA routing '
                 'would have to guess which ACE to drive. '
-                'Recover: ACEC__Unload_All then ACEB__Load_%d, then restart '
-                'the print.' % (head, head))
+                'Recover: ACEC__Unload_All, then load the target slot from '
+                'the dashboard, then restart the print.' % head)
 
         source = self._head_source.get(head)
         if (source and source['ace_index'] == ace_index and source['slot'] == slot
@@ -6024,36 +5788,7 @@ class MultiAce:
     def _push_slot_rfid_to_extruder(self, head):
 
         try:
-            if self._head_modes_explicit or self._single_head_mode():
-                self._clear_filament_display(head)
-                return
-            slots = self._info.get('slots', [{}] * 4)
-            if head < 0 or head >= len(slots):
-                return
-            si = slots[head]
-            if si.get('rfid') != 2:
-                return
-
-            ov = self._override_for(self._active_device_index, head)
-            if ov is not None:
-                push_type    = ov.get('material') or si.get('type', 'PLA')
-                push_color   = self._override_color_to_rgba(ov.get('color', ''))
-                push_brand   = ov.get('brand') or si.get('brand', 'Generic')
-                push_subtype = ov.get('subtype', '') or ''
-            else:
-                push_type    = si.get('type', 'PLA')
-                push_color   = self.rgb2hex(*si.get('color', (0, 0, 0)))
-                push_brand   = si.get('brand', 'Generic')
-                push_subtype = ''
-            self._expect_ptc_push(head, push_type, push_color, push_brand, push_subtype)
-            self.gcode.run_script_from_command(
-                'SET_PRINT_FILAMENT_CONFIG '
-                'CONFIG_EXTRUDER=%d '
-                'FILAMENT_TYPE="%s" '
-                'FILAMENT_COLOR_RGBA=%s '
-                'VENDOR="%s" '
-                'FILAMENT_SUBTYPE="%s"' % (
-                    head, push_type, push_color, push_brand, push_subtype))
+            self._clear_filament_display(head)
         except Exception as e:
             logging.info(
                 '[multiACE] _push_slot_rfid_to_extruder(%d) failed: %s' % (head, e))
@@ -6084,13 +5819,9 @@ class MultiAce:
                              self._ace_route_error)
         if self._ace_route_mode == 'native_only':
             heads = []
-        elif self._single_head_mode():
-            heads = [self._ace_primary_head]
-        elif self._head_modes_explicit:
+        else:
             heads = sorted(set([
                 h for h in self._ace_targets.values() if h is not None]))
-        else:
-            heads = range(4)
         for head in heads:
             sensor = self.printer.lookup_object(
                 'filament_motion_sensor e%d_filament' % head, None)
@@ -6098,6 +5829,13 @@ class MultiAce:
                 continue
 
             source = self._head_source.get(head)
+            if source is None:
+                raise gcmd.error(
+                    '[multiACE] ACE_UNLOAD_ALL_HEADS refused: HEAD=%d has '
+                    'filament but no saved ACE/slot source. Refusing to '
+                    'guess the slot. Recover this head with ACE_LOAD_HEAD '
+                    'HEAD=%d ACE=<n> SLOT=<n>, then unload again.'
+                    % (head, head))
             if source and source['ace_index'] != self._active_device_index:
                 self.log_always(self._t('msg.switching_ace_for_retract',
                     ace=self._disp(source['ace_index']), head=head))
@@ -6192,58 +5930,12 @@ class MultiAce:
         self.log_always(self._t('msg.drying_ace_at',
             ace=self._disp(ace_idx), temp=temp, duration=duration))
 
-    cmd_ACE_RUN_MODE_SWITCH_help = '[multiACE] Switch mode: normal (stock), single (one ACE), multi (multi-ACE)'
+    cmd_ACE_RUN_MODE_SWITCH_help = '[multiACE] Obsolete mode switch command (disabled)'
     def cmd_ACE_RUN_MODE_SWITCH(self, gcmd):
-        mode = gcmd.get('MODE', '').lower()
-        if mode not in ('normal', 'single', 'multi'):
-            raise gcmd.error('[multiACE] Invalid mode: %s. Use normal, single, or multi.' % mode)
-
-        current = self._ace_mode
-
-        if mode in ('single', 'multi') and current in ('single', 'multi'):
-            self.gcode.run_script_from_command(
-                "SAVE_VARIABLE VARIABLE=ace__mode VALUE=\"'%s'\"" % mode)
-            self._ace_mode = mode
-            if mode == 'multi':
-                self._restore_head_source()
-                self.printer.register_event_handler(
-                    'extruder:activate_extruder', self._on_extruder_change)
-            self.log_always(self._t('msg.switched_to_mode', mode=mode.upper()))
-            return
-
-        save_vars = self.printer.lookup_object('save_variables')
-        vars_path = save_vars.filename
-        script_dir = os.path.dirname(os.path.abspath(vars_path))
-        script = os.path.join(script_dir, 'ace_mode_switch.sh')
-        if not os.path.exists(script):
-            raise gcmd.error('[multiACE] Mode switch script not found: %s' % script)
-
-        file_mode = 'normal' if mode == 'normal' else 'ace'
-
-        self.log_always(self._t('msg.running_mode_switch', mode=mode.upper()))
-
-        self.gcode.run_script_from_command(
-            "SAVE_VARIABLE VARIABLE=ace__mode VALUE=\"'%s'\"" % mode)
-
-        try:
-            import subprocess
-            result = subprocess.run(['bash', script, file_mode],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    timeout=30)
-            if result.returncode != 0:
-                raise gcmd.error(
-                    '[multiACE] Mode switch script failed (rc=%d): %s' % (
-                        result.returncode, result.stderr.decode('utf-8', 'replace')))
-        except subprocess.TimeoutExpired:
-            raise gcmd.error('[multiACE] Mode switch script timed out after 30s')
-        except Exception as e:
-            raise gcmd.error('[multiACE] Failed to run mode switch script: %s' % str(e))
-
-        self.gcode.run_script_from_command(
-            'RAISE_EXCEPTION ID=6666 INDEX=6 CODE=6 MESSAGE="[multiACE] Switched to %s mode. Please reboot!" ONESHOT=0 LEVEL=2' % mode.upper())
-
         raise gcmd.error(
-            '[multiACE] Switched to %s mode. Please reboot the printer to activate!' % mode.upper())
+            '[multiACE] ACE_RUN_MODE_SWITCH is obsolete and disabled. '
+            'multiACE now always runs from explicit headN_mode + aceN_head '
+            'topology. Change topology in the dashboard, then Apply topology.')
 
     _UPDATE_SCRIPT = '/home/lava/multiace_update.sh'
 

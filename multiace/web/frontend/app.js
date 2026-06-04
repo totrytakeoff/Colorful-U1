@@ -107,8 +107,8 @@ createApp({
       ace_status: null, ace_temp: null,
       printer_state: null,
       active_device: null, device_count: 0,
-      mode: "normal",
-      route: {mode: "standard", primary_head: 0, slot_targets: {}},
+      mode: "multi",
+      route: {mode: "single_head", primary_head: 0, slot_targets: {}},
       dryer: null,
       swap_in_progress: false,
       aces: [], toolheads: [], wiring: [],
@@ -159,8 +159,8 @@ createApp({
       state.printer_state = s.printer_state ?? null;
       state.active_device = s.active_device ?? null;
       state.device_count  = s.device_count ?? 0;
-      state.mode          = s.mode || "normal";
-      state.route         = s.route || {mode: "standard", primary_head: 0, slot_targets: {}};
+      state.mode          = s.mode || "multi";
+      state.route         = s.route || {mode: "single_head", primary_head: 0, slot_targets: {}};
       state.dryer         = s.dryer ?? null;
       state.swap_in_progress = !!s.swap_in_progress;
       state.aces          = Array.isArray(s.aces) ? s.aces : [];
@@ -376,7 +376,7 @@ createApp({
         case 'ACE_UNLOAD_ALL_HEADS':
           return 'Unload all';
         case 'ACE_SWITCH':
-          return `ACE ${di(a.TARGET ?? 0)}` + ((a.AUTOLOAD == 1 || a.AUTOLOAD === true) ? ' (auto-load)' : '');
+          return `ACE ${di(a.TARGET ?? 0)}`;
         case 'ACE_DRY':
           return `Dry ACE ${di(a.ACE ?? 0)} ${a.TEMP}°C / ${a.DURATION}min`;
         case 'ACE_STOP_DRYING':
@@ -446,9 +446,6 @@ createApp({
     watch(() => tab.value, (v) => { if (v === "dashboard") scheduleWiringRecompute(); });
     function switchAce(idx) {
       run("ACE_SWITCH", {TARGET: idx});
-    }
-    function loadAll(idx) {
-      run("ACE_SWITCH", {TARGET: idx, AUTOLOAD: 1});
     }
     function _phaseFor(channelState) {
       if (!channelState) return null;
@@ -875,8 +872,8 @@ createApp({
       }
     }
     watch(() => configForm.ace_device_count, _ensurePerAceLength, {immediate: true});
-    const modeChangePending = ref(false);
     const topologySaving = ref(false);
+    const topologyDirty = ref(false);
     function paramsToForm(params, perAceParams) {
       if (!params) return;
       const num  = (k) => params[k] != null ? Number(params[k]) : configForm[k];
@@ -892,13 +889,10 @@ createApp({
         }
       }
       if (!anyHeadMode) {
-        const routeMode = params.ace_route_mode === 'single_head' ? 'single_head' : 'standard';
-        const primary = Math.max(0, Math.min(3, num('ace_primary_head') | 0));
-        for (let h = 0; h < 4; h++) {
-          configForm.headModes[h] = routeMode === 'single_head'
-            ? (h === primary ? 'ace' : 'native')
-            : 'ace';
-        }
+        configForm.headModes[0] = 'ace';
+        configForm.headModes[1] = 'native';
+        configForm.headModes[2] = 'native';
+        configForm.headModes[3] = 'native';
       }
       _ensurePerAceLength();
       for (let ace = 0; ace < configForm.aceTargets.length; ace++) {
@@ -948,24 +942,12 @@ createApp({
     function formToCfgContent(content) {
       const lines = content.split('\n');
       const numStr = (v) => (v === '' || v == null) ? '' : String(v);
-      const aceHeads = configForm.headModes
-        .map((m, h) => m === 'ace' ? h : null)
-        .filter(h => h != null);
-      const assignedHeads = configForm.aceTargets
-        .map(v => (v === '' || v == null) ? null : Number(v))
-        .filter(v => v != null && Number.isFinite(v));
-      const assignedHeadSet = Array.from(new Set(assignedHeads));
-      const primaryHead = assignedHeads.length
-        ? assignedHeads[0]
-        : (aceHeads.length ? aceHeads[0] : 0);
       const mainRepl = {
         ace_device_count:   numStr(configForm.ace_device_count),
         head0_mode:         configForm.headModes[0] === 'ace' ? 'ace' : 'native',
         head1_mode:         configForm.headModes[1] === 'ace' ? 'ace' : 'native',
         head2_mode:         configForm.headModes[2] === 'ace' ? 'ace' : 'native',
         head3_mode:         configForm.headModes[3] === 'ace' ? 'ace' : 'native',
-        ace_route_mode:     assignedHeadSet.length === 1 ? 'single_head' : 'standard',
-        ace_primary_head:   numStr(primaryHead),
         feed_speed:         numStr(configForm.feed_speed),
         retract_speed:      numStr(configForm.retract_speed),
         load_length:        numStr(configForm.load_length),
@@ -1014,6 +996,11 @@ createApp({
       }
       const keyRegex = /^\s*#?\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/;
       const sectionRegex = /^\s*\[(.+?)\]\s*$/;
+      const obsoleteAceKeys = new Set([
+        'ace_route_mode',
+        'ace_primary_head',
+        'print_mode',
+      ]);
       const out = [];
       let curSection = null;
       const sectionEnd = {};
@@ -1046,6 +1033,9 @@ createApp({
         }
         if (curSection === 'ace') {
           const m = raw.match(keyRegex);
+          if (m && obsoleteAceKeys.has(m[1])) {
+            continue;
+          }
           if (m && (m[1] in mainRepl)) {
             const key = m[1];
             const val = mainRepl[key];
@@ -1330,19 +1320,25 @@ createApp({
         if (!r.ok) throw new Error(`HTTP ${r.status} ${await r.text()}`);
         config.content = newContent;
         config.params = {};
-        modeChangePending.value = true;
+        topologyDirty.value = false;
         await loadConfig();
         await reloadState();
       } finally {
         topologySaving.value = false;
       }
     }
-    async function saveToolheadModes(modes) {
-      if (!config.content) await loadConfig();
-      for (let h = 0; h < 4; h++) {
-        configForm.headModes[h] = modes[h] === 'ace' ? 'ace' : 'native';
+    async function applyTopologyChanges() {
+      try {
+        await saveTopology();
+        setMacroLog('Toolhead topology saved. Klipper restart requested.');
+      } catch (e) {
+        setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
       }
-      await saveTopology();
+    }
+    async function discardTopologyChanges() {
+      await loadConfig();
+      topologyDirty.value = false;
+      setMacroLog('Discarded pending toolhead topology changes.');
     }
     async function setToolheadMode(idx, mode) {
       const targetMode = mode === 'ace' ? 'ace' : 'native';
@@ -1365,12 +1361,11 @@ createApp({
           }
         }
       }
-      try {
-        await saveToolheadModes(next);
-        setMacroLog(`Toolhead T${dispIdx(idx)} source saved as ${targetMode.toUpperCase()}. Klipper restart requested.`);
-      } catch (e) {
-        setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
+      for (let h = 0; h < 4; h++) {
+        configForm.headModes[h] = next[h] === 'ace' ? 'ace' : 'native';
       }
+      topologyDirty.value = true;
+      setMacroLog(`Toolhead T${dispIdx(idx)} source staged as ${targetMode.toUpperCase()}. Apply topology to restart Klipper.`);
     }
     function canChangeToolheadMode(th) {
       if (!th) return !topologySaving.value;
@@ -1406,24 +1401,8 @@ createApp({
         }
       }
       configForm.aceTargets[aceIdx] = target;
-      try {
-        await saveTopology();
-        setMacroLog(`ACE ${dispIdx(aceIdx)} target saved. Klipper restart requested.`);
-      } catch (e) {
-        setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
-      }
-    }
-    async function setMode(m) {
-      if (state.mode === m) return;
-      confirm({
-        title: t("ui.dialog.switch_mode_title", {mode: m}),
-        message: t("ui.dialog.switch_mode_msg", {mode: m}),
-        okLabel: t("ui.dialog.switch"),
-        onOk: async () => {
-          const ok = await run("SET_ACE_MODE", {MODE: m});
-          if (ok) modeChangePending.value = true;
-        },
-      });
+      topologyDirty.value = true;
+      setMacroLog(`ACE ${dispIdx(aceIdx)} target staged. Apply topology to restart Klipper.`);
     }
     const screenCanvas = ref(null);
     const floatScreenCanvas = ref(null);
@@ -1675,6 +1654,10 @@ createApp({
     }
     async function startPreflightPrint(mode) {
       if (preflight.busy || preflight.sending) return;
+      if (mode !== "slicer") {
+        preflight.error = t("ui.preflight.mvp_slicer_only");
+        return;
+      }
       const rep = preflight.report;
       if (!rep || !rep.token) return;
       preflight.sending = mode;
@@ -1785,13 +1768,14 @@ createApp({
     return {
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
-      slotTitle, switchAce, loadSlot, loadAll, unloadHead, isToolheadOccupied, toolheadOps,
+      slotTitle, switchAce, loadSlot, unloadHead, isToolheadOccupied, toolheadOps,
       toolheadMode, setToolheadMode, canChangeToolheadMode, toolheadAceSlots,
       aceTarget, aceTargetOptions, setAceTarget, canChangeAceTarget,
+      applyTopologyChanges, discardTopologyChanges,
       dryerCfg, dryStart, dryStop, dryOpenAce, toggleDryPanel, aceDrying,
       snapshots, selectedSnapshot, snapshotPreview, saveSnapshot, loadSnapshot, deleteSnapshot,
-      config, configLog, configLoadError, showRawConfig, configForm, modeChangePending, topologySaving,
-      loadConfig, saveConfigForm, saveConfigRaw, setMode,
+      config, configLog, configLoadError, showRawConfig, configForm, topologySaving, topologyDirty,
+      loadConfig, saveConfigForm, saveConfigRaw,
       preflight, closePreflight, startPreflightPrint, stageLabel,
       tierLabel, tierWarn, rgbDec, sortedMapping,
       updateState, updateCheck, updateApply,

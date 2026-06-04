@@ -132,7 +132,7 @@
       "unload_empty_msg": "T{slot} 报告没有耗材。再次退料可能会把线盘从 ACE 槽位中推出。<br>是否继续？",
       "force_unload": "仍然退料",
       "switch_mode_title": "切换到 “{mode}” 模式？",
-      "switch_mode_msg": "将执行 SET_ACE_MODE MODE={mode}。<br>前提：所有工具头必须已退料。<br>之后需要重启 Klipper。",
+      "switch_mode_msg": "模式切换已废弃。请在控制台的工具头拓扑里配置每个工具头来源和 ACE 归属，然后应用拓扑。",
       "switch": "切换",
       "apply_snapshot_title": "应用快照 “{name}”？",
       "apply_snapshot_msg": "将按顺序执行以下操作：<br>1) 退掉来自其他来源的工具头耗材<br>2) 每个 ACE：切换并加载指定工具头",
@@ -203,6 +203,7 @@
       "stage_done": "完成",
       "swaps_label": "次换料",
       "not_feasible": "不可行",
+      "mvp_slicer_only": "MVP 实机测试阶段仅开放当前布局打印。",
       "slicer": "切片",
       "printer": "打印机",
       "match_tier": "匹配"

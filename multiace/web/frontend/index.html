@@ -102,10 +102,6 @@
                         :class="{active: dryOpenAce === ace.idx, running: aceDrying(ace)}"
                         @click="toggleDryPanel(ace.idx)"
                         :title="t('ui.dashboard.dryer')">☀</button>
-                <button class="ace-load-all"
-                        @click.stop="loadAll(ace.idx)"
-                        :disabled="state.route && state.route.mode !== 'standard'"
-                        title="Disabled unless legacy standard routing is active">{{ t('ui.dashboard.load_all') }}</button>
               </span>
             </h2>
             <div class="slot-row" @click.stop>
@@ -158,6 +154,19 @@
         </div>
         <h3 class="th-section-head">
           <span>{{ t('ui.dashboard.toolheads') }}</span>
+          <span class="topology-actions">
+            <small v-if="topologyDirty" class="topology-dirty">Pending topology changes</small>
+            <button class="topology-apply"
+                    @click="applyTopologyChanges"
+                    :disabled="!topologyDirty || topologySaving">
+              {{ topologySaving ? t('ui.common.saving') : 'Apply topology' }}
+            </button>
+            <button class="topology-discard"
+                    @click="discardTopologyChanges"
+                    :disabled="!topologyDirty || topologySaving">
+              Discard
+            </button>
+          </span>
           <button class="unload-all-btn" @click="run('ACE_UNLOAD_ALL_HEADS')">{{ t('ui.dashboard.unload_all') }}</button>
         </h3>
         <div class="toolhead-grid">
@@ -260,9 +269,6 @@
         <span class="pill">Route: <strong>{{ state.route && state.route.mode || 'unknown' }}</strong></span>
         <span v-if="state.route && state.route.error" class="pill warn-pill">
           {{ state.route.error }}
-        </span>
-        <span v-if="modeChangePending" class="pill warn-pill">
-          {{ t('ui.config.mode_change_pending') }}
         </span>
       </div>
       <h3>{{ t('ui.config.parameters') }}</h3>
@@ -744,12 +750,15 @@ reboot</pre>
             <div class="row" v-if="!preflight.report.missing_materials.length
                                    && preflight.report.plans[mode].feasible">
               <button class="primary"
-                      :disabled="preflight.sending !== ''"
+                      :disabled="preflight.sending !== '' || mode !== 'slicer'"
                       @click="startPreflightPrint(mode)">
                 {{ preflight.sending === mode
                      ? t('ui.preflight.sending')
                      : t('ui.preflight.go_' + mode) }}
               </button>
+              <span v-if="mode !== 'slicer'" class="muted small">
+                {{ t('ui.preflight.mvp_slicer_only') }}
+              </span>
             </div>
           </div>
         </template>
