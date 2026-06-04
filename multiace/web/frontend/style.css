@@ -246,6 +246,9 @@ button.slot.state-unknown { background: #333; color: #555; }
                      border: 1px solid var(--border); border-radius: 3px; cursor: pointer; font-size: .8rem; }
 .dryer-form button:hover { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .dryer-form button.warn:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+.ace-target { display: flex; gap: .3rem; align-items: center; color: var(--muted); font-size: .75rem; }
+.ace-target select { max-width: 5.5rem; padding: .25rem .35rem; background: #111; color: var(--fg);
+                     border: 1px solid var(--border); border-radius: 3px; font-size: .78rem; }
 .toolhead-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .8rem; }
 .toolhead-card { background: var(--card); border: 1px solid var(--border); padding: .8rem; border-radius: 6px; }
 .toolhead-card.empty   { opacity: .5; }
@@ -266,6 +269,19 @@ button.slot.state-unknown { background: #333; color: #555; }
 .toolhead-card h2 small { color: #888; font-weight: 400; font-size: .7rem; }
 .toolhead-card .th-color { width: 14px; height: 14px; border-radius: 50%; margin-left: auto; border: 1px solid #444; }
 .toolhead-card code { font-size: .75rem; color: #6cc; }
+.toolhead-source { display: grid; grid-template-columns: auto 1fr; gap: .5rem; align-items: center; margin: .45rem 0 .55rem; }
+.toolhead-source label { color: var(--muted); font-size: .78rem; }
+.toolhead-source select { min-width: 0; padding: .32rem .45rem; background: #111; color: var(--fg);
+                          border: 1px solid var(--border); border-radius: 4px; font-size: .84rem; }
+.toolhead-native-panel, .toolhead-ace-panel { margin-top: .55rem; padding-top: .55rem; border-top: 1px solid var(--border); }
+.mini-btn { padding: .32rem .7rem; background: var(--card); color: var(--fg);
+            border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: .78rem; }
+.mini-btn:hover { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.toolhead-slot-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .35rem; }
+.mini-slot { min-height: 2.6rem; padding: .35rem; border-radius: 4px; border: 1px solid var(--border);
+             background: #222; color: #fff; cursor: pointer; text-align: left; font-size: .76rem;
+             text-shadow: 0 1px 2px rgba(0,0,0,.75); overflow: hidden; }
+.mini-slot em { display: block; font-style: normal; opacity: .9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .toolhead-actions { display: flex; gap: .4rem; margin-top: .6rem; }
 .toolhead-actions button { flex: 1; padding: .35rem .9rem; border-radius: 4px; cursor: pointer; font-size: .8rem;
                             background: var(--card); color: var(--fg); border: 1px solid var(--border);

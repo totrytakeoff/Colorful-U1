@@ -1,7 +1,8 @@
 const { createApp, ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } = Vue;
-const API = "/multiace/api";
+const BASE = location.pathname.startsWith("/multiace/") ? "/multiace" : "";
+const API = `${BASE}/api`;
 const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
-             + location.host + "/multiace/ws";
+             + location.host + `${BASE}/ws`;
 const SCREEN = "/screen";
 createApp({
   setup() {
@@ -107,6 +108,7 @@ createApp({
       printer_state: null,
       active_device: null, device_count: 0,
       mode: "normal",
+      route: {mode: "standard", primary_head: 0, slot_targets: {}},
       dryer: null,
       swap_in_progress: false,
       aces: [], toolheads: [], wiring: [],
@@ -158,6 +160,7 @@ createApp({
       state.active_device = s.active_device ?? null;
       state.device_count  = s.device_count ?? 0;
       state.mode          = s.mode || "normal";
+      state.route         = s.route || {mode: "standard", primary_head: 0, slot_targets: {}};
       state.dryer         = s.dryer ?? null;
       state.swap_in_progress = !!s.swap_in_progress;
       state.aces          = Array.isArray(s.aces) ? s.aces : [];
@@ -467,22 +470,35 @@ createApp({
       return ops;
     });
     function isToolheadOccupied(aceIdx, slotIdx) {
-      const th = state.toolheads.find(tt => tt.idx === slotIdx);
+      const slot = (state.aces.find(a => a.idx === aceIdx)?.slots || [])
+        .find(s => s.idx === slotIdx);
+      const headIdx = slot?.target_head;
+      if (headIdx == null) return true;
+      const th = state.toolheads.find(tt => tt.idx === headIdx);
       if (!th) return false;
-      if (th.head_source_known) return th.ace === aceIdx;
+      if (th.head_source_known) {
+        return th.ace === aceIdx && th.slot === slotIdx;
+      }
       return !!th.filament_at_extruder;
     }
     function unloadHead(idx) {
       run("ACE_UNLOAD_HEAD", {HEAD: idx});
     }
     function loadSlot(aceIdx, slotIdx) {
-      const th = state.toolheads.find(tt => tt.idx === slotIdx);
-      if (th && th.head_source_known && th.ace !== aceIdx) {
-        enqueue("ACE_UNLOAD_HEAD", {HEAD: slotIdx});
-        enqueue("ACE_LOAD_HEAD",   {HEAD: slotIdx, ACE: aceIdx});
+      const slot = (state.aces.find(a => a.idx === aceIdx)?.slots || [])
+        .find(s => s.idx === slotIdx);
+      const headIdx = slot?.target_head;
+      if (headIdx == null) {
+        setMacroLog(`Slot ACE ${dispIdx(aceIdx)} / ${dispIdx(slotIdx)} has no ACE toolhead target.`);
         return;
       }
-      enqueue("ACE_LOAD_HEAD", {HEAD: slotIdx, ACE: aceIdx});
+      const th = state.toolheads.find(tt => tt.idx === headIdx);
+      if (th && th.head_source_known && (th.ace !== aceIdx || th.slot !== slotIdx)) {
+        enqueue("ACE_UNLOAD_HEAD", {HEAD: headIdx});
+        enqueue("ACE_LOAD_HEAD",   {HEAD: headIdx, ACE: aceIdx, SLOT: slotIdx});
+        return;
+      }
+      enqueue("ACE_LOAD_HEAD", {HEAD: headIdx, ACE: aceIdx, SLOT: slotIdx});
     }
     // Default/fallback list; the live list is loaded from /api/materials
     // (a user-editable materials.json) so users can extend it themselves.
@@ -525,6 +541,23 @@ createApp({
       picker.show = true;
     }
     function closePicker() { picker.show = false; }
+    const nativePicker = reactive({
+      show: false,
+      head: 0,
+      material: "PLA",
+      subtype: "Basic",
+      vendor: "Generic",
+      color: "#ffffff",
+    });
+    function openNativePicker(th) {
+      nativePicker.head = th.idx;
+      nativePicker.material = th.material || "PLA";
+      nativePicker.subtype = th.sku || "Basic";
+      nativePicker.vendor = th.brand || "Generic";
+      nativePicker.color = th.color || "#ffffff";
+      nativePicker.show = true;
+    }
+    function closeNativePicker() { nativePicker.show = false; }
     function _pickerSlot() {
       const a = state.aces.find(x => x.idx === picker.ace);
       if (!a) return null;
@@ -558,17 +591,35 @@ createApp({
       if (r.brand)    picker.vendor   = r.brand;
       if (r.color)    picker.color    = r.color;
     }
-    function _ptcGcodeFor(aceIdx, slotIdx, mat, brand, sub, colorHex) {
+    function _ptcGcodeForHead(headIdx, mat, brand, sub, colorHex) {
       const dq = (s) => `"${String(s || "").replace(/"/g, "")}"`;
       const hex = (colorHex || "#ffffff").replace("#", "");
       const colorRGBA = hex.toUpperCase() + "FF";
       return {
-        CONFIG_EXTRUDER: slotIdx,
+        CONFIG_EXTRUDER: headIdx,
         FILAMENT_TYPE:   dq(mat || "PLA"),
         FILAMENT_COLOR_RGBA: colorRGBA,
         VENDOR:          dq(brand || "Generic"),
         FILAMENT_SUBTYPE: dq(sub || ""),
       };
+    }
+    function _ptcGcodeFor(aceIdx, slotIdx, mat, brand, sub, colorHex) {
+      const slot = (state.aces.find(a => a.idx === aceIdx)?.slots || [])
+        .find(s => s.idx === slotIdx);
+      const headIdx = slot?.target_head;
+      if (headIdx == null) {
+        throw new Error(`ACE ${dispIdx(aceIdx)} slot ${dispIdx(slotIdx)} has no target toolhead`);
+      }
+      return _ptcGcodeForHead(headIdx, mat, brand, sub, colorHex);
+    }
+    function saveNativePicker() {
+      enqueue("SET_PRINT_FILAMENT_CONFIG", _ptcGcodeForHead(
+        nativePicker.head,
+        nativePicker.material,
+        nativePicker.vendor,
+        nativePicker.subtype,
+        nativePicker.color));
+      closeNativePicker();
     }
     async function savePicker(loadAfter) {
       const aceIdx = picker.ace;
@@ -590,6 +641,13 @@ createApp({
         setMacroLog(`${t("ui.common.error")}: ${e}`);
       }
       closePicker();
+      enqueue("SET_PRINT_FILAMENT_CONFIG", _ptcGcodeFor(
+        aceIdx,
+        slotIdx,
+        picker.material,
+        picker.vendor,
+        picker.subtype,
+        picker.color), {silent: true});
       enqueue("MULTIACE_REFRESH_OVERRIDES", {}, {silent: true});
       if (loadAfter) {
         loadSlot(aceIdx, slotIdx);
@@ -769,6 +827,8 @@ createApp({
     const showRawConfig = ref(false);
     const configForm = reactive({
       ace_device_count: 1,
+      headModes: ['ace', 'native', 'native', 'native'],
+      aceTargets: [],
       feed_speed: 80,
       retract_speed: 80,
       load_length: 2100,
@@ -800,22 +860,56 @@ createApp({
       };
     }
     function _ensurePerAceLength() {
-      const n = Math.max(0, Math.min(4, configForm.ace_device_count | 0));
+      const n = Math.max(0, Math.min(8, configForm.ace_device_count | 0));
       while (configForm.perAce.length < n) {
         configForm.perAce.push(_makePerAceEntry());
       }
       while (configForm.perAce.length > n) {
         configForm.perAce.pop();
       }
+      while (configForm.aceTargets.length < n) {
+        configForm.aceTargets.push('');
+      }
+      while (configForm.aceTargets.length > n) {
+        configForm.aceTargets.pop();
+      }
     }
     watch(() => configForm.ace_device_count, _ensurePerAceLength, {immediate: true});
     const modeChangePending = ref(false);
+    const topologySaving = ref(false);
     function paramsToForm(params, perAceParams) {
       if (!params) return;
       const num  = (k) => params[k] != null ? Number(params[k]) : configForm[k];
       const bool = (k) => params[k] != null ? params[k] === 'true' : configForm[k];
       const numOrEmpty = (v) => (v != null && v !== '') ? Number(v) : '';
       configForm.ace_device_count = num('ace_device_count');
+      let anyHeadMode = false;
+      for (let h = 0; h < 4; h++) {
+        const mode = String(params[`head${h}_mode`] || '').trim().toLowerCase();
+        if (mode === 'ace' || mode === 'native') {
+          configForm.headModes[h] = mode;
+          anyHeadMode = true;
+        }
+      }
+      if (!anyHeadMode) {
+        const routeMode = params.ace_route_mode === 'single_head' ? 'single_head' : 'standard';
+        const primary = Math.max(0, Math.min(3, num('ace_primary_head') | 0));
+        for (let h = 0; h < 4; h++) {
+          configForm.headModes[h] = routeMode === 'single_head'
+            ? (h === primary ? 'ace' : 'native')
+            : 'ace';
+        }
+      }
+      _ensurePerAceLength();
+      for (let ace = 0; ace < configForm.aceTargets.length; ace++) {
+        const raw = String(params[`ace${ace}_head`] ?? '').trim().toLowerCase();
+        if (raw === '' || raw === 'none' || raw === 'native' || raw === 'off' || raw === '-1') {
+          configForm.aceTargets[ace] = '';
+        } else {
+          const n = Number(raw);
+          configForm.aceTargets[ace] = Number.isFinite(n) ? Math.max(0, Math.min(3, n | 0)) : '';
+        }
+      }
       configForm.feed_speed     = num('feed_speed');
       configForm.retract_speed  = num('retract_speed');
       configForm.load_length    = num('load_length');
@@ -832,7 +926,6 @@ createApp({
       configForm.state_debug    = bool('state_debug');
       configForm.usb_debug      = bool('usb_debug');
       configForm.fa_debug       = bool('fa_debug');
-      _ensurePerAceLength();
       const pa = perAceParams || {};
       for (let i = 0; i < configForm.perAce.length; i++) {
         const t = params[`dryer_temp_${i}`];
@@ -855,8 +948,24 @@ createApp({
     function formToCfgContent(content) {
       const lines = content.split('\n');
       const numStr = (v) => (v === '' || v == null) ? '' : String(v);
+      const aceHeads = configForm.headModes
+        .map((m, h) => m === 'ace' ? h : null)
+        .filter(h => h != null);
+      const assignedHeads = configForm.aceTargets
+        .map(v => (v === '' || v == null) ? null : Number(v))
+        .filter(v => v != null && Number.isFinite(v));
+      const assignedHeadSet = Array.from(new Set(assignedHeads));
+      const primaryHead = assignedHeads.length
+        ? assignedHeads[0]
+        : (aceHeads.length ? aceHeads[0] : 0);
       const mainRepl = {
         ace_device_count:   numStr(configForm.ace_device_count),
+        head0_mode:         configForm.headModes[0] === 'ace' ? 'ace' : 'native',
+        head1_mode:         configForm.headModes[1] === 'ace' ? 'ace' : 'native',
+        head2_mode:         configForm.headModes[2] === 'ace' ? 'ace' : 'native',
+        head3_mode:         configForm.headModes[3] === 'ace' ? 'ace' : 'native',
+        ace_route_mode:     assignedHeadSet.length === 1 ? 'single_head' : 'standard',
+        ace_primary_head:   numStr(primaryHead),
         feed_speed:         numStr(configForm.feed_speed),
         retract_speed:      numStr(configForm.retract_speed),
         load_length:        numStr(configForm.load_length),
@@ -874,6 +983,14 @@ createApp({
         usb_debug:          configForm.usb_debug   ? 'true' : 'false',
         fa_debug:           configForm.fa_debug    ? 'true' : 'false',
       };
+      for (let ace = 0; ace < 8; ace++) {
+        const target = ace < configForm.ace_device_count
+          ? configForm.aceTargets[ace]
+          : '';
+        mainRepl[`ace${ace}_head`] = (target === '' || target == null)
+          ? 'none'
+          : numStr(target);
+      }
       for (let i = 0; i < configForm.perAce.length; i++) {
         const p = configForm.perAce[i];
         mainRepl[`dryer_temp_${i}`]     = numStr(p.dryer_temp);
@@ -1163,6 +1280,138 @@ createApp({
         if (!r.ok) throw new Error(`HTTP ${r.status} ${await r.text()}`);
         configLog.value = JSON.stringify(await r.json(), null, 2);
       } catch (e) { configLog.value = `${t("ui.common.error")}: ${e}`; }
+    }
+    function toolheadMode(idx) {
+      if (config.content) {
+        const fromConfig = configForm.headModes[idx];
+        if (fromConfig === 'ace' || fromConfig === 'native') return fromConfig;
+      }
+      const fromState = state.route?.head_modes?.[String(idx)] ?? state.route?.head_modes?.[idx];
+      if (fromState === 'ace' || fromState === 'native') return fromState;
+      return configForm.headModes[idx] || 'native';
+    }
+    function toolheadAceSlots(idx) {
+      const out = [];
+      for (const ace of state.aces || []) {
+        for (const slot of ace.slots || []) {
+          if (slot.target_head === idx) out.push({ace, slot});
+        }
+      }
+      return out;
+    }
+    function aceTarget(aceIdx) {
+      if (config.content) {
+        const fromConfig = configForm.aceTargets[aceIdx];
+        return (fromConfig === '' || fromConfig == null) ? '' : String(fromConfig);
+      }
+      const fromState = state.route?.ace_targets?.[String(aceIdx)] ?? state.route?.ace_targets?.[aceIdx];
+      return fromState == null ? '' : String(fromState);
+    }
+    function aceTargetOptions() {
+      const opts = [];
+      for (let h = 0; h < 4; h++) {
+        if (toolheadMode(h) === 'ace') {
+          opts.push({value: String(h), label: `T${dispIdx(h)}`});
+        }
+      }
+      return opts;
+    }
+    async function saveTopology() {
+      if (topologySaving.value) return;
+      topologySaving.value = true;
+      if (!config.content) await loadConfig();
+      const newContent = formToCfgContent(config.content);
+      try {
+        const r = await fetch(`${API}/config`, {
+          method: "PUT",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({content: newContent, restart_klipper: true}),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status} ${await r.text()}`);
+        config.content = newContent;
+        config.params = {};
+        modeChangePending.value = true;
+        await loadConfig();
+        await reloadState();
+      } finally {
+        topologySaving.value = false;
+      }
+    }
+    async function saveToolheadModes(modes) {
+      if (!config.content) await loadConfig();
+      for (let h = 0; h < 4; h++) {
+        configForm.headModes[h] = modes[h] === 'ace' ? 'ace' : 'native';
+      }
+      await saveTopology();
+    }
+    async function setToolheadMode(idx, mode) {
+      const targetMode = mode === 'ace' ? 'ace' : 'native';
+      const th = state.toolheads.find(t => t.idx === idx);
+      if (th && (th.head_source_known || th.filament_at_extruder)) {
+        setMacroLog(`Unload T${dispIdx(idx)} before changing its source.`);
+        return;
+      }
+      const cur = [];
+      for (let h = 0; h < 4; h++) cur[h] = toolheadMode(h);
+      if (cur[idx] === targetMode) return;
+      const next = cur.slice();
+      if (targetMode === 'ace') {
+        next[idx] = 'ace';
+      } else {
+        next[idx] = 'native';
+        for (let ace = 0; ace < configForm.aceTargets.length; ace++) {
+          if (Number(configForm.aceTargets[ace]) === idx) {
+            configForm.aceTargets[ace] = '';
+          }
+        }
+      }
+      try {
+        await saveToolheadModes(next);
+        setMacroLog(`Toolhead T${dispIdx(idx)} source saved as ${targetMode.toUpperCase()}. Klipper restart requested.`);
+      } catch (e) {
+        setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
+      }
+    }
+    function canChangeToolheadMode(th) {
+      if (!th) return !topologySaving.value;
+      return !topologySaving.value
+        && !th.head_source_known
+        && !th.filament_at_extruder;
+    }
+    function canChangeAceTarget(aceIdx) {
+      if (topologySaving.value) return false;
+      if (state.toolheads.some(t => t.ace === aceIdx && t.head_source_known)) {
+        return false;
+      }
+      const current = aceTarget(aceIdx);
+      if (current !== '') {
+        const th = state.toolheads.find(t => t.idx === Number(current));
+        if (th && (th.head_source_known || th.filament_at_extruder)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    async function setAceTarget(aceIdx, value) {
+      const target = value === '' ? '' : Number(value);
+      if (target !== '' && toolheadMode(target) !== 'ace') {
+        setMacroLog(`T${dispIdx(target)} must be set to ACE before assigning ACE ${dispIdx(aceIdx)}.`);
+        return;
+      }
+      if (target !== '') {
+        const th = state.toolheads.find(t => t.idx === target);
+        if (th && (th.head_source_known || th.filament_at_extruder)) {
+          setMacroLog(`Unload T${dispIdx(target)} before assigning ACE ${dispIdx(aceIdx)} to it.`);
+          return;
+        }
+      }
+      configForm.aceTargets[aceIdx] = target;
+      try {
+        await saveTopology();
+        setMacroLog(`ACE ${dispIdx(aceIdx)} target saved. Klipper restart requested.`);
+      } catch (e) {
+        setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
+      }
     }
     async function setMode(m) {
       if (state.mode === m) return;
@@ -1507,7 +1756,6 @@ createApp({
       await loadNotifications();
       await refreshDebugState();
       await refreshPlugins();
-      if (state.mode === "normal" && tab.value === "dashboard") tab.value = "config";
       wsConnect();
       if (window.ResizeObserver && wiringContainerEl.value) {
         resizeObserver = new ResizeObserver(() => recomputeWiring());
@@ -1538,9 +1786,11 @@ createApp({
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
       slotTitle, switchAce, loadSlot, loadAll, unloadHead, isToolheadOccupied, toolheadOps,
+      toolheadMode, setToolheadMode, canChangeToolheadMode, toolheadAceSlots,
+      aceTarget, aceTargetOptions, setAceTarget, canChangeAceTarget,
       dryerCfg, dryStart, dryStop, dryOpenAce, toggleDryPanel, aceDrying,
       snapshots, selectedSnapshot, snapshotPreview, saveSnapshot, loadSnapshot, deleteSnapshot,
-      config, configLog, configLoadError, showRawConfig, configForm, modeChangePending,
+      config, configLog, configLoadError, showRawConfig, configForm, modeChangePending, topologySaving,
       loadConfig, saveConfigForm, saveConfigRaw, setMode,
       preflight, closePreflight, startPreflightPrint, stageLabel,
       tierLabel, tierWarn, rgbDec, sortedMapping,
@@ -1556,6 +1806,7 @@ createApp({
       wiringContainerEl, setSlotEl, setThEl, wiringPaths, wiringViewBox,
       t, dispIdx, language, languages, setLanguage,
       picker, openPicker, closePicker, savePicker, pickerMaterials,
+      nativePicker, openNativePicker, closeNativePicker, saveNativePicker,
       pickerHasRfid, pickerRfidStyle, readPickerRfid,
       cmdQueue, visibleQueue, cmdPaused, removeFromQueue, pauseQueue, resumeQueue, clearAllErrors,
       sendingAll, sendAllToPrinter,

@@ -18,8 +18,7 @@
              :title="'Firmware ' + printerFw">· {{ printerName }}</small>
     </h1>
     <nav>
-      <button v-if="state.mode !== 'normal'"
-              :class="{active: tab==='dashboard'}" @click="tab='dashboard'">{{ t('ui.tabs.dashboard') }}</button>
+      <button :class="{active: tab==='dashboard'}" @click="tab='dashboard'">{{ t('ui.tabs.dashboard') }}</button>
       <button :class="{active: tab==='config'}" @click="tab='config'">{{ t('ui.tabs.config') }}</button>
       <button v-for="p in plugins.items" :key="p.name"
               :class="{active: tab===('plugin:'+p.name)}"
@@ -39,7 +38,7 @@
     <span class="conn" :class="connClass">{{ connText }}</span>
   </header>
   <main>
-    <section v-show="tab==='dashboard' && state.mode !== 'normal'">
+    <section v-show="tab==='dashboard'">
       <p v-if="loadError" class="error">{{ loadError }}</p>
       <div class="status-row">
         <span class="pill" :class="'state-' + (state.printer_state || 'idle')">
@@ -88,11 +87,25 @@
                 <span v-if="ace.status" class="ace-state-text"> · {{ ace.status }}</span>
               </span>
               <span class="ace-card-actions" @click.stop>
+                <label class="ace-target">
+                  <span>Target</span>
+                  <select :value="aceTarget(ace.idx)"
+                          @change="setAceTarget(ace.idx, $event.target.value)"
+                          :disabled="!canChangeAceTarget(ace.idx)">
+                    <option value="">None</option>
+                    <option v-for="opt in aceTargetOptions()" :key="opt.value" :value="opt.value">
+                      {{ opt.label }}
+                    </option>
+                  </select>
+                </label>
                 <button class="ace-dry-btn"
                         :class="{active: dryOpenAce === ace.idx, running: aceDrying(ace)}"
                         @click="toggleDryPanel(ace.idx)"
                         :title="t('ui.dashboard.dryer')">☀</button>
-                <button class="ace-load-all" @click.stop="loadAll(ace.idx)">{{ t('ui.dashboard.load_all') }}</button>
+                <button class="ace-load-all"
+                        @click.stop="loadAll(ace.idx)"
+                        :disabled="state.route && state.route.mode !== 'standard'"
+                        title="Disabled unless legacy standard routing is active">{{ t('ui.dashboard.load_all') }}</button>
               </span>
             </h2>
             <div class="slot-row" @click.stop>
@@ -106,6 +119,7 @@
                         @click.stop="openPicker(ace, slot)"
                         :title="slotTitle(ace, slot)">
                   <span class="slot-num">{{ dispIdx(slot.idx) }}</span>
+                  <small v-if="slot.target_head != null">→ T{{ dispIdx(slot.target_head) }}</small>
                   <em v-if="slot.material">{{ slot.material }}</em>
                   <em v-else-if="slot.state === 'empty'" class="muted">{{ t('ui.common.empty') }}</em>
                   <em v-else-if="slot.state !== 'unknown'">{{ slot.state }}</em>
@@ -155,6 +169,15 @@
               <small v-if="!t_.module_exist">{{ t('ui.common.offline') }}</small>
               <span class="th-color" v-if="t_.color && t_.head_source_known && !toolheadOps[t_.idx]" :style="{background: t_.color}"></span>
             </h2>
+            <div class="toolhead-source">
+              <label>Source</label>
+              <select :value="toolheadMode(t_.idx)"
+                      @change="setToolheadMode(t_.idx, $event.target.value)"
+                      :disabled="!canChangeToolheadMode(t_)">
+                <option value="native">Native</option>
+                <option value="ace">ACE</option>
+              </select>
+            </div>
             <p class="meta" v-if="toolheadOps[t_.idx]">
               <span class="muted">{{ toolheadOps[t_.idx] === 'loading' ? t('ui.dashboard.load') : t('ui.dashboard.unload') }}…</span>
             </p>
@@ -174,6 +197,29 @@
                 · {{ t_.channel_error }}
               </span>
             </p>
+            <div class="toolhead-native-panel" v-if="toolheadMode(t_.idx) === 'native'">
+              <p class="meta">
+                <span v-if="t_.material">{{ t_.material }}</span>
+                <span v-if="t_.brand"> · {{ t_.brand }}</span>
+                <span v-if="t_.sku"> · {{ t_.sku }}</span>
+                <span v-if="!t_.material" class="muted">Native material not set</span>
+              </p>
+              <button class="mini-btn" @click="openNativePicker(t_)">Material</button>
+            </div>
+            <div class="toolhead-ace-panel" v-if="toolheadMode(t_.idx) === 'ace'">
+              <div v-if="toolheadAceSlots(t_.idx).length" class="toolhead-slot-strip">
+                <button v-for="x in toolheadAceSlots(t_.idx)"
+                        :key="'th-slot-' + t_.idx + '-' + x.ace.idx + '-' + x.slot.idx"
+                        class="mini-slot"
+                        :style="x.slot.color ? {background: x.slot.color} : {}"
+                        @click="openPicker(x.ace, x.slot)"
+                        :title="slotTitle(x.ace, x.slot)">
+                  ACE {{ dispIdx(x.ace.idx) }}/{{ dispIdx(x.slot.idx) }}
+                  <em v-if="x.slot.material">{{ x.slot.material }}</em>
+                </button>
+              </div>
+              <p v-else class="meta muted">Restart Klipper to apply ACE routing.</p>
+            </div>
             <div class="toolhead-actions" v-if="t_.module_exist">
               <button class="warn" @click="unloadHead(t_.idx)" :disabled="!t_.head_source_known && !t_.filament_at_extruder">{{ t('ui.dashboard.unload') }}</button>
             </div>
@@ -208,12 +254,13 @@
     </section>
     <section v-show="tab==='config'">
       <p v-if="configLoadError" class="error">{{ configLoadError }}</p>
-      <h3>{{ t('ui.config.mode') }}</h3>
+      <h3>Runtime</h3>
       <div class="mode-row">
-        <button v-for="m in ['normal','multi']"
-                :key="m"
-                :class="{active: state.mode === m}"
-                @click="setMode(m)">{{ m }}</button>
+        <span class="pill">Klipper mode: <strong>{{ state.mode || 'unknown' }}</strong></span>
+        <span class="pill">Route: <strong>{{ state.route && state.route.mode || 'unknown' }}</strong></span>
+        <span v-if="state.route && state.route.error" class="pill warn-pill">
+          {{ state.route.error }}
+        </span>
         <span v-if="modeChangePending" class="pill warn-pill">
           {{ t('ui.config.mode_change_pending') }}
         </span>
@@ -223,7 +270,7 @@
         <div class="config-row">
           <label>{{ t('ui.config.ace_count') }}</label>
           <select v-model.number="configForm.ace_device_count">
-            <option v-for="n in [1,2,3,4]" :key="n" :value="n">{{ n }}</option>
+            <option v-for="n in [1,2,3,4,5,6,7,8]" :key="n" :value="n">{{ n }}</option>
           </select>
         </div>
         <div class="config-row">
@@ -543,6 +590,35 @@ reboot</pre>
       </div>
     </div>
   </div>
+  <div v-if="nativePicker.show" class="overlay" @click.self="closeNativePicker">
+    <div class="dialog">
+      <h3>Native T{{ dispIdx(nativePicker.head) }} material</h3>
+      <div class="config-form">
+        <div class="config-row">
+          <label>{{ t('ui.dialog.picker_material') }}</label>
+          <select v-model="nativePicker.material">
+            <option v-for="m in pickerMaterials" :key="m" :value="m">{{ m }}</option>
+          </select>
+        </div>
+        <div class="config-row">
+          <label>{{ t('ui.dialog.picker_subtype') }}</label>
+          <input type="text" v-model="nativePicker.subtype" placeholder="Basic">
+        </div>
+        <div class="config-row">
+          <label>{{ t('ui.dialog.picker_vendor') }}</label>
+          <input type="text" v-model="nativePicker.vendor" placeholder="Generic">
+        </div>
+        <div class="config-row">
+          <label>{{ t('ui.dialog.picker_color') }}</label>
+          <input type="color" v-model="nativePicker.color" style="width: 4rem; height: 2rem;">
+        </div>
+      </div>
+      <div class="row">
+        <button @click="closeNativePicker">{{ t('ui.common.cancel') }}</button>
+        <button @click="saveNativePicker" class="primary">{{ t('ui.dialog.picker_save') }}</button>
+      </div>
+    </div>
+  </div>
   <div v-if="confirmDialog.show" class="overlay" @click.self="cancelConfirm">
     <div class="dialog">
       <h3>{{ confirmDialog.title }}</h3>
@@ -686,6 +762,6 @@ reboot</pre>
   </div>
 </div>
 <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=head-source-ui-2"></script>
 </body>
 </html>

@@ -177,6 +177,14 @@ def _parse_state(status: dict) -> dict:
     device_count = int(ace.get("device_count", 1))
     active_device = int(ace.get("active_device", 0))
     head_source = ace.get("head_source", {}) or {}
+    route = ace.get("route", {}) or {}
+    route_mode = route.get("mode", "standard")
+    raw_primary_head = route.get("primary_head", 0)
+    route_primary_head = None if raw_primary_head is None else int(raw_primary_head or 0)
+    route_slot_targets = route.get("slot_targets", {}) or {}
+    route_ace_targets = route.get("ace_targets", {}) or {}
+    route_head_modes = route.get("head_modes", {}) or {}
+    route_error = route.get("error")
     raw_aces = ace.get("aces", []) or []
 
     ptc = status.get("print_task_config", {}) or {}
@@ -199,6 +207,8 @@ def _parse_state(status: dict) -> dict:
         if rgba and len(rgba) >= 6 and rgba.upper() != "00000000":
             color_hex = "#" + rgba[:6].lower()
         sub = (ptc_subs[n] or "").strip() if n < len(ptc_subs) else ""
+        if sub == "NONE":
+            sub = ""
         vendor = (ptc_vendors[n] or "").strip() if n < len(ptc_vendors) else ""
         return {
             "material": mat if mat != "NONE" else "",
@@ -209,6 +219,29 @@ def _parse_state(status: dict) -> dict:
 
     SLOT_COUNT = 4
     by_idx = {a.get("idx", n): a for n, a in enumerate(raw_aces) if isinstance(a, dict)}
+
+    def _route_target_head(slot: int, ace_idx: int | None = None) -> int | None:
+        if ace_idx is not None:
+            if str(ace_idx) in route_ace_targets:
+                ace_val = route_ace_targets.get(str(ace_idx))
+                return None if ace_val is None else int(ace_val)
+            if ace_idx in route_ace_targets:
+                ace_val = route_ace_targets.get(ace_idx)
+                return None if ace_val is None else int(ace_val)
+        val = route_slot_targets.get(str(slot), route_slot_targets.get(slot))
+        if val is None:
+            return None
+        return int(val)
+
+    def _route_head_mode(head: int) -> str:
+        mode = route_head_modes.get(str(head), route_head_modes.get(head))
+        if mode in ("ace", "native"):
+            return mode
+        if route_mode == "standard":
+            return "ace"
+        if route_mode == "single_head" and route_primary_head == head:
+            return "ace"
+        return "native"
 
     def _head_in_op(t: int) -> bool:
 
@@ -301,6 +334,7 @@ def _parse_state(status: dict) -> dict:
             if is_empty and ptc_overlay is None:
                 slots_out.append({
                     "idx":       s,
+                    "target_head": _route_target_head(s, i),
                     "state":     "empty",
                     "raw":       gate,
                     "status":    raw_status,
@@ -317,6 +351,7 @@ def _parse_state(status: dict) -> dict:
                 if ptc_overlay is not None:
                     slots_out.append({
                         "idx":       s,
+                        "target_head": _route_target_head(s, i),
                         "state":     "ready" if not is_empty else "empty",
                         "raw":       gate,
                         "status":    raw_status,
@@ -331,6 +366,7 @@ def _parse_state(status: dict) -> dict:
                 else:
                     slots_out.append({
                         "idx":       s,
+                        "target_head": _route_target_head(s, i),
                         "state":     _slot_state_name(gate),
                         "raw":       gate,
                         "status":    raw_status,
@@ -369,6 +405,8 @@ def _parse_state(status: dict) -> dict:
         loaded = bool(feed.get("filament_detected"))
         color = None
         material = ""
+        brand = ""
+        sku = ""
         ace_field = None
         slot_field = None
         if d_explicit is not None and sl_explicit is not None:
@@ -380,9 +418,19 @@ def _parse_state(status: dict) -> dict:
                     slot_obj = slots_arr[sl_explicit]
                     color = slot_obj.get("color")
                     material = slot_obj.get("material", "")
+                    brand = slot_obj.get("brand", "")
+                    sku = slot_obj.get("sku", "")
+        else:
+            ptc_head = _ptc_at(t)
+            if ptc_head:
+                color = ptc_head.get("color")
+                material = ptc_head.get("material", "")
+                brand = ptc_head.get("brand", "")
+                sku = ptc_head.get("sku", "")
         toolheads.append({
             "idx":                t,
             "name":               f"T{t}",
+            "mode":               _route_head_mode(t),
             "ace":                ace_field,
             "slot":               slot_field,
             "filament_detected":  feed.get("filament_detected"),
@@ -394,7 +442,12 @@ def _parse_state(status: dict) -> dict:
             "module_exist":       feed.get("module_exist"),
             "color":              color,
             "material":           material,
+            "brand":              brand,
+            "sku":                sku,
             "head_source_known":  d_explicit is not None,
+            "route_managed":      (
+                t == route_primary_head if route_mode == "single_head" else True
+            ),
         })
 
         if d_explicit is not None and sl_explicit is not None:
@@ -426,6 +479,14 @@ def _parse_state(status: dict) -> dict:
         "active_device":      active_device,
         "device_count":       device_count,
         "mode":               mode,
+        "route":              {
+            "mode": route_mode,
+            "primary_head": route_primary_head,
+            "slot_targets": route_slot_targets,
+            "ace_targets": route_ace_targets,
+            "head_modes": route_head_modes,
+            "error": route_error,
+        },
         "language":           language,
         "display_index_base": idx_base,
         "dryer":              ace.get("dryer_status"),
@@ -441,7 +502,25 @@ async def _query_state() -> dict:
     data = await _mr_get(f"/printer/objects/query?{qs}")
     return data.get("result", {}).get("status", {})
 
+class _StripMultiacePrefix:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope.get("type") in ("http", "websocket") and (
+                path == "/multiace" or path.startswith("/multiace/")):
+            scope = dict(scope)
+            new_path = path[len("/multiace"):] or "/"
+            scope["path"] = new_path
+            raw_path = scope.get("raw_path")
+            if raw_path:
+                scope["raw_path"] = new_path.encode("utf-8")
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="multiACE Web", version=VERSION)
+app.add_middleware(_StripMultiacePrefix)
 
 class MacroRequest(BaseModel):
     name: str
@@ -1742,7 +1821,11 @@ async def apply_snapshot(name: str) -> dict:
 
     for ace_idx in sorted(by_ace):
         for head in sorted(by_ace[ace_idx]):
-            actions.append({"name": "ACE_LOAD_HEAD", "args": {"HEAD": head, "ACE": ace_idx}})
+            dt = desired.get(head, {})
+            args = {"HEAD": head, "ACE": ace_idx}
+            if dt.get("slot") is not None:
+                args["SLOT"] = dt.get("slot")
+            actions.append({"name": "ACE_LOAD_HEAD", "args": args})
 
     override_proposals: list[dict] = []
     for idx, dt in desired.items():

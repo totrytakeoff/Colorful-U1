@@ -118,6 +118,56 @@ class MultiAce:
         self._ace_present = set()
 
         self.ace_device_count = config.getint('ace_device_count', 1, minval=1, maxval=8)
+        self._ace_route_error = None
+        self._head_modes_explicit = False
+        self._head_modes = []
+        for head in range(4):
+            raw_mode = config.get('head%d_mode' % head, None)
+            if raw_mode is None:
+                self._head_modes.append('native')
+                continue
+            self._head_modes_explicit = True
+            mode = str(raw_mode).strip().lower()
+            if mode not in ('native', 'ace'):
+                raise config.error(
+                    'head%d_mode must be native or ace, got %s' % (
+                        head, raw_mode))
+            self._head_modes.append(mode)
+
+        if self._head_modes_explicit:
+            ace_heads = [h for h, m in enumerate(self._head_modes) if m == 'ace']
+            self._ace_targets = self._read_ace_targets(config, ace_heads)
+            target_heads = sorted(set([
+                h for h in self._ace_targets.values() if h is not None]))
+            if len(target_heads) == 1:
+                self._ace_route_mode = 'single_head'
+                self._ace_primary_head = target_heads[0]
+            elif len(target_heads) == 0:
+                self._ace_route_mode = 'native_only'
+                self._ace_primary_head = None
+            else:
+                self._ace_route_mode = 'multi_head'
+                self._ace_primary_head = target_heads[0]
+        else:
+            self._ace_route_mode = config.getchoice(
+                'ace_route_mode',
+                {'standard': 'standard', 'single_head': 'single_head'},
+                'standard')
+            self._ace_primary_head = config.getint(
+                'ace_primary_head', 0, minval=0, maxval=3)
+            if self._ace_route_mode == 'single_head':
+                self._head_modes = [
+                    'ace' if h == self._ace_primary_head else 'native'
+                    for h in range(4)]
+                self._ace_targets = {
+                    ace: self._ace_primary_head for ace in range(self.ace_device_count)
+                }
+            else:
+                self._head_modes = ['ace', 'ace', 'ace', 'ace']
+                self._ace_targets = {
+                    ace: ace if ace < 4 else None
+                    for ace in range(self.ace_device_count)
+                }
 
         cfg_print_mode = config.get('print_mode', None)
         if cfg_print_mode is not None:
@@ -675,6 +725,171 @@ class MultiAce:
             return v.format(**params)
         except Exception:
             return v
+
+    def _single_head_mode(self):
+        return self._ace_route_mode == 'single_head'
+
+    def _read_ace_targets(self, config, ace_heads):
+        targets = {}
+        for ace in range(self.ace_device_count):
+            raw = config.get('ace%d_head' % ace, None)
+            if raw is None:
+                targets[ace] = None
+                continue
+            val = str(raw).strip().lower()
+            if val in ('', 'none', 'native', 'off', '-1'):
+                targets[ace] = None
+                continue
+            try:
+                head = int(val)
+            except ValueError:
+                self._ace_route_error = (
+                    'ace%d_head must be 0..3 or none, got %s' % (ace, raw))
+                targets[ace] = None
+                continue
+            if head < 0 or head > 3:
+                self._ace_route_error = (
+                    'ace%d_head must be 0..3 or none, got %s' % (ace, raw))
+                targets[ace] = None
+                continue
+            if head not in ace_heads:
+                self._ace_route_error = (
+                    'ace%d_head targets T%d, but head%d_mode is not ace' %
+                    (ace, head, head))
+            targets[ace] = head
+        return targets
+
+    def _ace_target_head(self, ace_index):
+        if self._ace_route_mode == 'native_only':
+            return None
+        if ace_index in self._ace_targets:
+            return self._ace_targets.get(ace_index)
+        return None
+
+    def _slot_target_head(self, slot, ace_index=None):
+        if ace_index is not None and self._head_modes_explicit:
+            return self._ace_target_head(ace_index)
+        if self._ace_route_mode == 'native_only':
+            return None
+        if self._single_head_mode():
+            return self._ace_primary_head
+        return slot
+
+    def _check_routed_head(self, gcmd, head, action, ace_index=None):
+        if self._ace_route_error:
+            raise gcmd.error('[multiACE] %s refused: %s' % (
+                action, self._ace_route_error))
+        if self._ace_route_mode == 'native_only':
+            raise gcmd.error(
+                '[multiACE] %s refused: no toolhead is configured as ACE' %
+                action)
+        if ace_index is not None and self._head_modes_explicit:
+            target = self._ace_target_head(ace_index)
+            if target is None:
+                raise gcmd.error(
+                    '[multiACE] %s refused: ACE %d is not assigned to any '
+                    'ACE toolhead' % (action, ace_index))
+            if head != target:
+                raise gcmd.error(
+                    '[multiACE] %s refused: ACE %d is assigned to T%d, '
+                    'not HEAD=%d' % (action, ace_index, target, head))
+            return
+        ace_heads = [h for h, m in enumerate(self._head_modes) if m == 'ace']
+        if self._ace_route_mode == 'multi_head':
+            if head not in ace_heads:
+                raise gcmd.error(
+                    '[multiACE] %s refused: HEAD=%d is not configured as ACE'
+                    % (action, head))
+            return
+        if not self._single_head_mode():
+            return
+        if head != self._ace_primary_head:
+            raise gcmd.error(
+                '[multiACE] %s refused: HEAD=%d is not the configured '
+                'ACE toolhead T%d' % (
+                    action, head, self._ace_primary_head))
+
+    def _plan_head_for_ace(self, ace_index):
+        if self._head_modes_explicit:
+            return self._ace_target_head(ace_index)
+        if self._single_head_mode():
+            return self._ace_primary_head
+        return ace_index if 0 <= ace_index <= 3 else None
+
+    def _plan_default_slot(self, head, ace_index):
+        if self._head_modes_explicit:
+            return 0
+        return head
+
+    def _configured_ace_for_head(self, head):
+        matches = [
+            ace for ace, target in self._ace_targets.items()
+            if target == head
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _append_plan_load_for_ace(self, gcmd, steps, ace):
+        if self._head_modes_explicit or self._single_head_mode():
+            head = self._plan_head_for_ace(ace)
+            if head is None:
+                raise gcmd.error(
+                    '[multiACE] ACE %d has no configured ACE toolhead target'
+                    % ace)
+            steps.append({
+                'action': 'LOAD',
+                'head': head,
+                'ace': ace,
+                'slot': self._plan_default_slot(head, ace),
+            })
+            return
+        for head in range(4):
+            steps.append({
+                'action': 'LOAD',
+                'head': head,
+                'ace': ace,
+                'slot': head,
+            })
+
+    def _append_plan_default_loads(self, steps):
+        if self._head_modes_explicit or self._single_head_mode():
+            for ace in range(self.ace_device_count):
+                head = self._plan_head_for_ace(ace)
+                if head is None:
+                    continue
+                steps.append({
+                    'action': 'LOAD',
+                    'head': head,
+                    'ace': ace,
+                    'slot': self._plan_default_slot(head, ace),
+                })
+            return
+        self._refresh_ace_devices('plan')
+        for i in range(min(len(self._ace_devices), 4)):
+            steps.append({'action': 'LOAD', 'head': i, 'ace': i, 'slot': i})
+
+    def _route_status(self):
+        slot_targets = {}
+        for slot in range(4):
+            if (self._head_modes_explicit
+                    and self._ace_route_mode == 'multi_head'):
+                slot_targets[str(slot)] = None
+            else:
+                slot_targets[str(slot)] = self._slot_target_head(slot)
+        return {
+            'mode': self._ace_route_mode,
+            'primary_head': self._ace_primary_head,
+            'slot_targets': slot_targets,
+            'ace_targets': {
+                str(ace): self._ace_targets.get(ace)
+                for ace in range(self.ace_device_count)
+            },
+            'head_modes': {
+                str(head): self._head_modes[head] for head in range(4)
+            },
+            'error': self._ace_route_error,
+        }
 
     def _disp(self, idx):
         """Apply display_index_base offset for log messages."""
@@ -2989,7 +3204,7 @@ class MultiAce:
                                         push_color,
                                         push_brand,
                                         push_subtype))
-                        elif is_active:
+                        elif is_active and not self._head_modes_explicit:
 
                             source = self._head_source.get(i)
                             if not (source and source['ace_index']
@@ -3045,10 +3260,6 @@ class MultiAce:
                                 target_heads = self._get_heads_for_ace_slot(
                                     idx, slot_idx)
 
-                                if is_active and not target_heads and slot_idx < 4:
-                                    src = self._head_source.get(slot_idx)
-                                    if not src:
-                                        target_heads = [slot_idx]
                                 if override is not None:
                                     push_type = override.get('material') or slot.get('type', 'PLA')
                                     push_color = self._override_color_to_rgba(override.get('color', ''))
@@ -3644,6 +3855,11 @@ class MultiAce:
             ace_idx = int(src.get('ace_index', 0))
             slot_idx = int(src.get('slot', 0))
         else:
+            if self._head_modes_explicit or self._single_head_mode():
+                logging.info(
+                    '[multiACE] display edit ignored for unloaded routed '
+                    'head %d (no head_source)' % head)
+                return
 
             ace_idx = self._active_device_index
             slot_idx = head
@@ -3751,6 +3967,20 @@ class MultiAce:
                             head, fallback_type, fallback_color, fallback_brand))
             else:
 
+                if self._head_modes_explicit or self._single_head_mode():
+                    logging.info(
+                        '[multiACE] _push_rfid_info: head %d - empty routed '
+                        'head, clearing display' % head)
+                    self._expect_ptc_push(head, '', '000000FF', '', '')
+                    lines.append(
+                        'SET_PRINT_FILAMENT_CONFIG '
+                        'CONFIG_EXTRUDER=%d '
+                        'FILAMENT_TYPE="" '
+                        'FILAMENT_COLOR_RGBA=000000FF '
+                        'VENDOR="" '
+                        'FILAMENT_SUBTYPE=""' % head)
+                    continue
+
                 empty_override = self._override_for(active, head)
                 if empty_override is not None:
                     ace_info = self._info_per_ace.get(active, {}) or {}
@@ -3815,6 +4045,18 @@ class MultiAce:
         if not self._ace_devices:
             self.log_always(self._t('msg.no_ace_devices_detected'))
             return
+        if self._ace_route_error and autoload:
+            raise gcmd.error('[multiACE] ACE_SWITCH AUTOLOAD refused: %s' %
+                             self._ace_route_error)
+        if self._ace_route_mode == 'native_only' and autoload:
+            raise gcmd.error(
+                '[multiACE] ACE_SWITCH AUTOLOAD refused: no toolhead is '
+                'configured as ACE')
+        if self._head_modes_explicit and autoload:
+            raise gcmd.error(
+                '[multiACE] ACE_SWITCH AUTOLOAD is disabled with custom '
+                'toolhead/ACE routing. Use ACE_LOAD_HEAD/ACE_SWAP_HEAD '
+                'with explicit HEAD, ACE and SLOT.')
 
         if not self._is_ace_present(target):
             self._usb_log.info('RETRY [switch] target=%d not present, starting retries', target)
@@ -3921,6 +4163,9 @@ class MultiAce:
         for head, source in self._head_source.items():
             if source and source['ace_index'] == ace_index and source['slot'] == slot:
                 heads.append(head)
+        target = self._slot_target_head(slot, ace_index)
+        if target is not None and target not in heads:
+            heads.append(target)
         return heads
 
     def _restore_head_source(self):
@@ -4202,6 +4447,7 @@ class MultiAce:
             self.log_always(self._t('msg.ace_not_available',
                 ace=self._disp(ace_index)))
             return
+        self._check_routed_head(gcmd, head, 'ACE_LOAD_HEAD', ace_index)
         if slot < 0 or slot > 3:
             raise gcmd.error('[multiACE] SLOT must be 0-3')
 
@@ -4368,6 +4614,7 @@ class MultiAce:
 
         if head < 0 or head > 3:
             raise gcmd.error('[multiACE] HEAD must be 0-3')
+        self._check_routed_head(gcmd, head, 'ACE_UNLOAD_HEAD')
 
         sensor = self.printer.lookup_object(
             'filament_motion_sensor e%d_filament' % head, None)
@@ -4387,6 +4634,22 @@ class MultiAce:
                         '[multiACE] Failed to connect to ACE %d for unload!' % ace_index)
         else:
             self.log_always(self._t('msg.unload_head_no_mapping', head=head))
+            if self._head_modes_explicit:
+                ace_index = self._configured_ace_for_head(head)
+                if ace_index is None:
+                    raise gcmd.error(
+                        '[multiACE] ACE_UNLOAD_HEAD refused: HEAD=%d has '
+                        'no saved source and no unique configured ACE target'
+                        % head)
+                if not self._ensure_ace_available(ace_index):
+                    raise gcmd.error(
+                        '[multiACE] ACE_UNLOAD_HEAD refused: configured ACE '
+                        '%d for HEAD=%d is not available' % (ace_index, head))
+                if ace_index != self._active_device_index:
+                    if not self._switch_ace_for_head_target(ace_index):
+                        raise gcmd.error(
+                            '[multiACE] Failed to connect to ACE %d for '
+                            'unload!' % ace_index)
 
         def _noop_cb(self, response):
             pass
@@ -4466,7 +4729,7 @@ class MultiAce:
 
     cmd_ACE_TEST_help = (
         '[multiACE] Run load/unload test. PLAN items (comma-sep): '
-        '0:1=load HEAD:ACE, H0:1=swap HEAD to ACE, A0=all from ACE, '
+        '0:1[:2]=load HEAD:ACE[:SLOT], H0:1[:2]=swap HEAD to ACE[:SLOT], A0=load routed target for ACE, '
         'U=unload all, U0..U3=unload head, S0..S3=switch ACE, W5=wait 5s')
     def cmd_ACE_TEST(self, gcmd):
         plan_str = gcmd.get('PLAN', '')
@@ -4496,22 +4759,40 @@ class MultiAce:
                     steps.append({'action': 'UNLOAD', 'head': int(item[1:])})
                 elif item.startswith('A') and item[1:].isdigit():
                     ace = int(item[1:])
-                    for h in range(4):
-                        steps.append({'action': 'LOAD', 'head': h, 'ace': ace})
+                    self._append_plan_load_for_ace(gcmd, steps, ace)
                 elif item.startswith('H') and ':' in item[1:]:
                     parts = item[1:].split(':')
-                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                        steps.append({'action': 'SWAP', 'head': int(parts[0]), 'ace': int(parts[1])})
+                    if (len(parts) in (2, 3)
+                            and all(p.isdigit() for p in parts)):
+                        head = int(parts[0])
+                        ace = int(parts[1])
+                        slot = (int(parts[2]) if len(parts) == 3
+                                else self._plan_default_slot(head, ace))
+                        steps.append({
+                            'action': 'SWAP',
+                            'head': head,
+                            'ace': ace,
+                            'slot': slot,
+                        })
                     else:
-                        raise gcmd.error('[multiACE] Invalid PLAN item: %s (use H0:1)' % item)
+                        raise gcmd.error('[multiACE] Invalid PLAN item: %s (use H0:1 or H0:1:2)' % item)
                 elif item.startswith('S') and item[1:].isdigit():
                     steps.append({'action': 'SWITCH', 'ace': int(item[1:])})
                 elif item.startswith('W') and item[1:].replace('.', '', 1).isdigit():
                     steps.append({'action': 'WAIT', 'seconds': float(item[1:])})
                 elif ':' in item:
                     parts = item.split(':')
-                    if len(parts) == 2:
-                        steps.append({'action': 'LOAD', 'head': int(parts[0]), 'ace': int(parts[1])})
+                    if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
+                        head = int(parts[0])
+                        ace = int(parts[1])
+                        slot = (int(parts[2]) if len(parts) == 3
+                                else self._plan_default_slot(head, ace))
+                        steps.append({
+                            'action': 'LOAD',
+                            'head': head,
+                            'ace': ace,
+                            'slot': slot,
+                        })
                     else:
                         raise gcmd.error('[multiACE] Invalid PLAN item: %s' % item)
                 else:
@@ -4519,9 +4800,7 @@ class MultiAce:
                         '[multiACE] Invalid PLAN item: %s '
                         '(use HEAD:ACE, A0, U, U0..U3, S0..S3, W<seconds>)' % item)
         else:
-            self._refresh_ace_devices('test')
-            for i in range(min(len(self._ace_devices), 4)):
-                steps.append({'action': 'LOAD', 'head': i, 'ace': i})
+            self._append_plan_default_loads(steps)
 
         self.log_always(self._t('msg.test_start',
             steps=len(steps), unload=('yes' if do_unload else 'no')))
@@ -4546,18 +4825,21 @@ class MultiAce:
             if action == 'LOAD':
                 head = step['head']
                 ace = step['ace']
+                slot = step.get('slot', self._plan_default_slot(head, ace))
                 self.log_always(self._t('msg.test_step_load',
                     step=step_nr, total=len(steps),
-                    head=head, ace=self._disp(ace), slot=self._disp(head)))
+                    head=head, ace=self._disp(ace), slot=self._disp(slot)))
                 try:
                     self.gcode.run_script_from_command(
-                        'ACE_LOAD_HEAD HEAD=%d ACE=%d SLOT=%d' % (head, ace, head))
+                        'ACE_LOAD_HEAD HEAD=%d ACE=%d SLOT=%d' % (head, ace, slot))
                     sensor = self.printer.lookup_object(
                         'filament_motion_sensor e%d_filament' % head, None)
                     detected = sensor and sensor.get_status(0)['filament_detected']
                     src = self._head_source.get(head)
                     if detected and src is not None:
-                        results.append({'step': step_nr, 'action': 'LOAD', 'status': 'PASS', 'head': head, 'ace': ace})
+                        results.append({'step': step_nr, 'action': 'LOAD',
+                                        'status': 'PASS', 'head': head,
+                                        'ace': ace, 'slot': slot})
                         self.log_always(self._t('msg.test_step_load_pass', step=step_nr))
                     else:
                         reason = []
@@ -4566,11 +4848,13 @@ class MultiAce:
                         if src is None:
                             reason.append('mapping=missing')
                         results.append({'step': step_nr, 'action': 'LOAD', 'status': 'FAIL',
-                                        'head': head, 'ace': ace, 'reason': ', '.join(reason)})
+                                        'head': head, 'ace': ace, 'slot': slot,
+                                        'reason': ', '.join(reason)})
                         self.log_always(self._t('msg.test_step_fail_reasons', step=step_nr, reason=', '.join(reason)))
                 except Exception as e:
                     results.append({'step': step_nr, 'action': 'LOAD', 'status': 'ERROR',
-                                    'head': head, 'ace': ace, 'reason': str(e)})
+                                    'head': head, 'ace': ace, 'slot': slot,
+                                    'reason': str(e)})
                     self.log_always(self._t('msg.test_step_error', step=step_nr, error=str(e)))
                 self.gcode.run_script_from_command('ACE_HEAD_STATUS')
 
@@ -4641,18 +4925,19 @@ class MultiAce:
             elif action == 'SWAP':
                 head = step['head']
                 ace = step['ace']
+                slot = step.get('slot', self._plan_default_slot(head, ace))
                 self.log_always(self._t('msg.test_step_swap',
                     step=step_nr, total=len(steps), head=head, ace=self._disp(ace)))
                 try:
                     self.gcode.run_script_from_command(
-                        'ACE_SWAP_HEAD HEAD=%d ACE=%d' % (head, ace))
+                        'ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d' % (head, ace, slot))
                     sensor = self.printer.lookup_object(
                         'filament_motion_sensor e%d_filament' % head, None)
                     detected = sensor and sensor.get_status(0)['filament_detected']
                     src = self._head_source.get(head)
                     if detected and src is not None and src['ace_index'] == ace:
                         results.append({'step': step_nr, 'action': 'SWAP', 'status': 'PASS',
-                                        'head': head, 'ace': ace})
+                                        'head': head, 'ace': ace, 'slot': slot})
                         self.log_always(self._t('msg.test_step_swap_pass', step=step_nr, ace=self._disp(ace)))
                     else:
                         reason = []
@@ -4663,11 +4948,13 @@ class MultiAce:
                         elif src['ace_index'] != ace:
                             reason.append('mapping=ACE %d (expected %d)' % (src['ace_index'], ace))
                         results.append({'step': step_nr, 'action': 'SWAP', 'status': 'FAIL',
-                                        'head': head, 'ace': ace, 'reason': ', '.join(reason)})
+                                        'head': head, 'ace': ace, 'slot': slot,
+                                        'reason': ', '.join(reason)})
                         self.log_always(self._t('msg.test_step_fail_reasons', step=step_nr, reason=', '.join(reason)))
                 except Exception as e:
                     results.append({'step': step_nr, 'action': 'SWAP', 'status': 'ERROR',
-                                    'head': head, 'ace': ace, 'reason': str(e)})
+                                    'head': head, 'ace': ace, 'slot': slot,
+                                    'reason': str(e)})
                     self.log_always(self._t('msg.test_step_error', step=step_nr, error=str(e)))
                 self.gcode.run_script_from_command('ACE_HEAD_STATUS')
 
@@ -4786,6 +5073,7 @@ class MultiAce:
             raise gcmd.error('[multiACE] HEAD must be 0-3')
         if ace_index < 0 or not self._ensure_ace_available(ace_index):
             raise gcmd.error('ACE %d not available' % ace_index)
+        self._check_routed_head(gcmd, head, 'ACE_SWAP_HEAD', ace_index)
         if slot < 0 or slot > 3:
             raise gcmd.error('[multiACE] SLOT must be 0-3')
         if head in self._ghost_heads:
@@ -5730,6 +6018,9 @@ class MultiAce:
     def _push_slot_rfid_to_extruder(self, head):
 
         try:
+            if self._head_modes_explicit or self._single_head_mode():
+                self._clear_filament_display(head)
+                return
             slots = self._info.get('slots', [{}] * 4)
             if head < 0 or head >= len(slots):
                 return
@@ -5782,7 +6073,19 @@ class MultiAce:
             self.wait_ace_ready()
 
         unloaded_any = False
-        for head in range(4):
+        if self._ace_route_error:
+            raise gcmd.error('[multiACE] ACE_UNLOAD_ALL_HEADS refused: %s' %
+                             self._ace_route_error)
+        if self._ace_route_mode == 'native_only':
+            heads = []
+        elif self._single_head_mode():
+            heads = [self._ace_primary_head]
+        elif self._head_modes_explicit:
+            heads = sorted(set([
+                h for h in self._ace_targets.values() if h is not None]))
+        else:
+            heads = range(4)
+        for head in heads:
             sensor = self.printer.lookup_object(
                 'filament_motion_sensor e%d_filament' % head, None)
             if not sensor or not sensor.get_status(0)['filament_detected']:
@@ -6100,7 +6403,7 @@ class MultiAce:
             'b': after['b'] - before['b'],
         }
 
-    cmd_ACE_SEQ_help = '[multiACE] Run scripted load/unload sequence. PLAN: 0:1=load HEAD:ACE, A0=all from ACE, U=unload all, U0=unload head. UNLOAD=0|1 (default 1) runs final ACE_UNLOAD_ALL_HEADS.'
+    cmd_ACE_SEQ_help = '[multiACE] Run scripted load/unload sequence. PLAN: 0:1[:2]=load HEAD:ACE[:SLOT], A0=load routed target for ACE, U=unload all, U0=unload head. UNLOAD=0|1 (default 1) runs final ACE_UNLOAD_ALL_HEADS.'
     def cmd_ACE_SEQ(self, gcmd):
 
         plan_str = gcmd.get('PLAN', '')
@@ -6129,20 +6432,26 @@ class MultiAce:
                     steps.append({'action': 'UNLOAD', 'head': int(item[1:])})
                 elif item.startswith('A') and item[1:].isdigit():
                     ace = int(item[1:])
-                    for h in range(4):
-                        steps.append({'action': 'LOAD', 'head': h, 'ace': ace})
+                    self._append_plan_load_for_ace(gcmd, steps, ace)
                 elif ':' in item:
                     parts = item.split(':')
-                    if len(parts) == 2:
-                        steps.append({'action': 'LOAD', 'head': int(parts[0]), 'ace': int(parts[1])})
+                    if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
+                        head = int(parts[0])
+                        ace = int(parts[1])
+                        slot = (int(parts[2]) if len(parts) == 3
+                                else self._plan_default_slot(head, ace))
+                        steps.append({
+                            'action': 'LOAD',
+                            'head': head,
+                            'ace': ace,
+                            'slot': slot,
+                        })
                     else:
                         raise gcmd.error('[multiACE] Invalid PLAN item: %s' % item)
                 else:
-                    raise gcmd.error('[multiACE] Invalid PLAN item: %s (use HEAD:ACE, A0, U, U0)' % item)
+                    raise gcmd.error('[multiACE] Invalid PLAN item: %s (use HEAD:ACE[:SLOT], A0, U, U0)' % item)
         else:
-            self._refresh_ace_devices('seq')
-            for i in range(min(len(self._ace_devices), 4)):
-                steps.append({'action': 'LOAD', 'head': i, 'ace': i})
+            self._append_plan_default_loads(steps)
 
         self.log_always(self._t('msg.seq_start',
             steps=len(steps), unload=('yes' if do_unload else 'no')))
@@ -6156,18 +6465,21 @@ class MultiAce:
             if action == 'LOAD':
                 head = step['head']
                 ace = step['ace']
+                slot = step.get('slot', self._plan_default_slot(head, ace))
                 self.log_always(self._t('msg.test_step_load',
                     step=step_nr, total=len(steps),
-                    head=head, ace=self._disp(ace), slot=self._disp(head)))
+                    head=head, ace=self._disp(ace), slot=self._disp(slot)))
                 try:
                     self.gcode.run_script_from_command(
-                        'ACE_LOAD_HEAD HEAD=%d ACE=%d SLOT=%d' % (head, ace, head))
+                        'ACE_LOAD_HEAD HEAD=%d ACE=%d SLOT=%d' % (head, ace, slot))
                     sensor = self.printer.lookup_object(
                         'filament_motion_sensor e%d_filament' % head, None)
                     detected = sensor and sensor.get_status(0)['filament_detected']
                     src = self._head_source.get(head)
                     if detected and src is not None:
-                        results.append({'step': step_nr, 'action': 'LOAD', 'status': 'PASS', 'head': head, 'ace': ace})
+                        results.append({'step': step_nr, 'action': 'LOAD',
+                                        'status': 'PASS', 'head': head,
+                                        'ace': ace, 'slot': slot})
                         self.log_always(self._t('msg.test_step_load_pass', step=step_nr))
                     else:
                         reason = []
@@ -6176,11 +6488,13 @@ class MultiAce:
                         if src is None:
                             reason.append('mapping=missing')
                         results.append({'step': step_nr, 'action': 'LOAD', 'status': 'FAIL',
-                                        'head': head, 'ace': ace, 'reason': ', '.join(reason)})
+                                        'head': head, 'ace': ace, 'slot': slot,
+                                        'reason': ', '.join(reason)})
                         self.log_always(self._t('msg.test_step_fail_reasons', step=step_nr, reason=', '.join(reason)))
                 except Exception as e:
                     results.append({'step': step_nr, 'action': 'LOAD', 'status': 'ERROR',
-                                    'head': head, 'ace': ace, 'reason': str(e)})
+                                    'head': head, 'ace': ace, 'slot': slot,
+                                    'reason': str(e)})
                     self.log_always(self._t('msg.test_step_error', step=step_nr, error=str(e)))
                 self.gcode.run_script_from_command('ACE_HEAD_STATUS')
 
@@ -6616,6 +6930,7 @@ class MultiAce:
             'active_device': self._active_device_index,
             'device_count': len(self._ace_devices),
             'head_source': {str(k): v for k, v in self._head_source.items()},
+            'route': self._route_status(),
             'swap_in_progress': self._swap_in_progress,
             'aces': aces,
         }

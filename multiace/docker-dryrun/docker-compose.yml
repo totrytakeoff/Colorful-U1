@@ -1,0 +1,43 @@
+services:
+  moonraker:
+    build:
+      context: ../..
+      dockerfile: multiace/docker-dryrun/Dockerfile
+    command: >
+      python -m uvicorn mock_moonraker:app --host 0.0.0.0 --port 7125
+    working_dir: /app/multiace/docker-dryrun
+    volumes:
+      - dryrun-data:/data
+    ports:
+      - "7125:7125"
+
+  multiace-web:
+    build:
+      context: ../..
+      dockerfile: multiace/docker-dryrun/Dockerfile
+    command: >
+      sh -c 'test -f /data/ace.cfg ||
+      cp /app/multiace/config/extended/ace.cfg /data/ace.cfg;
+      python -m uvicorn main:app --host 0.0.0.0 --port 7126 --reload'
+    working_dir: /app/multiace/web/backend
+    environment:
+      MOONRAKER_URL: http://moonraker:7125
+      MULTIACE_CFG_PATH: /data/ace.cfg
+      MULTIACE_FRONTEND_DIR: /app/multiace/web/frontend
+      MULTIACE_SNAPSHOT_DIR: /data/snapshots
+      MULTIACE_OVERRIDE_FILE: /data/slot_overrides.json
+      MULTIACE_MATERIALS_FILE: /data/materials.json
+      MULTIACE_I18N_DIR: /app/multiace/i18n
+    volumes:
+      - dryrun-data:/data
+      - ../web/backend:/app/multiace/web/backend:ro
+      - ../web/frontend:/app/multiace/web/frontend:ro
+      - ../i18n:/app/multiace/i18n:ro
+      - ../config/extended/ace.cfg:/app/multiace/config/extended/ace.cfg:ro
+    ports:
+      - "7126:7126"
+    depends_on:
+      - moonraker
+
+volumes:
+  dryrun-data:
