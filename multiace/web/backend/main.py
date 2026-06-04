@@ -2377,6 +2377,7 @@ _load_overrides_from_disk()
 _notifications: deque = deque(maxlen=50)
 _next_notification_id = int(time.time() * 1000)
 _notifications_lock = asyncio.Lock()
+_notification_cutoff_ts = 0.0
 
 _NOTIF_ONLY_MULTIACE = os.environ.get(
     "MULTIACE_NOTIF_ONLY_MULTIACE", "1") in ("1", "true", "yes")
@@ -2408,6 +2409,38 @@ def _is_error_gcode_response(text: str) -> bool:
     if body.lower().startswith("unknown command"):
         return True
     return False
+
+def _notification_cutoff_from_status(status: dict) -> float:
+    ps = (status or {}).get("print_stats", {}) or {}
+    ps_state = (ps.get("state") or "").lower()
+    if ps_state not in ("printing", "paused"):
+        return 0.0
+    if ps.get("exception") or ps.get("message"):
+        return 0.0
+    try:
+        total_duration = float(ps.get("total_duration") or 0.0)
+    except (TypeError, ValueError):
+        total_duration = 0.0
+    if total_duration <= 0:
+        return 0.0
+    return max(0.0, time.time() - total_duration - 5.0)
+
+async def _prune_notifications_before(cutoff_ts: float) -> int:
+    global _notification_cutoff_ts
+    if cutoff_ts <= 0:
+        return 0
+    _notification_cutoff_ts = max(_notification_cutoff_ts, cutoff_ts)
+    async with _notifications_lock:
+        before = len(_notifications)
+        keep = [n for n in _notifications
+                if float(n.get("ts") or 0.0) >= _notification_cutoff_ts]
+        _notifications.clear()
+        _notifications.extend(keep)
+        pruned = before - len(_notifications)
+    if pruned:
+        _trace.info("pruned %d stale notification(s) before %.3f",
+                    pruned, _notification_cutoff_ts)
+    return pruned
 
 def _record_notification(text: str) -> dict | None:
     global _next_notification_id
@@ -2503,7 +2536,16 @@ async def _start_log_listener() -> None:
 
 @app.get("/api/notifications")
 async def list_notifications() -> dict:
-    return {"notifications": list(_notifications)}
+    cutoff_ts = 0.0
+    try:
+        cutoff_ts = _notification_cutoff_from_status(await _query_state())
+        await _prune_notifications_before(cutoff_ts)
+    except Exception as e:
+        _trace.info("notification stale-prune skipped: %s", e)
+    return {
+        "notifications": list(_notifications),
+        "cutoff_ts": max(_notification_cutoff_ts, cutoff_ts),
+    }
 
 @app.post("/api/notifications/test")
 async def test_notification(payload: dict | None = None) -> dict:
@@ -2716,6 +2758,21 @@ async def ws(websocket: WebSocket) -> None:
         while True:
             now = time.time()
 
+            if now - last_ts >= 1.0 and not _homing_active():
+                try:
+                    status = await _query_state()
+                    cutoff_ts = _notification_cutoff_from_status(status)
+                    await _prune_notifications_before(cutoff_ts)
+                    payload = _parse_state(status)
+                    payload["type"] = "state"
+                    payload["ts"] = now
+                    payload["notification_cutoff_ts"] = max(
+                        _notification_cutoff_ts, cutoff_ts)
+                    await websocket.send_json(payload)
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "ts": now, "error": str(e)})
+                last_ts = now
+
             for n in list(_notifications):
                 if n["id"] > last_seen_notif_id:
                     try:
@@ -2730,16 +2787,6 @@ async def ws(websocket: WebSocket) -> None:
                     except Exception:
                         return
                     last_seen_notif_id = n["id"]
-            if now - last_ts >= 1.0 and not _homing_active():
-                try:
-                    status = await _query_state()
-                    payload = _parse_state(status)
-                    payload["type"] = "state"
-                    payload["ts"] = now
-                    await websocket.send_json(payload)
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "ts": now, "error": str(e)})
-                last_ts = now
             await asyncio.sleep(0.25)
     except WebSocketDisconnect:
         return

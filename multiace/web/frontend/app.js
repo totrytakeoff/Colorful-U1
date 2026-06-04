@@ -117,6 +117,15 @@ createApp({
     const loadError = ref("");
     const notifications = ref([]);
     const _notifIds = new Set();
+    function pruneNotificationsBefore(cutoffTs) {
+      const cutoff = Number(cutoffTs || 0);
+      if (!cutoff) return;
+      const keep = notifications.value.filter(n => Number(n.ts || 0) >= cutoff);
+      if (keep.length === notifications.value.length) return;
+      notifications.value = keep;
+      _notifIds.clear();
+      for (const n of keep) _notifIds.add(n.id);
+    }
     function _addNotif(n) {
       if (!n || n.id == null) return;
       if (_notifIds.has(n.id)) return;
@@ -135,6 +144,7 @@ createApp({
         const r = await fetch(`${API}/notifications`);
         if (!r.ok) return;
         const j = await r.json();
+        pruneNotificationsBefore(j.cutoff_ts);
         for (const n of (j.notifications || [])) _addNotif(n);
       } catch (_) {}
     }
@@ -154,6 +164,7 @@ createApp({
     }
     function applyState(s) {
       if (!s) return;
+      pruneNotificationsBefore(s.notification_cutoff_ts);
       state.ace_status    = s.ace_status ?? null;
       state.ace_temp      = s.ace_temp ?? null;
       state.printer_state = s.printer_state ?? null;

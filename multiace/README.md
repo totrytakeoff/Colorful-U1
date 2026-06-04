@@ -81,6 +81,21 @@ ace.aces[0].gate_status  = [1, 1, 1, 1]
 head_source[3]           = {"ace_index": 0, "slot": <active slot>, ...}
 ```
 
+#### Field note: 2026-06-05 stale Web alerts
+
+During the next single-head print, the Web UI still showed an old
+`multiACE alerts` entry for `swap slot_empty (post-unload)`, but Moonraker
+reported `print_stats.state=printing`, `pause_resume.is_paused=false`,
+`print_stats.exception={}`, and the Klippy log showed successful swaps
+after the restart. This was a stale multiACE Web notification, not a new
+Klipper-side failure.
+
+The Web backend now prunes notifications older than the current healthy
+print session, and the frontend applies the same cutoff to its local alert
+list. If a similar alert appears while the print keeps running, first check
+`print_stats.exception`, `pause_resume.is_paused`, and the latest Klippy log
+before treating it as a new swap failure.
+
 ### Single Material (e.g. PLA on ACE 0)
 
 1. Insert spools into ACE 0
