@@ -58,6 +58,29 @@ slot. Changing the printer-side retract settings does not require
 re-slicing; the same already-postprocessed test G-code can be used after a
 Klipper restart.
 
+#### Field note: 2026-06-04 single-head MVP print
+
+The single-head path was validated on a U1 where ACE0 slots 0-3 feed
+physical head 3 through a 4-to-1 splitter. A real four-colour file
+(`puzle_PETG_11m6s.gcode`) was started after configuring head 3 as the ACE
+head. The initial auto-load mapped slicer tool 2 to `ACE0 / Slot2` and
+successfully loaded head 3 from that slot.
+
+One failure found during this run was a false
+`swap slot_empty (post-unload)` pause. The ACE per-device status reported
+all four slots ready, but the legacy top-level `gate_status` field still
+contained unknown values. The fix keeps the active ACE top-level gate state
+in sync with the per-ACE state and forces a fresh ACE status read before
+slot availability checks in `ACE_LOAD_HEAD` and `ACE_SWAP_HEAD`.
+
+Expected healthy state after Klipper restart:
+
+```text
+ace.gate_status          = [1, 1, 1, 1]
+ace.aces[0].gate_status  = [1, 1, 1, 1]
+head_source[3]           = {"ace_index": 0, "slot": <active slot>, ...}
+```
+
 ### Single Material (e.g. PLA on ACE 0)
 
 1. Insert spools into ACE 0
@@ -404,6 +427,7 @@ require re-slicing the model.
 
 - **Unload before first use** - After a fresh install or when upgrading from a previous version, unload all toolheads before using multiACE. Filament loaded from a previous installation may cause unexpected behavior since multiACE has no knowledge of the previous state. Use **ACEC__Unload_All** or unload via display before starting.
 - **Single-toolhead ACE MVP only supports current-layout printing** - The Web preflight page may show future Optimize/Layer concepts, but real hardware printing is intentionally limited to the loaded printer layout until multi-head/native+ACE coordination is implemented.
+- **Single-toolhead MVP swap status is still under observation** - Real printing can continue correctly after the initial ACE load, but `swap_in_progress` may remain true longer than expected in status output. Treat this as a status/reporting issue to investigate before broadening the MVP to mixed native+ACE heads.
 - **Cross-ACE feed_assist** - During a print, only the ACE that was active when the print started has feed_assist available. Toolchanges to heads on other ACEs print without feed_assist (extruder pulls filament directly through the bowden). Pick the start ACE deliberately with `ACE_SWITCH TARGET=N` before the print so your most-used material lives on it. The next major version (v0.82) will lift this restriction.
 - **ACE USB Reset** - Inactive ACE units periodically reset their USB connection (~3s cycle). This is normal ACE Pro firmware behavior and does not affect operation. Visible in `dmesg` but harmless.
 - **Display Attach Toolhead** - Attaching a toolhead via the Snapmaker display triggers auto-feed. This is stock Snapmaker behavior and cannot be suppressed.

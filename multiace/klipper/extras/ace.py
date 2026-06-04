@@ -3097,6 +3097,8 @@ class MultiAce:
 
                 if idx == self._active_device_index:
                     self._info = result
+                    self.gate_status = self._gate_status_per_ace.get(
+                        idx, self.gate_status)
 
                 if not self._swap_in_progress:
                     try:
@@ -3259,6 +3261,112 @@ class MultiAce:
         if info is None:
             return False
         return info.get('status') == 'ready'
+
+    def _gate_value_for_slot(self, ace_index, slot):
+        gate_list = self._gate_status_per_ace.get(ace_index)
+        if (gate_list is None and ace_index == self._active_device_index
+                and self.gate_status is not None):
+            gate_list = self.gate_status
+        if gate_list is None or slot < 0 or slot >= len(gate_list):
+            return GATE_UNKNOWN
+        return gate_list[slot]
+
+    def _slot_status_for_slot(self, ace_index, slot):
+        info = self._info_per_ace.get(ace_index) or {}
+        slots = info.get('slots', []) or []
+        if slot < 0 or slot >= len(slots):
+            return 'unknown'
+        slot_info = slots[slot]
+        if not isinstance(slot_info, dict):
+            return 'unknown'
+        return slot_info.get('status', 'unknown')
+
+    def _refresh_gate_status_once(self, ace_index, reason=''):
+        result_box = {'done': False}
+
+        def callback(self, response):
+            try:
+                result = response.get('result') if response else None
+                if isinstance(result, dict):
+                    self._refresh_slot_overrides_if_changed()
+                    try:
+                        self._merge_v2_filament_info(ace_index, result)
+                    except Exception as e:
+                        logging.info(
+                            '[multiACE] gate refresh merge failed ace=%d reason=%s: %s'
+                            % (ace_index, reason, e))
+                    gate_list = self._gate_status_per_ace.setdefault(
+                        ace_index,
+                        [GATE_UNKNOWN, GATE_UNKNOWN, GATE_UNKNOWN, GATE_UNKNOWN])
+                    slots = result.get('slots', []) or []
+                    for i in range(min(4, len(slots))):
+                        slot_info = slots[i]
+                        if not isinstance(slot_info, dict):
+                            continue
+                        gate_list[i] = (
+                            GATE_EMPTY
+                            if slot_info.get('status') == 'empty'
+                            else GATE_AVAILABLE)
+                    self._info_per_ace[ace_index] = result
+                    if ace_index == self._active_device_index:
+                        self._info = result
+                        self.gate_status = gate_list
+            finally:
+                result_box['done'] = True
+
+        try:
+            self.send_request_to(ace_index, {"method": "get_status"}, callback)
+        except Exception as e:
+            logging.info(
+                '[multiACE] gate refresh send failed ace=%d reason=%s: %s'
+                % (ace_index, reason, e))
+            return False
+
+        deadline = time.monotonic() + 2.0
+        while not result_box['done'] and time.monotonic() < deadline:
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        if not result_box['done']:
+            logging.info(
+                '[multiACE] gate refresh timed out ace=%d reason=%s'
+                % (ace_index, reason))
+            return False
+        return True
+
+    def _wait_slot_available(self, ace_index, slot, reason, timeout=5.0):
+        self._refresh_gate_status_once(ace_index, '%s initial' % reason)
+        initial_gate = self._gate_value_for_slot(ace_index, slot)
+        initial_status = self._slot_status_for_slot(ace_index, slot)
+        if initial_gate == GATE_AVAILABLE:
+            return True
+
+        logging.info(
+            '[multiACE] slot gate wait start ace=%d slot=%d reason=%s '
+            'initial_gate=%s initial_status=%s'
+            % (ace_index, slot, reason, initial_gate, initial_status))
+
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            self._refresh_gate_status_once(
+                ace_index, '%s attempt=%d' % (reason, attempt))
+            gate_value = self._gate_value_for_slot(ace_index, slot)
+            slot_status = self._slot_status_for_slot(ace_index, slot)
+            logging.info(
+                '[multiACE] slot gate wait check ace=%d slot=%d reason=%s '
+                'attempt=%d gate=%s status=%s'
+                % (ace_index, slot, reason, attempt, gate_value, slot_status))
+            if gate_value == GATE_AVAILABLE:
+                return True
+            self.reactor.pause(self.reactor.monotonic() + 0.25)
+
+        logging.info(
+            '[multiACE] slot gate wait failed ace=%d slot=%d reason=%s '
+            'final_gate=%s final_status=%s'
+            % (ace_index, slot, reason,
+               self._gate_value_for_slot(ace_index, slot),
+               self._slot_status_for_slot(ace_index, slot)))
+        return False
 
     def dwell(self, delay=1.0):
         curr_ts = self.reactor.monotonic()
@@ -4305,7 +4413,8 @@ class MultiAce:
                 raise gcmd.error(
                     '[multiACE] Failed to connect to ACE %d' % ace_index)
 
-        if self.gate_status[slot] != GATE_AVAILABLE:
+        if not self._wait_slot_available(
+                ace_index, slot, 'load-head-preload', timeout=5.0):
             self.log_always(self._t('msg.load_slot_no_filament',
                 ace=self._disp(ace_index), slot=self._disp(slot)))
             return
@@ -4924,9 +5033,8 @@ class MultiAce:
                 ace=self._disp(ace_index), head=head))
             return
 
-        target_gate = self._gate_status_per_ace.get(ace_index)
-        if (target_gate is not None and slot < len(target_gate)
-                and target_gate[slot] != GATE_AVAILABLE):
+        if not self._wait_slot_available(
+                ace_index, slot, 'swap-pre-unload', timeout=5.0):
             cur_src = self._head_source.get(head)
             self._telemetry('SWAP_SUMMARY', {
                 'head': head,
@@ -5093,7 +5201,8 @@ class MultiAce:
                 if not self._switch_ace_for_head_target(ace_index):
                     raise gcmd.error('[multiACE] Failed to connect to ACE %d' % ace_index)
 
-            if self.gate_status[slot] != GATE_AVAILABLE:
+            if not self._wait_slot_available(
+                    ace_index, slot, 'swap-post-unload', timeout=6.0):
 
                 swap_status = 'slot_empty'
                 self._swap_back_to_orig_for_pause(
