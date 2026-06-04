@@ -4170,9 +4170,6 @@ class MultiAce:
         for head, source in self._head_source.items():
             if source and source['ace_index'] == ace_index and source['slot'] == slot:
                 heads.append(head)
-        target = self._slot_target_head(slot, ace_index)
-        if target is not None and target not in heads:
-            heads.append(target)
         return heads
 
     def _restore_head_source(self):
