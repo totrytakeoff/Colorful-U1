@@ -543,6 +543,7 @@ class ConfigUpdate(BaseModel):
 EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
 EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
 OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
+EXPLICIT_PLAN_MACROS = {"ACE_TEST", "ACE_SEQ", "ACE_PRELOAD"}
 
 OBSOLETE_ACE_CONFIG_KEYS = {
     "ace_route_mode",
@@ -581,6 +582,64 @@ def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
                 detail=(
                     f"{macro} requires explicit HEAD, ACE and SLOT; "
                     f"missing {', '.join(missing)}"))
+    if macro in EXPLICIT_PLAN_MACROS:
+        _validate_plan_arg(macro, None if args is None else args.get("PLAN", args.get("plan")))
+
+def _validate_plan_arg(macro: str, plan: Any) -> None:
+    plan_str = str(plan or "").strip()
+    if not plan_str:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{macro} requires PLAN with explicit HEAD:ACE:SLOT; "
+                "implicit ACE/default-slot plans are blocked"))
+    for item in plan_str.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item == "U":
+            continue
+        if item.startswith("U") and item[1:].isdigit():
+            continue
+        if macro == "ACE_TEST":
+            if item.startswith("S") and item[1:].isdigit():
+                continue
+            if item.startswith("W"):
+                try:
+                    seconds = float(item[1:])
+                except ValueError:
+                    seconds = -1.0
+                if seconds >= 0:
+                    continue
+            if item.startswith("H") and ":" in item[1:]:
+                parts = item[1:].split(":")
+                if len(parts) == 3 and all(p.isdigit() for p in parts):
+                    continue
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{macro} rejects PLAN item {item!r}; "
+                        "use HHEAD:ACE:SLOT"))
+        if item.startswith("A") and item[1:].isdigit():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{macro} rejects PLAN item {item!r}; A<ace> "
+                    "implicit loads are blocked; use HEAD:ACE:SLOT"))
+        if ":" in item:
+            parts = item.split(":")
+            if len(parts) == 3 and all(p.isdigit() for p in parts):
+                continue
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{macro} rejects PLAN item {item!r}; "
+                    "use HEAD:ACE:SLOT"))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{macro} rejects PLAN item {item!r}; "
+                "use explicit HEAD:ACE:SLOT"))
 
 def _validate_gcode_script(script: str) -> None:
     for lineno, raw in enumerate((script or "").splitlines(), start=1):
@@ -595,13 +654,21 @@ def _validate_gcode_script(script: str) -> None:
             raise HTTPException(
                 status_code=400,
                 detail=f"line {lineno}: {macro} is obsolete and blocked")
-        if macro not in EXPLICIT_ROUTE_MACROS:
-            continue
-        keys = {
-            p.split("=", 1)[0].upper()
+        gcode_args = {
+            p.split("=", 1)[0].upper(): p.split("=", 1)[1]
             for p in parts[1:]
             if "=" in p
         }
+        if macro in EXPLICIT_PLAN_MACROS:
+            try:
+                _validate_plan_arg(macro, gcode_args.get("PLAN"))
+            except HTTPException as e:
+                raise HTTPException(
+                    status_code=e.status_code,
+                    detail=f"line {lineno}: {e.detail}")
+        if macro not in EXPLICIT_ROUTE_MACROS:
+            continue
+        keys = set(gcode_args.keys())
         missing = sorted(EXPLICIT_ROUTE_ARGS - keys)
         if missing:
             raise HTTPException(

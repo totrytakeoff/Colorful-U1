@@ -803,37 +803,6 @@ class MultiAce:
             '[multiACE] %s refused: HEAD=%d is not configured as ACE'
             % (action, head))
 
-    def _plan_head_for_ace(self, ace_index):
-        return self._ace_target_head(ace_index)
-
-    def _plan_default_slot(self, head, ace_index):
-        return 0
-
-    def _append_plan_load_for_ace(self, gcmd, steps, ace):
-        head = self._plan_head_for_ace(ace)
-        if head is None:
-            raise gcmd.error(
-                '[multiACE] ACE %d has no configured ACE toolhead target'
-                % ace)
-        steps.append({
-            'action': 'LOAD',
-            'head': head,
-            'ace': ace,
-            'slot': self._plan_default_slot(head, ace),
-        })
-
-    def _append_plan_default_loads(self, steps):
-        for ace in range(self.ace_device_count):
-            head = self._plan_head_for_ace(ace)
-            if head is None:
-                continue
-            steps.append({
-                'action': 'LOAD',
-                'head': head,
-                'ace': ace,
-                'slot': self._plan_default_slot(head, ace),
-            })
-
     def _route_status(self):
         slot_targets = {}
         for slot in range(4):
@@ -4508,7 +4477,7 @@ class MultiAce:
 
     cmd_ACE_TEST_help = (
         '[multiACE] Run load/unload test. PLAN items (comma-sep): '
-        '0:1[:2]=load HEAD:ACE[:SLOT], H0:1[:2]=swap HEAD to ACE[:SLOT], A0=load routed target for ACE, '
+        '0:1:2=load HEAD:ACE:SLOT, H0:1:2=swap HEAD to ACE:SLOT, '
         'U=unload all, U0..U3=unload head, S0..S3=switch ACE, W5=wait 5s')
     def cmd_ACE_TEST(self, gcmd):
         plan_str = gcmd.get('PLAN', '')
@@ -4527,59 +4496,63 @@ class MultiAce:
         self._audit_state('TEST_START', {'plan': plan_str, 'unload': do_unload})
 
         steps = []
-        if plan_str:
-            for item in plan_str.split(','):
-                item = item.strip()
-                if not item:
-                    continue
-                if item == 'U':
-                    steps.append({'action': 'UNLOAD_ALL'})
-                elif item.startswith('U') and item[1:].isdigit():
-                    steps.append({'action': 'UNLOAD', 'head': int(item[1:])})
-                elif item.startswith('A') and item[1:].isdigit():
-                    ace = int(item[1:])
-                    self._append_plan_load_for_ace(gcmd, steps, ace)
-                elif item.startswith('H') and ':' in item[1:]:
-                    parts = item[1:].split(':')
-                    if (len(parts) in (2, 3)
-                            and all(p.isdigit() for p in parts)):
-                        head = int(parts[0])
-                        ace = int(parts[1])
-                        slot = (int(parts[2]) if len(parts) == 3
-                                else self._plan_default_slot(head, ace))
-                        steps.append({
-                            'action': 'SWAP',
-                            'head': head,
-                            'ace': ace,
-                            'slot': slot,
-                        })
-                    else:
-                        raise gcmd.error('[multiACE] Invalid PLAN item: %s (use H0:1 or H0:1:2)' % item)
-                elif item.startswith('S') and item[1:].isdigit():
-                    steps.append({'action': 'SWITCH', 'ace': int(item[1:])})
-                elif item.startswith('W') and item[1:].replace('.', '', 1).isdigit():
-                    steps.append({'action': 'WAIT', 'seconds': float(item[1:])})
-                elif ':' in item:
-                    parts = item.split(':')
-                    if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
-                        head = int(parts[0])
-                        ace = int(parts[1])
-                        slot = (int(parts[2]) if len(parts) == 3
-                                else self._plan_default_slot(head, ace))
-                        steps.append({
-                            'action': 'LOAD',
-                            'head': head,
-                            'ace': ace,
-                            'slot': slot,
-                        })
-                    else:
-                        raise gcmd.error('[multiACE] Invalid PLAN item: %s' % item)
+        if not plan_str:
+            raise gcmd.error(
+                '[multiACE] ACE_TEST requires PLAN. Use HEAD:ACE:SLOT; '
+                'implicit ACE/default-slot plans are blocked.')
+        for item in plan_str.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if item == 'U':
+                steps.append({'action': 'UNLOAD_ALL'})
+            elif item.startswith('U') and item[1:].isdigit():
+                steps.append({'action': 'UNLOAD', 'head': int(item[1:])})
+            elif item.startswith('A') and item[1:].isdigit():
+                raise gcmd.error(
+                    '[multiACE] Invalid PLAN item: %s. A<ace> implicit '
+                    'loads are blocked; use HEAD:ACE:SLOT.' % item)
+            elif item.startswith('H') and ':' in item[1:]:
+                parts = item[1:].split(':')
+                if len(parts) == 3 and all(p.isdigit() for p in parts):
+                    head = int(parts[0])
+                    ace = int(parts[1])
+                    slot = int(parts[2])
+                    steps.append({
+                        'action': 'SWAP',
+                        'head': head,
+                        'ace': ace,
+                        'slot': slot,
+                    })
                 else:
                     raise gcmd.error(
                         '[multiACE] Invalid PLAN item: %s '
-                        '(use HEAD:ACE, A0, U, U0..U3, S0..S3, W<seconds>)' % item)
-        else:
-            self._append_plan_default_loads(steps)
+                        '(use HHEAD:ACE:SLOT)' % item)
+            elif item.startswith('S') and item[1:].isdigit():
+                steps.append({'action': 'SWITCH', 'ace': int(item[1:])})
+            elif item.startswith('W') and item[1:].replace('.', '', 1).isdigit():
+                steps.append({'action': 'WAIT', 'seconds': float(item[1:])})
+            elif ':' in item:
+                parts = item.split(':')
+                if len(parts) == 3 and all(p.isdigit() for p in parts):
+                    head = int(parts[0])
+                    ace = int(parts[1])
+                    slot = int(parts[2])
+                    steps.append({
+                        'action': 'LOAD',
+                        'head': head,
+                        'ace': ace,
+                        'slot': slot,
+                    })
+                else:
+                    raise gcmd.error(
+                        '[multiACE] Invalid PLAN item: %s '
+                        '(use HEAD:ACE:SLOT)' % item)
+            else:
+                raise gcmd.error(
+                    '[multiACE] Invalid PLAN item: %s '
+                    '(use HEAD:ACE:SLOT, HHEAD:ACE:SLOT, U, U0..U3, '
+                    'S0..S3, W<seconds>)' % item)
 
         self.log_always(self._t('msg.test_start',
             steps=len(steps), unload=('yes' if do_unload else 'no')))
@@ -4604,7 +4577,7 @@ class MultiAce:
             if action == 'LOAD':
                 head = step['head']
                 ace = step['ace']
-                slot = step.get('slot', self._plan_default_slot(head, ace))
+                slot = step['slot']
                 self.log_always(self._t('msg.test_step_load',
                     step=step_nr, total=len(steps),
                     head=head, ace=self._disp(ace), slot=self._disp(slot)))
@@ -4704,7 +4677,7 @@ class MultiAce:
             elif action == 'SWAP':
                 head = step['head']
                 ace = step['ace']
-                slot = step.get('slot', self._plan_default_slot(head, ace))
+                slot = step['slot']
                 self.log_always(self._t('msg.test_step_swap',
                     step=step_nr, total=len(steps), head=head, ace=self._disp(ace)))
                 try:
@@ -6112,7 +6085,7 @@ class MultiAce:
             'b': after['b'] - before['b'],
         }
 
-    cmd_ACE_SEQ_help = '[multiACE] Run scripted load/unload sequence. PLAN: 0:1[:2]=load HEAD:ACE[:SLOT], A0=load routed target for ACE, U=unload all, U0=unload head. UNLOAD=0|1 (default 1) runs final ACE_UNLOAD_ALL_HEADS.'
+    cmd_ACE_SEQ_help = '[multiACE] Run scripted load/unload sequence. PLAN: 0:1:2=load HEAD:ACE:SLOT, U=unload all, U0=unload head. UNLOAD=0|1 (default 1) runs final ACE_UNLOAD_ALL_HEADS.'
     def cmd_ACE_SEQ(self, gcmd):
 
         plan_str = gcmd.get('PLAN', '')
@@ -6130,37 +6103,42 @@ class MultiAce:
         self._audit_state('SEQ_START', {'plan': plan_str, 'unload': do_unload})
 
         steps = []
-        if plan_str:
-            for item in plan_str.split(','):
-                item = item.strip()
-                if not item:
-                    continue
-                if item == 'U':
-                    steps.append({'action': 'UNLOAD_ALL'})
-                elif item.startswith('U') and item[1:].isdigit():
-                    steps.append({'action': 'UNLOAD', 'head': int(item[1:])})
-                elif item.startswith('A') and item[1:].isdigit():
-                    ace = int(item[1:])
-                    self._append_plan_load_for_ace(gcmd, steps, ace)
-                elif ':' in item:
-                    parts = item.split(':')
-                    if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
-                        head = int(parts[0])
-                        ace = int(parts[1])
-                        slot = (int(parts[2]) if len(parts) == 3
-                                else self._plan_default_slot(head, ace))
-                        steps.append({
-                            'action': 'LOAD',
-                            'head': head,
-                            'ace': ace,
-                            'slot': slot,
-                        })
-                    else:
-                        raise gcmd.error('[multiACE] Invalid PLAN item: %s' % item)
+        if not plan_str:
+            raise gcmd.error(
+                '[multiACE] ACE_SEQ requires PLAN. Use HEAD:ACE:SLOT; '
+                'implicit ACE/default-slot plans are blocked.')
+        for item in plan_str.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if item == 'U':
+                steps.append({'action': 'UNLOAD_ALL'})
+            elif item.startswith('U') and item[1:].isdigit():
+                steps.append({'action': 'UNLOAD', 'head': int(item[1:])})
+            elif item.startswith('A') and item[1:].isdigit():
+                raise gcmd.error(
+                    '[multiACE] Invalid PLAN item: %s. A<ace> implicit '
+                    'loads are blocked; use HEAD:ACE:SLOT.' % item)
+            elif ':' in item:
+                parts = item.split(':')
+                if len(parts) == 3 and all(p.isdigit() for p in parts):
+                    head = int(parts[0])
+                    ace = int(parts[1])
+                    slot = int(parts[2])
+                    steps.append({
+                        'action': 'LOAD',
+                        'head': head,
+                        'ace': ace,
+                        'slot': slot,
+                    })
                 else:
-                    raise gcmd.error('[multiACE] Invalid PLAN item: %s (use HEAD:ACE[:SLOT], A0, U, U0)' % item)
-        else:
-            self._append_plan_default_loads(steps)
+                    raise gcmd.error(
+                        '[multiACE] Invalid PLAN item: %s '
+                        '(use HEAD:ACE:SLOT)' % item)
+            else:
+                raise gcmd.error(
+                    '[multiACE] Invalid PLAN item: %s '
+                    '(use HEAD:ACE:SLOT, U, U0)' % item)
 
         self.log_always(self._t('msg.seq_start',
             steps=len(steps), unload=('yes' if do_unload else 'no')))
@@ -6174,7 +6152,7 @@ class MultiAce:
             if action == 'LOAD':
                 head = step['head']
                 ace = step['ace']
-                slot = step.get('slot', self._plan_default_slot(head, ace))
+                slot = step['slot']
                 self.log_always(self._t('msg.test_step_load',
                     step=step_nr, total=len(steps),
                     head=head, ace=self._disp(ace), slot=self._disp(slot)))
