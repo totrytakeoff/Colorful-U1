@@ -3615,6 +3615,71 @@ class MultiAce:
             return '#' + s[:6]
         return ''
 
+    def _override_color_to_source_hex(self, hex_color):
+        """Picker stores '#rrggbb'; head_source stores RRGGBB."""
+        h = (hex_color or '').lstrip('#').upper()
+        if len(h) >= 6:
+            return h[:6]
+        return ''
+
+    def _slot_color_to_source_hex(self, color):
+        try:
+            return self.rgb2hex(*color[:3])
+        except Exception:
+            return '000000'
+
+    def _head_source_for_slot(self, ace_idx, slot_idx, slot_info=None):
+        """Build saved head_source from the physical slot plus UI override."""
+        if slot_info is None:
+            info = self._info_per_ace.get(
+                ace_idx, self._make_default_info(ace_idx)) or {}
+            slots = info.get('slots', []) or []
+            slot_info = slots[slot_idx] if slot_idx < len(slots) else {}
+        override = self._override_for(ace_idx, slot_idx)
+        source_type = slot_info.get('type', '') or ''
+        source_color = self._slot_color_to_source_hex(
+            slot_info.get('color', (0, 0, 0)))
+        source_brand = slot_info.get('brand', '') or ''
+        source_subtype = slot_info.get('sku', '') or ''
+        if override is not None:
+            source_type = override.get('material') or source_type
+            source_color = (
+                self._override_color_to_source_hex(override.get('color', ''))
+                or source_color)
+            source_brand = override.get('brand') or source_brand
+            source_subtype = override.get('subtype') or source_subtype
+        return {
+            'ace_index': ace_idx,
+            'slot': slot_idx,
+            'type': source_type,
+            'color': source_color,
+            'brand': source_brand,
+            'subtype': source_subtype,
+        }
+
+    def _sync_loaded_head_source_metadata(self):
+        """Refresh saved head_source labels from current slot + override data."""
+        changed = False
+        for head, source in self._head_source.items():
+            if not source:
+                continue
+            try:
+                ace_idx = int(source.get('ace_index', 0))
+                slot_idx = int(source.get('slot', 0))
+                wanted = self._head_source_for_slot(ace_idx, slot_idx)
+            except Exception as e:
+                logging.info(
+                    '[multiACE] head_source metadata sync skipped T%d: %s'
+                    % (head, e))
+                continue
+            for key in ('type', 'color', 'brand', 'subtype'):
+                if source.get(key, '') != wanted.get(key, ''):
+                    source[key] = wanted.get(key, '')
+                    changed = True
+        if changed:
+            self._save_head_source()
+            logging.info('[multiACE] head_source metadata synced from slot overrides')
+
     def _save_slot_overrides(self):
         """Write self._slot_overrides back to slot_overrides.json
         atomically (.tmp + os.replace) so concurrent readers - the
@@ -3772,6 +3837,7 @@ class MultiAce:
         self._save_slot_overrides()
 
     def _push_rfid_info(self):
+        self._sync_loaded_head_source_metadata()
         logging.info('[multiACE] _push_rfid_info: active_device=%d, head_source=%s' % (
             self._active_device_index, str({k: (v['ace_index'] if v else None) for k, v in self._head_source.items()})))
         lines = []
@@ -3968,13 +4034,8 @@ class MultiAce:
                 '(module=%s channel=%s)' % (head, module, channel))
             return
         slot_info = slots[target_slot] if target_slot < len(slots) else {}
-        self._head_source[head] = {
-            'ace_index': ace_index,
-            'slot': target_slot,
-            'type': slot_info.get('type', ''),
-            'color': self.rgb2hex(*slot_info.get('color', (0, 0, 0))),
-            'brand': slot_info.get('brand', ''),
-        }
+        self._head_source[head] = self._head_source_for_slot(
+            ace_index, target_slot, slot_info)
         try:
             self._save_head_source()
         except Exception as e:
@@ -4322,13 +4383,8 @@ class MultiAce:
             logging.info('[multiACE] LOAD_HEAD: RFID not ready for slot %d after wait' % slot)
 
         slot_info = self._info['slots'][slot]
-        self._head_source[head] = {
-            'ace_index': ace_index,
-            'slot': slot,
-            'type': slot_info.get('type', 'PLA'),
-            'color': self.rgb2hex(*slot_info.get('color', (0, 0, 0))),
-            'brand': slot_info.get('brand', 'Generic'),
-        }
+        self._head_source[head] = self._head_source_for_slot(
+            ace_index, slot, slot_info)
         self._save_head_source()
         self._ghost_heads.discard(head)
 

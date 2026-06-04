@@ -1558,13 +1558,9 @@ class FilamentFeed:
                             si = slot_info[ace_slot]
                         else:
                             si = {}
-                        self.ace._head_source[head_idx] = {
-                            'ace_index': ace_idx,
-                            'slot': ace_slot,
-                            'type': si.get('type', 'PLA'),
-                            'color': self.ace.rgb2hex(*si.get('color', (0, 0, 0))),
-                            'brand': si.get('brand', 'Generic'),
-                        }
+                        self.ace._head_source[head_idx] = (
+                            self.ace._head_source_for_slot(
+                                ace_idx, ace_slot, si))
                         self.ace._save_head_source()
                         self.ace._ghost_heads.discard(head_idx)
                         logging.info('[multiACE] FEED_AUTO LOAD: head_source[%d] -> ACE %d / Slot %d' % (
