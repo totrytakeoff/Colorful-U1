@@ -149,6 +149,26 @@ def _resolve_head_source(src: Any) -> tuple[int | None, int | None]:
         return (d, src.get("slot"))
     return (None, None)
 
+def _head_source_load_failed(src: Any) -> bool:
+    return isinstance(src, dict) and bool(src.get("load_failed"))
+
+def _load_failed_toolheads(parsed: dict) -> list[dict]:
+    return [
+        t for t in (parsed.get("toolheads") or [])
+        if isinstance(t, dict) and t.get("load_failed")
+    ]
+
+def _load_failed_message(t: dict) -> str:
+    idx = t.get("idx")
+    ace = t.get("failed_ace")
+    slot = t.get("failed_slot")
+    if ace is None or slot is None:
+        return f"T{idx}: previous ACE load failed; recover this head first"
+    return (
+        f"T{idx}: previous ACE load failed on ACE {ace} / Slot {slot}; "
+        "recover this head first"
+    )
+
 def _color_to_hex(c: Any) -> str | None:
     """[r,g,b] (0-255) → '#rrggbb', or None for [0,0,0]/missing."""
     if not isinstance(c, (list, tuple)) or len(c) < 3:
@@ -262,6 +282,8 @@ def _parse_state(status: dict) -> dict:
 
     loaded_by_source: dict[tuple[int, int], int] = {}
     for t_key, src in (head_source or {}).items():
+        if _head_source_load_failed(src):
+            continue
         d_l, sl_l = _resolve_head_source(src)
         if d_l is None or sl_l is None:
             continue
@@ -399,8 +421,9 @@ def _parse_state(status: dict) -> dict:
         ext_key = f"extruder{t}" if t > 0 else "extruder0"
         feed = (fl if t < 2 else fr).get(ext_key, {}) or {}
 
-        d_explicit, sl_explicit = _resolve_head_source(
-            head_source.get(str(t)) or head_source.get(t))
+        src_raw = head_source.get(str(t)) or head_source.get(t)
+        load_failed = _head_source_load_failed(src_raw)
+        d_explicit, sl_explicit = _resolve_head_source(src_raw)
         loaded = bool(feed.get("filament_detected"))
         color = None
         material = ""
@@ -408,7 +431,8 @@ def _parse_state(status: dict) -> dict:
         sku = ""
         ace_field = None
         slot_field = None
-        if d_explicit is not None and sl_explicit is not None:
+        if (not load_failed
+                and d_explicit is not None and sl_explicit is not None):
             ace_field = d_explicit
             slot_field = sl_explicit
             if 0 <= d_explicit < len(aces_out):
@@ -443,13 +467,19 @@ def _parse_state(status: dict) -> dict:
             "material":           material,
             "brand":              brand,
             "sku":                sku,
-            "head_source_known":  d_explicit is not None,
+            "head_source_known":  (
+                not load_failed and d_explicit is not None
+            ),
+            "load_failed":        load_failed,
+            "failed_ace":         d_explicit if load_failed else None,
+            "failed_slot":        sl_explicit if load_failed else None,
             "route_managed":      (
                 t == route_primary_head if route_mode == "single_head" else True
             ),
         })
 
-        if d_explicit is not None and sl_explicit is not None:
+        if (not load_failed
+                and d_explicit is not None and sl_explicit is not None):
             wiring.append({
                 "ace": d_explicit, "slot": sl_explicit, "toolhead": t,
                 "color": color, "material": material,
@@ -779,6 +809,12 @@ async def _live_slots_async() -> list[dict]:
     status = await _query_state()
     out = []
     parsed = _parse_state(status)
+    failed = _load_failed_toolheads(parsed)
+    if failed:
+        raise HTTPException(
+            status_code=409,
+            detail="; ".join(_load_failed_message(t) for t in failed),
+        )
     for ace in parsed.get("aces", []) or []:
         for slot in ace.get("slots", []) or []:
             if slot.get("state") == "empty":
@@ -798,6 +834,7 @@ def _slot_to_dict(s: dict | None) -> dict | None:
     return {
         "ace":      s.get("ace"),
         "slot":     s.get("slot"),
+        "target_head": s.get("target_head"),
         "material": s.get("material") or "",
         "color":    s.get("color") or "",
     }
@@ -838,13 +875,15 @@ def _remap_mapping(base_mapping: list[dict], remap_t_to_t: dict[int, int]) -> li
 
 def _real_swap_count(events, mapping):
     by_t = {m["t"]: m["slot"] for m in mapping if m.get("slot")}
-    head_current = {h: (0, h) for h in range(4)}
+    head_current = {}
     swaps = 0
     for t in events:
         slot = by_t.get(t)
         if slot is None:
             continue
-        h = slot["slot"]
+        h = slot.get("target_head")
+        if h is None:
+            h = slot["slot"]
         key = (slot["ace"], slot["slot"])
         if head_current.get(h) != key:
             swaps += 1
@@ -875,6 +914,16 @@ def _layout_from_head_assignment(c2h, slicer_colors, slicer_types):
         }))
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     return [r[3] for r in rows]
+
+
+def _disabled_plan() -> dict:
+    return {
+        "feasible":     False,
+        "swaps":        0,
+        "tool_changes": 0,
+        "mapping":      [],
+        "reason":       "",
+    }
 
 
 def _build_plan(pp, plan_name, body, result, mapping,
@@ -1053,6 +1102,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         ],
         "live_slots": [
             {"ace": s["ace"], "slot": s["slot"],
+             "target_head": s.get("target_head"),
              "material": s["material"], "color": s["color"],
              "name": pp.approx_color_name(s["color"]) or ""}
             for s in sorted(live_slots, key=lambda x: (x["ace"], x["slot"]))
@@ -1072,11 +1122,12 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         proxy_remapped = pp.apply_remap(plan_proxy, remap) if remap else plan_proxy
         result = pp.plan_loadout(proxy_remapped, num_aces=num_aces) or {}
         del plan_proxy, proxy_remapped
-        for mode in ("slicer", "optimize", "layer"):
-            out["plans"][mode] = _build_plan(
-                pp, mode, None, result, mapping,
-                slicer_colors=slicer_colors, slicer_types=slicer_types,
-                num_aces=num_aces)
+        out["plans"]["slicer"] = _build_plan(
+            pp, "slicer", None, result, mapping,
+            slicer_colors=slicer_colors, slicer_types=slicer_types,
+            num_aces=num_aces)
+        out["plans"]["optimize"] = _disabled_plan()
+        out["plans"]["layer"] = _disabled_plan()
         del result
     return out
 
@@ -1296,6 +1347,16 @@ async def preflight_print(req: _PreflightPrint) -> dict:
     if not gpath.is_file():
         raise HTTPException(status_code=404,
                             detail="preflight token expired or unknown")
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    failed = _load_failed_toolheads(parsed)
+    if failed:
+        raise HTTPException(
+            status_code=409,
+            detail="; ".join(_load_failed_message(t) for t in failed),
+        )
     safe_name = (npath.read_text(encoding="utf-8").strip()
                  if npath.is_file() else (req.token + ".gcode"))
 
@@ -1514,6 +1575,17 @@ async def reboot() -> dict:
 
 @app.post("/api/upload-and-print")
 async def upload_and_print(file: UploadFile = File(...)) -> dict:
+
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    failed = _load_failed_toolheads(parsed)
+    if failed:
+        raise HTTPException(
+            status_code=409,
+            detail="; ".join(_load_failed_message(t) for t in failed),
+        )
 
     raw_name = file.filename or ""
     safe_name = os.path.basename(raw_name)
@@ -2003,6 +2075,27 @@ async def apply_snapshot(name: str) -> dict:
     cur_th = {t["idx"]: t for t in cur["toolheads"]}
     desired = {t["idx"]: t for t in snap.get("toolheads", [])}
     cur_aces = cur.get("aces", []) or []
+    errors: list[dict] = []
+    warnings: list[dict] = []
+
+    for idx, ct in cur_th.items():
+        if not ct.get("load_failed"):
+            continue
+        errors.append({
+            "head": idx,
+            "ace": ct.get("failed_ace"),
+            "slot": ct.get("failed_slot"),
+            "kind": "load_failed",
+            "message": _load_failed_message(ct),
+        })
+    if errors:
+        return {
+            "snapshot": name,
+            "actions": [],
+            "errors": errors,
+            "warnings": warnings,
+            "override_proposals": [],
+        }
 
     def _slot_view(ace_i, slot_i):
         if ace_i is None or slot_i is None:
@@ -2013,9 +2106,6 @@ async def apply_snapshot(name: str) -> dict:
         if not (0 <= slot_i < len(slots)):
             return None
         return slots[slot_i]
-
-    errors: list[dict] = []
-    warnings: list[dict] = []
 
     for idx, dt in desired.items():
         ace_i  = dt.get("ace")
@@ -2177,7 +2267,20 @@ def _save_overrides_to_disk() -> None:
     try:
         tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(json.dumps(_slot_overrides, indent=2), encoding="utf-8")
+        try:
+            st = p.parent.stat()
+            os.chown(str(tmp), st.st_uid, st.st_gid)
+        except OSError:
+            pass
+        try:
+            os.chmod(str(tmp), 0o644)
+        except OSError:
+            pass
         os.replace(str(tmp), str(p))
+        try:
+            os.chmod(str(p), 0o644)
+        except OSError:
+            pass
         try:
             _overrides_mtime = p.stat().st_mtime
         except OSError:
@@ -2220,7 +2323,10 @@ def _track_unload_clears(head_source: dict) -> None:
     changed = False
     for t in range(4):
         cur = head_source.get(str(t)) or head_source.get(t)
-        d, sl = _resolve_head_source(cur)
+        if _head_source_load_failed(cur):
+            d, sl = (None, None)
+        else:
+            d, sl = _resolve_head_source(cur)
         prev = _last_head_source.get(t)
         if prev is not None and (d, sl) != prev and d is None and sl is None:
 

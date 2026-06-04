@@ -26,6 +26,38 @@ multiACE extends the [SnapACE](https://github.com/BlackFrogKok/SnapACE) software
 
 ## Typical Workflow
 
+### Single Toolhead + Single ACE MVP
+
+This workflow is for the current hardware-test path where all four ACE
+slots feed one physical U1 toolhead through a 4-to-1 splitter. It lets a
+normal four-colour slicer profile drive one physical toolhead by rewriting
+virtual slicer tools to explicit ACE slot swaps.
+
+1. In the multiACE dashboard, set exactly one toolhead to **ACE** and set
+   the ACE target to that same toolhead. Leave the other toolheads
+   **Native**.
+2. Configure the four ACE slots with the material and colour that match
+   the slicer's virtual tools.
+3. Upload the G-code through the multiACE upload/preflight button, not
+   directly through the stock Moonraker upload page.
+4. In preflight, use **Printer layout (as loaded)**. The MVP disables
+   Optimize and Layer layouts for real printing.
+5. Verify that each row shows `ACE <n> Slot <m> -> T<physical head>` and
+   that all rows point to the ACE toolhead.
+6. Start the print from the preflight dialog.
+
+The post-processed G-code emits explicit commands such as:
+
+```gcode
+ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=0
+ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
+```
+
+`HEAD` is the physical U1 toolhead index, while `SLOT` is the ACE spool
+slot. Changing the printer-side retract settings does not require
+re-slicing; the same already-postprocessed test G-code can be used after a
+Klipper restart.
+
 ### Single Material (e.g. PLA on ACE 0)
 
 1. Insert spools into ACE 0
@@ -361,9 +393,17 @@ dryer_duration: 240     # Default drying duration (minutes)
 
 **retract_length** - Measure the actual distance from your extruder sensor to the PTFE splitter and subtract ~100mm. The retract only needs to pull the filament back past the splitter junction, not the full tube length.
 
+**swap_retract_length** - Print-time colour swaps use this value when
+unloading the currently loaded slot before loading the next one. For the
+single-toolhead ACE MVP, start conservatively at `1800` so the filament is
+pulled clear of the 4-to-1 splitter before the next slot loads. A change to
+this value requires a Klipper restart to enter memory, but it does not
+require re-slicing the model.
+
 ## Known Limitations
 
 - **Unload before first use** - After a fresh install or when upgrading from a previous version, unload all toolheads before using multiACE. Filament loaded from a previous installation may cause unexpected behavior since multiACE has no knowledge of the previous state. Use **ACEC__Unload_All** or unload via display before starting.
+- **Single-toolhead ACE MVP only supports current-layout printing** - The Web preflight page may show future Optimize/Layer concepts, but real hardware printing is intentionally limited to the loaded printer layout until multi-head/native+ACE coordination is implemented.
 - **Cross-ACE feed_assist** - During a print, only the ACE that was active when the print started has feed_assist available. Toolchanges to heads on other ACEs print without feed_assist (extruder pulls filament directly through the bowden). Pick the start ACE deliberately with `ACE_SWITCH TARGET=N` before the print so your most-used material lives on it. The next major version (v0.82) will lift this restriction.
 - **ACE USB Reset** - Inactive ACE units periodically reset their USB connection (~3s cycle). This is normal ACE Pro firmware behavior and does not affect operation. Visible in `dmesg` but harmless.
 - **Display Attach Toolhead** - Attaching a toolhead via the Snapmaker display triggers auto-feed. This is stock Snapmaker behavior and cannot be suppressed.

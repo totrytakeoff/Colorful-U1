@@ -273,6 +273,8 @@ button.slot.state-unknown { background: #333; color: #555; }
 .toolhead-card.present { border-color: #3a6a3a; }
 .toolhead-card.unknown { border-color: #b59a2a; }
 .toolhead-card.unknown .meta .muted { color: #d6b842; }
+.toolhead-card.failed { border-color: var(--error); background: #2c1d1d; }
+.toolhead-card.failed .error-inline { color: var(--error); font-weight: 600; }
 @keyframes th-blink-load {
   0%, 100% { background: #3a3a3a; }
   50%      { background: #1f4d2a; }
@@ -306,6 +308,7 @@ button.slot.state-unknown { background: #333; color: #555; }
                             font-weight: 500; }
 .toolhead-actions button:hover:not(:disabled) { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .toolhead-actions button:disabled { opacity: .3; cursor: not-allowed; }
+.toolhead-actions button.warn { border-color: #5a2a2a; color: var(--error); }
 .toolhead-actions button.warn:hover:not(:disabled) { background: var(--danger); color: #fff; border-color: var(--danger); }
 .meta { margin: .25rem 0 0 0; color: var(--muted); font-size: .85rem; }
 .meta strong { color: var(--fg); }

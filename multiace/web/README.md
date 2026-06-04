@@ -30,11 +30,33 @@ nginx zu ihm durchkommen - keine eigene User-/Token-Logik.
 | POST    | `/multiace/api/macro` | Führt G-Code-Macro aus (z. B. `A_LOAD`)    |
 | GET     | `/multiace/api/config`| Liest `ace.cfg`                            |
 | PUT     | `/multiace/api/config`| Schreibt `ace.cfg` (Backup `.bak`, optional Klipper-Restart) |
+| POST    | `/multiace/api/preflight`| Analysiert G-Code, matched Slicer-Farben gegen live ACE-Slots |
+| POST    | `/multiace/api/preflight/print`| Postprocess + Upload + Start über die aktuelle Printer-Anordnung |
 | WS      | `/multiace/ws`        | Live-Push der ACE-States (Intervall ~1 s)  |
 
 Display-Mirror wird **nicht** durch FastAPI proxied - das Frontend redet
 direkt mit `/screen/snapshot` und `/screen/touch` (paxx fb-http). Mobile
 Apps machen es analog.
+
+## G-Code Preflight
+
+Die Upload-Schaltfläche im Header führt mehrfarbige G-Code-Dateien zuerst
+durch `/multiace/api/preflight`. Für den Single-Toolhead-ACE-MVP ist nur
+**Printer layout (as loaded)** druckbar. Optimize- und Layer-Layouts bleiben
+bewusst deaktiviert, bis native+ACE- und Multi-Head-Koordination stabil sind.
+
+Die Mapping-Tabelle zeigt die echte Laufzeitroute:
+
+```text
+ACE <ace> Slot <slot> -> T<physical head> <- Slicer T<n>
+```
+
+Für ein Setup `ACE 0 -> HEAD 3` müssen alle vier ACE-Slots `target_head=3`
+melden. Beim Drucken schreibt der Postprozessor explizite Befehle wie
+`ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=2` in die hochgeladene Datei. Dadurch können
+printer-seitige Parameter wie `swap_retract_length` geändert und nach einem
+Klipper-Restart mit derselben G-Code-Datei erneut getestet werden; erneutes
+Slicen ist dafür nicht erforderlich.
 
 ## Verzeichnislayout
 

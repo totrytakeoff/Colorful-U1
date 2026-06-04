@@ -262,6 +262,7 @@ createApp({
           jobStatus: '',
           jobError: '',
           jobLastPoll: 0,
+          jobPolling: false,
           _resolve: resolve,
         });
         cmdQueue.value.unshift(it);
@@ -410,16 +411,19 @@ createApp({
         const th = _toolheadByIdx(a.HEAD);
         return !!(th
           && th.head_source_known
+          && !th.load_failed
           && Number(th.ace) === Number(a.ACE)
           && Number(th.slot) === Number(a.SLOT)
           && !_toolheadBusy(th));
       }
       if (it.cmd === 'ACE_UNLOAD_HEAD') {
         const th = _toolheadByIdx(a.HEAD);
-        return !!(th && !th.head_source_known && !_toolheadBusy(th));
+        return !!(th && !th.head_source_known && !th.load_failed
+          && !_toolheadBusy(th));
       }
       if (it.cmd === 'ACE_UNLOAD_ALL_HEADS') {
-        return state.toolheads.every(th => !th.head_source_known && !_toolheadBusy(th));
+        return state.toolheads.every(th => !th.head_source_known
+          && !th.load_failed && !_toolheadBusy(th));
       }
       return false;
     }
@@ -427,33 +431,59 @@ createApp({
       if (it.jobStatus === 'error') {
         return it.jobError || 'command failed';
       }
-      for (const th of _asyncItemHeads(it)) {
-        const err = th && th.channel_error;
-        if (err && err !== 'ok') return `T${dispIdx(th.idx)}: ${err}`;
-      }
       if (Date.now() - (it.startedAt || Date.now()) > ASYNC_QUEUE_TIMEOUT_MS) {
         return t("ui.queue.long_timeout");
+      }
+      for (const th of _asyncItemHeads(it)) {
+        if (!th) continue;
+        if ((it.cmd === 'ACE_LOAD_HEAD' || it.cmd === 'ACE_SWAP_HEAD')
+            && th.load_failed) {
+          const acePart = th.failed_ace != null && th.failed_slot != null
+            ? ` ACE ${dispIdx(th.failed_ace)} / Slot ${dispIdx(th.failed_slot)}`
+            : '';
+          return t("ui.dashboard.load_failed_detail", {
+            head: dispIdx(th.idx),
+            target: acePart,
+          });
+        }
+        const stateName = String(th.channel_state || '');
+        const err = th.channel_error;
+        const failedState = stateName.endsWith('_fail');
+        const finalErrored = it.jobStatus === 'done' && !_toolheadBusy(th)
+          && err && err !== 'ok';
+        if (failedState || finalErrored) {
+          return `T${dispIdx(th.idx)}: ${err || stateName || 'command failed'}`;
+        }
       }
       return '';
     }
     async function _pollAsyncJob(it) {
-      if (!it.jobId) return;
+      if (!it.jobId) return false;
       const now = Date.now();
-      if (now - (it.jobLastPoll || 0) < 1500) return;
+      if (now - (it.jobLastPoll || 0) < 1500) return false;
+      if (it.jobPolling) return false;
       it.jobLastPoll = now;
+      it.jobPolling = true;
       try {
         const r = await fetch(`${API}/macro-jobs/${encodeURIComponent(it.jobId)}`);
-        if (!r.ok) return;
+        if (!r.ok) return true;
         const j = await r.json();
         it.jobStatus = j.status || '';
         it.jobError = j.error || '';
-      } catch (_) {}
+        return true;
+      } catch (_) {
+        return true;
+      } finally {
+        it.jobPolling = false;
+      }
     }
     function _checkAsyncQueueItems() {
       let changed = false;
       for (const it of [...cmdQueue.value]) {
         if (it.status !== 'running' || !it.async || !it.submitted) continue;
-        _pollAsyncJob(it);
+        _pollAsyncJob(it).then(polled => {
+          if (polled) _checkAsyncQueueItems();
+        });
         if (!it.submittedStateSeen) {
           it.submittedStateSeen = true;
           continue;
@@ -638,12 +668,16 @@ createApp({
       if (headIdx == null) return true;
       const th = state.toolheads.find(tt => tt.idx === headIdx);
       if (!th) return false;
+      if (th.load_failed) return true;
       if (th.head_source_known) {
         return th.ace === aceIdx && th.slot === slotIdx;
       }
       return !!th.filament_at_extruder;
     }
     function unloadHead(idx) {
+      run("ACE_UNLOAD_HEAD", {HEAD: idx});
+    }
+    function recoverLoadFailed(idx) {
       run("ACE_UNLOAD_HEAD", {HEAD: idx});
     }
     function loadSlot(aceIdx, slotIdx) {
@@ -655,6 +689,12 @@ createApp({
         return;
       }
       const th = state.toolheads.find(tt => tt.idx === headIdx);
+      if (th && th.load_failed) {
+        setMacroLog(t("ui.dashboard.recover_before_load", {
+          head: dispIdx(headIdx),
+        }));
+        return;
+      }
       if (th && th.head_source_known && (th.ace !== aceIdx || th.slot !== slotIdx)) {
         enqueue("ACE_UNLOAD_HEAD", {HEAD: headIdx});
         enqueue("ACE_LOAD_HEAD",   {HEAD: headIdx, ACE: aceIdx, SLOT: slotIdx});
@@ -1508,7 +1548,7 @@ createApp({
     async function setToolheadMode(idx, mode) {
       const targetMode = mode === 'ace' ? 'ace' : 'native';
       const th = state.toolheads.find(t => t.idx === idx);
-      if (th && (th.head_source_known || th.filament_at_extruder)) {
+      if (th && (th.head_source_known || th.filament_at_extruder || th.load_failed)) {
         setMacroLog(`Unload T${dispIdx(idx)} before changing its source.`);
         return;
       }
@@ -1536,17 +1576,20 @@ createApp({
       if (!th) return !topologySaving.value;
       return !topologySaving.value
         && !th.head_source_known
-        && !th.filament_at_extruder;
+        && !th.filament_at_extruder
+        && !th.load_failed;
     }
     function canChangeAceTarget(aceIdx) {
       if (topologySaving.value) return false;
-      if (state.toolheads.some(t => t.ace === aceIdx && t.head_source_known)) {
+      if (state.toolheads.some(t =>
+        (t.ace === aceIdx && t.head_source_known)
+        || (t.failed_ace === aceIdx && t.load_failed))) {
         return false;
       }
       const current = aceTarget(aceIdx);
       if (current !== '') {
         const th = state.toolheads.find(t => t.idx === Number(current));
-        if (th && (th.head_source_known || th.filament_at_extruder)) {
+        if (th && (th.head_source_known || th.filament_at_extruder || th.load_failed)) {
           return false;
         }
       }
@@ -1560,7 +1603,7 @@ createApp({
       }
       if (target !== '') {
         const th = state.toolheads.find(t => t.idx === target);
-        if (th && (th.head_source_known || th.filament_at_extruder)) {
+        if (th && (th.head_source_known || th.filament_at_extruder || th.load_failed)) {
           setMacroLog(`Unload T${dispIdx(target)} before assigning ACE ${dispIdx(aceIdx)} to it.`);
           return;
         }
@@ -1744,6 +1787,14 @@ createApp({
       const g = parseInt(s.slice(2, 4), 16);
       const b = parseInt(s.slice(4, 6), 16);
       return `${r},${g},${b}`;
+    }
+    function slicerColorFor(tIdx) {
+      return (preflight.report?.slicer_colors || []).find(c => c.t === tIdx) || {};
+    }
+    function physicalHeadForMapping(m) {
+      const h = m?.slot?.target_head;
+      if (h != null && h !== '') return Number(h);
+      return null;
     }
     function sortedMapping(plan) {
       const rows = (plan && plan.mapping) || [];
@@ -1933,7 +1984,8 @@ createApp({
     return {
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
-      slotTitle, switchAce, loadSlot, unloadHead, isToolheadOccupied, toolheadOps,
+      slotTitle, switchAce, loadSlot, unloadHead, recoverLoadFailed,
+      isToolheadOccupied, toolheadOps,
       toolheadMode, setToolheadMode, canChangeToolheadMode, toolheadAceSlots,
       aceTarget, aceTargetOptions, setAceTarget, canChangeAceTarget,
       applyTopologyChanges, discardTopologyChanges,
@@ -1943,6 +1995,7 @@ createApp({
       loadConfig, saveConfigForm, saveConfigRaw,
       preflight, closePreflight, startPreflightPrint, stageLabel,
       tierLabel, tierWarn, rgbDec, sortedMapping,
+      slicerColorFor, physicalHeadForMapping,
       updateState, updateCheck, updateApply,
       debugState, debugEnable, debugDisable,
       plugins, refreshPlugins, pluginIframeSrc,

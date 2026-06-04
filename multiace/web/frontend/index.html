@@ -7,7 +7,7 @@
   <title>mUlt1ACE</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" type="image/svg+xml" href="icon.svg">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=preflight-head-map-1">
 </head>
 <body>
 <div id="app">
@@ -173,7 +173,7 @@
           <article v-for="t_ in state.toolheads" :key="t_.idx"
                    :ref="el => setThEl(t_.idx, el)"
                    class="toolhead-card"
-                   :class="{empty: !t_.module_exist, present: t_.head_source_known, unknown: !t_.head_source_known && t_.filament_at_extruder, 'op-loading': toolheadOps[t_.idx] === 'loading', 'op-unloading': toolheadOps[t_.idx] === 'unloading'}">
+                   :class="{empty: !t_.module_exist, present: t_.head_source_known, failed: t_.load_failed, unknown: !t_.head_source_known && !t_.load_failed && t_.filament_at_extruder, 'op-loading': toolheadOps[t_.idx] === 'loading', 'op-unloading': toolheadOps[t_.idx] === 'unloading'}">
             <h2>T{{ dispIdx(t_.idx) }}
               <small v-if="!t_.module_exist">{{ t('ui.common.offline') }}</small>
               <span class="th-color" v-if="t_.color && t_.head_source_known && !toolheadOps[t_.idx]" :style="{background: t_.color}"></span>
@@ -189,6 +189,14 @@
             </div>
             <p class="meta" v-if="toolheadOps[t_.idx]">
               <span class="muted">{{ toolheadOps[t_.idx] === 'loading' ? t('ui.dashboard.load') : t('ui.dashboard.unload') }}…</span>
+            </p>
+            <p class="meta" v-else-if="t_.load_failed">
+              <span class="error-inline">
+                {{ t('ui.dashboard.load_failed') }}
+                <template v-if="t_.failed_ace != null && t_.failed_slot != null">
+                  · ACE {{ dispIdx(t_.failed_ace) }} / Slot {{ dispIdx(t_.failed_slot) }}
+                </template>
+              </span>
             </p>
             <p class="meta" v-else-if="t_.head_source_known">
               <span v-if="t_.ace != null && t_.slot != null">ACE {{ dispIdx(t_.ace) }} / Slot {{ dispIdx(t_.slot) }}</span>
@@ -230,7 +238,10 @@
               <p v-else class="meta muted">Restart Klipper to apply ACE routing.</p>
             </div>
             <div class="toolhead-actions" v-if="t_.module_exist">
-              <button class="warn" @click="unloadHead(t_.idx)" :disabled="!t_.head_source_known && !t_.filament_at_extruder">{{ t('ui.dashboard.unload') }}</button>
+              <button v-if="t_.load_failed" class="warn" @click="recoverLoadFailed(t_.idx)">
+                {{ t('ui.dashboard.recover') }}
+              </button>
+              <button v-else class="warn" @click="unloadHead(t_.idx)" :disabled="!t_.head_source_known && !t_.filament_at_extruder">{{ t('ui.dashboard.unload') }}</button>
             </div>
           </article>
         </div>
@@ -298,7 +309,8 @@
         <div class="config-row">
           <label>{{ t('ui.config.swap_retract_length') }}</label>
           <input type="number" v-model.number="configForm.swap_retract_length"
-                 min="0" max="2000" step="1" placeholder="900">
+                 min="0" max="2000" step="1" placeholder="1800">
+          <small class="muted">{{ t('ui.config.swap_retract_length_hint') }}</small>
         </div>
         <div class="config-row">
           <label>Swap purge length</label>
@@ -670,6 +682,9 @@ reboot</pre>
             <div class="preflight-meta">
               <div><strong>ACE {{ dispIdx(s.ace) }} · Slot {{ dispIdx(s.slot) }}</strong></div>
               <div class="muted small">{{ s.material || '?' }}</div>
+              <div v-if="s.target_head != null" class="muted small">
+                → T{{ dispIdx(s.target_head) }}
+              </div>
               <div class="small">{{ s.name }}</div>
               <div class="muted small">{{ s.color || '?' }}<br>RGB({{ rgbDec(s.color) }})</div>
             </div>
@@ -720,7 +735,7 @@ reboot</pre>
               <thead>
                 <tr>
                   <th>{{ t('ui.preflight.printer') }}</th>
-                  <th>T</th>
+                  <th>{{ t('ui.preflight.physical_head') }}</th>
                   <th>←</th>
                   <th>{{ t('ui.preflight.slicer') }}</th>
                   <th>{{ t('ui.preflight.match_tier') }}</th>
@@ -734,14 +749,22 @@ reboot</pre>
                           :style="{background: m.slot.color || '#444'}"></span>
                     ACE {{ dispIdx(m.slot.ace) }} Slot {{ dispIdx(m.slot.slot) }}
                     <span class="muted small">· {{ m.slot.material || '?' }}</span>
+                    <span v-if="physicalHeadForMapping(m) != null"
+                          class="muted small">→ T{{ dispIdx(physicalHeadForMapping(m)) }}</span>
                   </td>
                   <td v-else class="muted">-</td>
-                  <td>T{{ dispIdx(m.t) }}</td>
+                  <td>
+                    <span v-if="physicalHeadForMapping(m) != null">
+                      T{{ dispIdx(physicalHeadForMapping(m)) }}
+                    </span>
+                    <span v-else class="muted">-</span>
+                  </td>
                   <td>←</td>
                   <td>
                     <span class="preflight-dot"
-                          :style="{background: preflight.report.slicer_colors.find(c => c.t === m.t)?.hex || '#444'}"></span>
-                    <span class="muted small">{{ preflight.report.slicer_colors.find(c => c.t === m.t)?.material || '?' }}</span>
+                          :style="{background: slicerColorFor(m.t).hex || '#444'}"></span>
+                    T{{ dispIdx(m.t) }}
+                    <span class="muted small">· {{ slicerColorFor(m.t).material || '?' }}</span>
                   </td>
                   <td class="small">{{ tierLabel(m.tier) }}</td>
                 </tr>
@@ -756,9 +779,9 @@ reboot</pre>
                      ? t('ui.preflight.sending')
                      : t('ui.preflight.go_' + mode) }}
               </button>
-              <span v-if="mode !== 'slicer'" class="muted small">
-                {{ t('ui.preflight.mvp_slicer_only') }}
-              </span>
+            </div>
+            <div v-else-if="mode !== 'slicer'" class="muted small">
+              {{ t('ui.preflight.mvp_slicer_only') }}
             </div>
           </div>
         </template>
@@ -771,6 +794,6 @@ reboot</pre>
   </div>
 </div>
 <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
-<script src="app.js?v=explicit-slot-guard-1"></script>
+<script src="app.js?v=preflight-head-map-1"></script>
 </body>
 </html>
