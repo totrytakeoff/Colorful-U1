@@ -738,8 +738,10 @@ class MultiAce:
 
     def _read_ace_targets(self, config, ace_heads):
         targets = {}
-        for ace in range(self.ace_device_count):
+        for ace in range(8):
             raw = config.get('ace%d_head' % ace, None)
+            if ace >= self.ace_device_count:
+                continue
             if raw is None:
                 targets[ace] = None
                 continue
