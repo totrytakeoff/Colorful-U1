@@ -520,6 +520,15 @@ class _StripMultiacePrefix:
 app = FastAPI(title="multiACE Web", version=VERSION)
 app.add_middleware(_StripMultiacePrefix)
 
+@app.middleware("http")
+async def _no_cache_frontend(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if not (path.startswith("/api/") or path.startswith("/plugin/")):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
 class MacroRequest(BaseModel):
     name: str
     args: dict[str, Any] | None = None
@@ -530,6 +539,10 @@ class MacroBatchRequest(BaseModel):
 class ConfigUpdate(BaseModel):
     content: str
     restart_klipper: bool = False
+
+EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
+EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
+OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
 
 OBSOLETE_ACE_CONFIG_KEYS = {
     "ace_route_mode",
@@ -550,6 +563,52 @@ OBSOLETE_GCODE_MACROS = {
     "ACEF__Mode_Normal",
     "ACEF__Mode_Multi",
 }
+
+def _macro_args_upper(args: dict[str, Any] | None) -> set[str]:
+    return {str(k).upper() for k in (args or {}).keys()}
+
+def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
+    macro = str(name or "").strip().upper()
+    if macro in OBSOLETE_MACROS_BLOCKED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{macro} is obsolete and blocked; use dashboard topology.")
+    if macro in EXPLICIT_ROUTE_MACROS:
+        missing = sorted(EXPLICIT_ROUTE_ARGS - _macro_args_upper(args))
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{macro} requires explicit HEAD, ACE and SLOT; "
+                    f"missing {', '.join(missing)}"))
+
+def _validate_gcode_script(script: str) -> None:
+    for lineno, raw in enumerate((script or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith(";"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        macro = parts[0].upper()
+        if macro in OBSOLETE_MACROS_BLOCKED:
+            raise HTTPException(
+                status_code=400,
+                detail=f"line {lineno}: {macro} is obsolete and blocked")
+        if macro not in EXPLICIT_ROUTE_MACROS:
+            continue
+        keys = {
+            p.split("=", 1)[0].upper()
+            for p in parts[1:]
+            if "=" in p
+        }
+        missing = sorted(EXPLICIT_ROUTE_ARGS - keys)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"line {lineno}: {macro} requires explicit HEAD, ACE "
+                    f"and SLOT; missing {', '.join(missing)}"))
 
 class SnapshotSave(BaseModel):
     name: str
@@ -1483,6 +1542,7 @@ async def run_macro_batch(req: MacroBatchRequest) -> dict:
         raise HTTPException(status_code=400, detail="no commands")
     lines = []
     for c in req.commands:
+        _validate_macro_request(c.name, c.args)
         parts = [c.name]
         if c.args:
             for k, v in c.args.items():
@@ -1503,6 +1563,7 @@ async def run_macro_batch(req: MacroBatchRequest) -> dict:
 
 @app.post("/api/macro")
 async def run_macro(req: MacroRequest) -> dict:
+    _validate_macro_request(req.name, req.args)
     parts = [req.name]
     if req.args:
         for k, v in req.args.items():
@@ -1884,9 +1945,15 @@ async def apply_snapshot(name: str) -> dict:
     for ace_idx in sorted(by_ace):
         for head in sorted(by_ace[ace_idx]):
             dt = desired.get(head, {})
-            args = {"HEAD": head, "ACE": ace_idx}
-            if dt.get("slot") is not None:
-                args["SLOT"] = dt.get("slot")
+            if dt.get("slot") is None:
+                errors.append({
+                    "head": head, "ace": ace_idx, "slot": None,
+                    "kind": "missing_slot",
+                    "message": (
+                        f"T{head}: snapshot target needs explicit ACE slot"),
+                })
+                continue
+            args = {"HEAD": head, "ACE": ace_idx, "SLOT": dt.get("slot")}
             actions.append({"name": "ACE_LOAD_HEAD", "args": args})
 
     override_proposals: list[dict] = []
@@ -2351,6 +2418,7 @@ async def plugin_api_gcode(req: _PluginGcode) -> dict:
     script = (req.script or "").strip()
     if not script:
         raise HTTPException(status_code=400, detail="empty script")
+    _validate_gcode_script(script)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(

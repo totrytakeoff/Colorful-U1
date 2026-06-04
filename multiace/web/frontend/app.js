@@ -209,8 +209,27 @@ createApp({
       const a = args || {};
       return Object.keys(a).sort().map(k => `${k}=${a[k]}`).join('|');
     }
+    function _validateQueuedCommand(name, args) {
+      const a = args || {};
+      if (name === 'ACE_LOAD_HEAD' || name === 'ACE_SWAP_HEAD') {
+        const missing = ['HEAD', 'ACE', 'SLOT'].filter(k => !(k in a));
+        if (missing.length) {
+          throw new Error(`${name} requires HEAD, ACE and SLOT; missing ${missing.join(', ')}`);
+        }
+      }
+      if (name === 'SET_ACE_MODE' || name === 'ACE_RUN_MODE_SWITCH') {
+        throw new Error(`${name} is obsolete and blocked`);
+      }
+    }
     function enqueue(name, args, opts) {
       return new Promise((resolve) => {
+        try {
+          _validateQueuedCommand(name, args || {});
+        } catch (e) {
+          setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
+          resolve(false);
+          return;
+        }
         const key = _argsKey(args);
         const dup = cmdQueue.value.find(it =>
           (it.status === 'queued' || it.status === 'running')
@@ -368,9 +387,9 @@ createApp({
         case 'SET_PRINT_FILAMENT_CONFIG':
           return `Display T${di(a.CONFIG_EXTRUDER ?? 0)}`;
         case 'ACE_LOAD_HEAD':
-          return `Load T${di(a.HEAD ?? 0)} ← ACE ${di(a.ACE ?? 0)}`;
+          return `Load T${di(a.HEAD ?? 0)} ← ACE ${di(a.ACE ?? 0)} / Slot ${di(a.SLOT ?? 0)}`;
         case 'ACE_SWAP_HEAD':
-          return `Swap T${di(a.HEAD ?? 0)} ← ACE ${di(a.ACE ?? 0)}`;
+          return `Swap T${di(a.HEAD ?? 0)} ← ACE ${di(a.ACE ?? 0)} / Slot ${di(a.SLOT ?? 0)}`;
         case 'ACE_UNLOAD_HEAD':
           return `Unload T${di(a.HEAD ?? 0)}`;
         case 'ACE_UNLOAD_ALL_HEADS':

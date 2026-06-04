@@ -4213,8 +4213,30 @@ class MultiAce:
         })
 
     cmd_ACE_LOAD_HEAD_help = '[multiACE] Load a toolhead from ACE. Usage: ACE_LOAD_HEAD HEAD=0 ACE=0 SLOT=0'
+    def _require_explicit_params(self, gcmd, action, names):
+        try:
+            raw = gcmd.get_raw_command_parameters()
+        except Exception:
+            raw = ''
+        tokens = [
+            p.split('=', 1)[0].strip().upper()
+            for p in str(raw).replace('\n', ' ').split()
+            if '=' in p
+        ]
+        missing = [
+            name for name in names
+            if name.upper() not in tokens
+        ]
+        if missing:
+            raise gcmd.error(
+                '[multiACE] %s refused: explicit %s required. '
+                'Use %s HEAD=<0..3> ACE=<n> SLOT=<0..3>.'
+                % (action, ', '.join(missing), action))
+
     def cmd_ACE_LOAD_HEAD(self, gcmd):
 
+        self._require_explicit_params(
+            gcmd, 'ACE_LOAD_HEAD', ('HEAD', 'ACE', 'SLOT'))
         head = gcmd.get_int('HEAD')
         ace_index = gcmd.get_int('ACE')
         slot = gcmd.get_int('SLOT')
@@ -4238,25 +4260,12 @@ class MultiAce:
                     head=head))
                 return
 
-            if len(self._ace_devices) == 1:
-                only_idx = 0
-                info = self._info_per_ace.get(only_idx, self._make_default_info(only_idx))
-                slots = info.get('slots', [])
-                slot_info = slots[slot] if slot < len(slots) else {}
-                self._head_source[head] = {
-                    'ace_index': only_idx,
-                    'slot': slot,
-                    'type': slot_info.get('type', 'PLA'),
-                    'color': self.rgb2hex(*slot_info.get('color', (0, 0, 0))),
-                    'brand': slot_info.get('brand', 'Generic'),
-                }
-                self._save_head_source()
-                self.log_always(self._t('msg.load_head_inferred_only_ace',
-                    head=head, slot=self._disp(slot)))
-            else:
-                self.log_error(self._t('msg.load_head_no_source_recorded',
-                    head=head, count=len(self._ace_devices)))
-            return
+            raise gcmd.error(
+                '[multiACE] ACE_LOAD_HEAD refused: HEAD=%d already has '
+                'filament but no saved ACE/slot source. Refusing to guess '
+                'or overwrite the source. Unload/recover the physically '
+                'loaded filament first, then load HEAD=%d ACE=%d SLOT=%d.'
+                % (head, head, ace_index, slot))
 
         self.log_always(self._t('msg.load_head_starting',
             head=head, ace=self._disp(ace_index), slot=self._disp(slot)))
@@ -4835,6 +4844,8 @@ class MultiAce:
     cmd_ACE_SWAP_HEAD_help = '[multiACE] Mid-print filament swap. Usage: ACE_SWAP_HEAD HEAD=0 ACE=1 SLOT=0'
     def cmd_ACE_SWAP_HEAD(self, gcmd):
 
+        self._require_explicit_params(
+            gcmd, 'ACE_SWAP_HEAD', ('HEAD', 'ACE', 'SLOT'))
         head = gcmd.get_int('HEAD')
         ace_index = gcmd.get_int('ACE')
         slot = gcmd.get_int('SLOT')
