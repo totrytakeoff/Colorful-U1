@@ -1,5 +1,7 @@
 # Colorful-U1
 
+[中文说明](README.zh-CN.md)
+
 Colorful-U1 is an experimental Snapmaker U1 filament-routing firmware and
 web-control project based on
 [decay71/multiACE](https://github.com/decay71/multiACE), which itself extends
