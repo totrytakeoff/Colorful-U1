@@ -26,6 +26,7 @@ services:
       MULTIACE_FRONTEND_DIR: /app/multiace/web/frontend
       MULTIACE_SNAPSHOT_DIR: /data/snapshots
       MULTIACE_OVERRIDE_FILE: /data/slot_overrides.json
+      MULTIACE_NATIVE_OVERRIDE_FILE: /data/native_overrides.json
       MULTIACE_MATERIALS_FILE: /data/materials.json
       MULTIACE_I18N_DIR: /app/multiace/i18n
     volumes:

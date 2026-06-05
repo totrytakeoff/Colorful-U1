@@ -897,7 +897,28 @@ createApp({
       }
       return _ptcGcodeForHead(headIdx, mat, brand, sub, colorHex);
     }
-    function saveNativePicker() {
+    async function saveNativePicker() {
+      try {
+        const r = await fetch(`${API}/native-override`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            head:     nativePicker.head,
+            material: nativePicker.material || "",
+            brand:    nativePicker.vendor || "",
+            subtype:  nativePicker.subtype || "",
+            color:    nativePicker.color || "",
+          }),
+        });
+        if (!r.ok) {
+          let msg = `${r.status} ${r.statusText}`;
+          try { const j = await r.json(); if (j.detail) msg = j.detail; } catch (_) {}
+          throw new Error(msg);
+        }
+      } catch (e) {
+        setMacroLog(`${t("ui.common.error")}: ${e.message || e}`);
+        return;
+      }
       enqueue("SET_PRINT_FILAMENT_CONFIG", _ptcGcodeForHead(
         nativePicker.head,
         nativePicker.material,
@@ -905,6 +926,7 @@ createApp({
         nativePicker.subtype,
         nativePicker.color));
       closeNativePicker();
+      reloadState();
     }
     async function savePicker(loadAfter) {
       const aceIdx = picker.ace;

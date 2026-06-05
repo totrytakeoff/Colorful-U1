@@ -55,6 +55,10 @@ OVERRIDE_FILE = os.environ.get(
     "MULTIACE_OVERRIDE_FILE",
     "/home/lava/printer_data/config/extended/multiace/slot_overrides.json",
 )
+NATIVE_OVERRIDE_FILE = os.environ.get(
+    "MULTIACE_NATIVE_OVERRIDE_FILE",
+    "/home/lava/printer_data/config/extended/multiace/native_overrides.json",
+)
 MATERIALS_FILE = os.environ.get(
     "MULTIACE_MATERIALS_FILE",
     "/home/lava/printer_data/config/extended/multiace/materials.json",
@@ -190,6 +194,7 @@ def _parse_state(status: dict) -> dict:
     """
 
     _reload_overrides_if_changed()
+    _reload_native_overrides_if_changed()
 
     ace = status.get("ace", {}) or {}
     fl = status.get("filament_feed left",  {}) or {}
@@ -236,6 +241,21 @@ def _parse_state(status: dict) -> dict:
             "sku":      sub,
             "brand":    vendor if vendor != "NONE" else "",
             "color":    color_hex,
+        }
+
+    def _native_override_at(n: int) -> dict | None:
+        o = _native_overrides.get(str(n)) or _native_overrides.get(n)
+        if not isinstance(o, dict):
+            return None
+        mat = (o.get("material") or "").strip()
+        color = (o.get("color") or "").strip()
+        if not mat and not color:
+            return None
+        return {
+            "material": mat,
+            "sku":      (o.get("subtype") or "").strip(),
+            "brand":    (o.get("brand") or "").strip(),
+            "color":    color.lower() if color else None,
         }
 
     SLOT_COUNT = 4
@@ -429,6 +449,7 @@ def _parse_state(status: dict) -> dict:
         material = ""
         brand = ""
         sku = ""
+        mode = _route_head_mode(t)
         ace_field = None
         slot_field = None
         if (not load_failed
@@ -444,16 +465,16 @@ def _parse_state(status: dict) -> dict:
                     brand = slot_obj.get("brand", "")
                     sku = slot_obj.get("sku", "")
         else:
-            ptc_head = _ptc_at(t)
-            if ptc_head:
-                color = ptc_head.get("color")
-                material = ptc_head.get("material", "")
-                brand = ptc_head.get("brand", "")
-                sku = ptc_head.get("sku", "")
+            meta = (_native_override_at(t) if mode == "native" else None) or _ptc_at(t)
+            if meta:
+                color = meta.get("color")
+                material = meta.get("material", "")
+                brand = meta.get("brand", "")
+                sku = meta.get("sku", "")
         toolheads.append({
             "idx":                t,
             "name":               f"T{t}",
-            "mode":               _route_head_mode(t),
+            "mode":               mode,
             "ace":                ace_field,
             "slot":               slot_field,
             "filament_detected":  feed.get("filament_detected"),
@@ -779,6 +800,13 @@ class SnapshotSave(BaseModel):
 class SlotOverride(BaseModel):
     ace: int
     slot: int
+    material: str | None = ""
+    brand: str | None = ""
+    subtype: str | None = ""
+    color: str | None = ""
+
+class NativeOverride(BaseModel):
+    head: int
     material: str | None = ""
     brand: str | None = ""
     subtype: str | None = ""
@@ -2719,12 +2747,17 @@ async def apply_snapshot(name: str) -> dict:
     }
 
 _slot_overrides: dict[str, dict] = {}
+_native_overrides: dict[str, dict] = {}
 _last_head_source: dict[int, tuple[int, int] | None] = {}
 
 _overrides_mtime: float = 0.0
+_native_overrides_mtime: float = 0.0
 
 def _override_key(ace: int, slot: int) -> str:
     return f"{int(ace)}_{int(slot)}"
+
+def _native_override_key(head: int) -> str:
+    return str(int(head))
 
 def _reload_overrides_if_changed() -> None:
     """Cheap mtime check; reloads only when the file has been touched
@@ -2757,6 +2790,68 @@ def _load_overrides_from_disk() -> None:
             _slot_overrides.update(data)
         try:
             _overrides_mtime = p.stat().st_mtime
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+def _reload_native_overrides_if_changed() -> None:
+    global _native_overrides_mtime
+    p = Path(NATIVE_OVERRIDE_FILE)
+    if not p.exists():
+        if _native_overrides:
+            _native_overrides.clear()
+        _native_overrides_mtime = 0.0
+        return
+    try:
+        m = p.stat().st_mtime
+    except OSError:
+        return
+    if m == _native_overrides_mtime:
+        return
+    _load_native_overrides_from_disk()
+    _native_overrides_mtime = m
+
+def _load_native_overrides_from_disk() -> None:
+    global _native_overrides_mtime
+    p = Path(NATIVE_OVERRIDE_FILE)
+    if not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _native_overrides.clear()
+            _native_overrides.update(data)
+        try:
+            _native_overrides_mtime = p.stat().st_mtime
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+def _save_native_overrides_to_disk() -> None:
+    global _native_overrides_mtime
+    p = Path(NATIVE_OVERRIDE_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(_native_overrides, indent=2), encoding="utf-8")
+        try:
+            st = p.parent.stat()
+            os.chown(str(tmp), st.st_uid, st.st_gid)
+        except OSError:
+            pass
+        try:
+            os.chmod(str(tmp), 0o644)
+        except OSError:
+            pass
+        os.replace(str(tmp), str(p))
+        try:
+            os.chmod(str(p), 0o644)
+        except OSError:
+            pass
+        try:
+            _native_overrides_mtime = p.stat().st_mtime
         except OSError:
             pass
     except Exception:
@@ -2849,6 +2944,42 @@ def _track_unload_clears(head_source: dict) -> None:
 async def list_slot_overrides() -> dict:
     return {"overrides": _slot_overrides}
 
+@app.get("/api/native-override")
+async def list_native_overrides() -> dict:
+    _reload_native_overrides_if_changed()
+    return {"overrides": _native_overrides}
+
+@app.post("/api/native-override")
+async def set_native_override(req: NativeOverride) -> dict:
+    if req.head < 0 or req.head > 3:
+        raise HTTPException(status_code=400, detail="head must be 0..3")
+    key = _native_override_key(req.head)
+    new = {
+        "head":     req.head,
+        "material": req.material or "",
+        "brand":    req.brand or "",
+        "subtype":  req.subtype or "",
+        "color":    req.color or "",
+    }
+    old = _native_overrides.get(key)
+    _native_overrides[key] = new
+    _trace.info("native override SET via picker POST T%d: %s -> %s",
+                req.head, old, new)
+    _save_native_overrides_to_disk()
+    return {"ok": True, "key": key, "override": _native_overrides[key]}
+
+@app.delete("/api/native-override/{head}")
+async def delete_native_override(head: int) -> dict:
+    if head < 0 or head > 3:
+        raise HTTPException(status_code=400, detail="head must be 0..3")
+    key = _native_override_key(head)
+    if key in _native_overrides:
+        old = _native_overrides.pop(key, None)
+        _trace.info("native override DROP via picker DELETE T%d (was %s)",
+                    head, old)
+        _save_native_overrides_to_disk()
+    return {"ok": True}
+
 @app.post("/api/slot-override")
 async def set_slot_override(req: SlotOverride) -> dict:
     key = _override_key(req.ace, req.slot)
@@ -2878,6 +3009,7 @@ async def delete_slot_override(ace: int, slot: int) -> dict:
     return {"ok": True}
 
 _load_overrides_from_disk()
+_load_native_overrides_from_disk()
 
 _notifications: deque = deque(maxlen=50)
 _next_notification_id = int(time.time() * 1000)
