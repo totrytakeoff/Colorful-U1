@@ -96,6 +96,21 @@ Phase 4: 切片软件集成
 目标：先减少不必要的换料次数，再优化单次换料耗时。优先做不改变硬件控制
 边界的优化。
 
+### 实现进度：2026-06-05
+
+已落地第一轮统计基线：
+
+- `source_map` 增加 `swap_stats`。
+- `swap_stats` 记录 toolchange 事件数、每个 slicer tool 的出现次数、native
+  事件数、ACE 事件数、预计真实 ACE swap 次数、同源可跳过次数和未映射事件数。
+- `source_map` 只保存前 200 条事件样本，完整事件序列单独作为 preflight
+  临时 artifact 保存，避免大文件撑爆 API 响应。
+- Web preflight 页面显示预计 ACE swap、同源跳过、tool events 和 2-4 分钟
+  单次 swap 假设下的粗略耗时范围。
+- 手动映射发送打印时，后端会基于完整 toolchange events 重新生成最终
+  `swap_stats`。
+- Docker dry-run 回归脚本增加 `swap_stats` 校验。
+
 ### 2.1 减少换料次数
 
 这是收益最大、风险最低的方向。

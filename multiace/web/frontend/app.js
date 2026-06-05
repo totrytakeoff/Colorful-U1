@@ -2011,12 +2011,26 @@ createApp({
         token: rep.token,
         filename: rep.filename,
         tool_targets: rep.tool_targets || {},
+        swap_stats: {
+          ...(existing.swap_stats || {}),
+          mapping_changed: true,
+        },
         entries,
       };
     }
     function sourceMapEntries() {
       const entries = preflight.report?.source_map?.entries || [];
       return entries.slice().sort((a, b) => Number(a.slicer_tool) - Number(b.slicer_tool));
+    }
+    function swapStats() {
+      return preflight.report?.source_map?.swap_stats || null;
+    }
+    function formatSecondsRange(minSec, maxSec) {
+      const a = Number(minSec || 0);
+      const b = Number(maxSec || 0);
+      if (!a && !b) return "0m";
+      const fmt = (sec) => `${Math.round(sec / 60)}m`;
+      return a === b ? fmt(a) : `${fmt(a)}-${fmt(b)}`;
     }
     function preflightTargetOptions() {
       return (preflight.report?.live_loadout || [])
@@ -2314,7 +2328,7 @@ createApp({
       mappingTargetKind, mappingTargetColor, mappingTargetMaterial,
       mappingTargetValue, setManualMapping, preflightTargetDisabled,
       preflightTargetOptions, formatPreflightTarget, preflightCanPrint,
-      sourceMapEntries,
+      sourceMapEntries, swapStats, formatSecondsRange,
       updateState, updateCheck, updateApply,
       debugState, debugEnable, debugDisable,
       plugins, refreshPlugins, pluginIframeSrc,

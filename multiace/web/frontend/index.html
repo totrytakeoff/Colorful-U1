@@ -760,6 +760,30 @@ reboot</pre>
                       class="muted small">- {{ preflight.report.plans[mode].reason }}</span>
               </span>
             </div>
+            <div v-if="mode === 'slicer' && swapStats()" class="preflight-swap-stats">
+              <span>
+                <strong>{{ swapStats().active_ace_swaps }}</strong>
+                {{ t('ui.preflight.ace_swaps_est') }}
+              </span>
+              <span>
+                <strong>{{ swapStats().skipped_same_ace }}</strong>
+                {{ t('ui.preflight.same_source_skips') }}
+              </span>
+              <span>
+                <strong>{{ swapStats().tool_events }}</strong>
+                {{ t('ui.preflight.tool_events') }}
+              </span>
+              <span>
+                {{ t('ui.preflight.swap_time_est') }}:
+                <strong>
+                  {{ formatSecondsRange(swapStats().estimated_swap_seconds_min,
+                                        swapStats().estimated_swap_seconds_max) }}
+                </strong>
+              </span>
+              <span v-if="swapStats().mapping_changed" class="preflight-stat-note">
+                {{ t('ui.preflight.stats_refresh_on_send') }}
+              </span>
+            </div>
             <table class="preflight-mapping" v-if="preflight.report.plans[mode].mapping.length">
               <thead>
                 <tr>

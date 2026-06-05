@@ -217,7 +217,12 @@
       "match_tier": "Match",
       "command_preview": "Finale Befehlsvorschau",
       "target": "Ziel",
-      "commands": "Befehle"
+      "commands": "Befehle",
+      "ace_swaps_est": "geschätzte ACE-Wechsel",
+      "same_source_skips": "Same-Source-Skips",
+      "tool_events": "Tool-Events",
+      "swap_time_est": "geschätzte Wechselzeit",
+      "stats_refresh_on_send": "Statistik wird beim Senden aktualisiert"
     },
     "queue": {
       "send_all_tooltip": "Alle Queue-Befehle an den Drucker senden (UI darf danach geschlossen werden)",

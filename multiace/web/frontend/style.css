@@ -587,6 +587,26 @@ body { padding-bottom: 64px; }
                        flex-wrap: wrap; }
 .preflight-plan-head h4 { margin: 0; }
 .preflight-infeasible { color: var(--warn, #c4651e); font-weight: 500; }
+.preflight-swap-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem .6rem;
+  margin: .45rem 0 .25rem;
+  font-size: .8rem;
+  color: var(--muted);
+}
+.preflight-swap-stats span {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: .16rem .38rem;
+  background: rgba(0,0,0,.18);
+}
+.preflight-swap-stats strong { color: var(--fg); }
+.preflight-swap-stats .preflight-stat-note {
+  color: var(--warn, #c4651e);
+  border-color: var(--warn, #c4651e);
+  background: rgba(196, 101, 30, .12);
+}
 .preflight-mapping { width: 100%; border-collapse: collapse; margin: .4rem 0;
                      font-size: .82rem; }
 .preflight-mapping th { text-align: left; padding: .2rem .4rem;

@@ -1094,6 +1094,90 @@ def _target_command_preview(target: dict | None) -> list[str]:
         ]
     return []
 
+def _event_target_key(target: dict | None) -> tuple | None:
+    if not target:
+        return None
+    try:
+        head = int(target.get("head"))
+    except (TypeError, ValueError):
+        return None
+    if target.get("kind") == "native":
+        return ("native", head)
+    if target.get("kind") == "ace":
+        try:
+            ace = int(target.get("ace"))
+            slot = int(target.get("slot"))
+        except (TypeError, ValueError):
+            return None
+        return ("ace", head, ace, slot)
+    return None
+
+def _build_swap_stats(events: list[int] | tuple[int, ...],
+                      tool_targets: dict[str, dict]) -> dict:
+    """Estimate command-level ACE swap pressure for the resolved mapping.
+
+    This is intentionally observational. It does not change rewrite behavior;
+    it only summarizes the current resolver output so Phase 2 optimization has
+    a stable baseline.
+    """
+    head_current: dict[int, tuple] = {}
+    tool_counts: dict[str, int] = {}
+    active_ace_swaps = 0
+    skipped_same_ace = 0
+    ace_events = 0
+    native_events = 0
+    unmapped_events = 0
+    sample = []
+    for idx, raw_t in enumerate(events or []):
+        try:
+            t = int(raw_t)
+        except (TypeError, ValueError):
+            continue
+        tool_counts[str(t)] = tool_counts.get(str(t), 0) + 1
+        target = tool_targets.get(str(t), tool_targets.get(t))
+        key = _event_target_key(target)
+        commands = _target_command_preview(target)
+        action = "unmapped"
+        if key is None:
+            unmapped_events += 1
+        elif key[0] == "native":
+            native_events += 1
+            action = "native"
+            head_current[int(key[1])] = key
+        else:
+            ace_events += 1
+            head = int(key[1])
+            if head_current.get(head) == key:
+                skipped_same_ace += 1
+                action = "ace_skip_same_source"
+            else:
+                active_ace_swaps += 1
+                action = "ace_swap"
+                head_current[head] = key
+        if len(sample) < 200:
+            sample.append({
+                "index": idx,
+                "slicer_tool": t,
+                "target": target,
+                "commands": commands,
+                "action": action,
+            })
+    total = len(events or [])
+    return {
+        "tool_events": total,
+        "tool_counts": tool_counts,
+        "native_events": native_events,
+        "ace_events": ace_events,
+        "active_ace_swaps": active_ace_swaps,
+        "skipped_same_ace": skipped_same_ace,
+        "unmapped_events": unmapped_events,
+        "estimated_swap_seconds_min": active_ace_swaps * 120,
+        "estimated_swap_seconds_max": active_ace_swaps * 240,
+        "events_sample_limit": 200,
+        "events_sample_truncated": total > 200,
+        "events_sample": sample,
+    }
+
 def _build_preflight_source_map(
         *,
         token: str,
@@ -1103,6 +1187,7 @@ def _build_preflight_source_map(
         tool_targets: dict[str, dict],
         parsed: dict,
         used_tools: set[int],
+        events: list[int] | tuple[int, ...] | None = None,
 ) -> dict:
     route = parsed.get("route", {}) or {}
     entries = []
@@ -1132,8 +1217,37 @@ def _build_preflight_source_map(
         },
         "used_tools": sorted(used_tools),
         "tool_targets": tool_targets,
+        "swap_stats": _build_swap_stats(list(events or []), tool_targets),
         "entries": entries,
     }
+
+def _preflight_events_path(token: str) -> Path:
+    return _PREFLIGHT_DIR / (token + ".events")
+
+def _save_preflight_events(token: str, events: list[int]) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return
+    _preflight_events_path(token).write_text(
+        json.dumps([int(t) for t in events]),
+        encoding="utf-8")
+
+def _load_preflight_events(token: str) -> list[int]:
+    p = _preflight_events_path(token)
+    if not p.is_file():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for t in data:
+        try:
+            out.append(int(t))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 def _preflight_source_map_path(token: str) -> Path:
     return _PREFLIGHT_DIR / (token + ".source_map.json")
@@ -1653,6 +1767,12 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=409,
                             detail="no native head or ACE slot is available")
     tool_targets = resolver.get("tool_targets", {})
+    result = {}
+    if not resolver.get("errors"):
+        result = pp.plan_loadout(plan_proxy, num_aces=num_aces) or {}
+    events = [int(t) for t in (result.get("events") or [])]
+    if not events:
+        events = sorted(used_tools)
     source_map = _build_preflight_source_map(
         token=token,
         filename=safe_name,
@@ -1661,10 +1781,12 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         tool_targets=tool_targets,
         parsed=parsed,
         used_tools=used_tools,
+        events=events,
     )
     (_PREFLIGHT_DIR / (token + ".targets")).write_text(
         json.dumps(tool_targets, indent=2),
         encoding="utf-8")
+    _save_preflight_events(token, events)
     _save_preflight_source_map(source_map)
     (_PREFLIGHT_DIR / (token + ".used")).write_text(
         json.dumps(sorted(used_tools)),
@@ -1710,9 +1832,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
     if not missing_mats and not resolver.get("errors"):
 
         mapping = resolver.get("mapping", [])
-        proxy_remapped = plan_proxy
-        result = pp.plan_loadout(proxy_remapped, num_aces=num_aces) or {}
-        del plan_proxy, proxy_remapped
+        del plan_proxy
         out["plans"]["slicer"] = _build_plan(
             pp, "slicer", None, result, mapping,
             slicer_colors=slicer_colors, slicer_types=slicer_types,
@@ -2028,6 +2148,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             tool_targets=manual_targets,
             parsed=parsed,
             used_tools=used_tools,
+            events=_load_preflight_events(req.token),
         )
         _save_preflight_source_map(source_map)
 

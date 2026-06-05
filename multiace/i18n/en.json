@@ -217,7 +217,12 @@
       "match_tier": "Match",
       "command_preview": "Final command preview",
       "target": "Target",
-      "commands": "Commands"
+      "commands": "Commands",
+      "ace_swaps_est": "ACE swaps estimated",
+      "same_source_skips": "same-source skips",
+      "tool_events": "tool events",
+      "swap_time_est": "swap time estimate",
+      "stats_refresh_on_send": "stats refresh after send"
     },
     "queue": {
       "send_all_tooltip": "Send all queued commands to the printer (UI can be closed afterwards)",

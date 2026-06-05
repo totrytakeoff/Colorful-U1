@@ -86,6 +86,17 @@ def main() -> int:
     assert_true(commands[0] == ["T1"], f"T0 command preview mismatch: {commands[0]}")
     assert_true(commands[1] == ["T0", "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1"],
                 f"T1 command preview mismatch: {commands[1]}")
+    stats = source_map.get("swap_stats") or {}
+    assert_true(stats.get("tool_events") == 2,
+                f"expected 2 tool events, got {stats}")
+    assert_true(stats.get("active_ace_swaps") == 1,
+                f"expected 1 active ACE swap, got {stats}")
+    assert_true(stats.get("skipped_same_ace") == 0,
+                f"expected 0 same-source skips, got {stats}")
+    assert_true(stats.get("estimated_swap_seconds_min") == 120,
+                f"unexpected min swap estimate: {stats}")
+    assert_true(stats.get("estimated_swap_seconds_max") == 240,
+                f"unexpected max swap estimate: {stats}")
 
     token = report["token"]
     saved_map = request("GET", f"{WEB}/preflight/source-map?token={token}")
@@ -115,6 +126,9 @@ def main() -> int:
         time.sleep(0.25)
     assert_true(status.get("done"), f"print job did not finish: {status}")
     assert_true(not status.get("error"), f"print job failed: {status.get('error')}")
+    final_stats = ((status.get("source_map") or {}).get("swap_stats") or {})
+    assert_true(final_stats.get("active_ace_swaps") == 1,
+                f"final source map lost swap stats: {final_stats}")
 
     uploaded = request(
         "GET",
