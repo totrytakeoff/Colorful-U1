@@ -21,6 +21,7 @@
       "active": "active",
       "offline": "offline",
       "empty": "empty",
+      "loaded": "loaded",
       "select": "select",
       "apply": "Apply",
       "cancel": "Cancel",

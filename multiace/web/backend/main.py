@@ -599,6 +599,68 @@ OBSOLETE_GCODE_MACROS = {
 def _macro_args_upper(args: dict[str, Any] | None) -> set[str]:
     return {str(k).upper() for k in (args or {}).keys()}
 
+def _validate_feed_auto_args(args: dict[str, Any] | None) -> None:
+    a = {str(k).upper(): v for k, v in (args or {}).items()}
+    allowed = {
+        "MODULE", "CHANNEL", "EXTRUDER", "LOAD", "UNLOAD", "STAGE",
+        "AUTO", "SAVE", "PRINTING",
+    }
+    extra = sorted(set(a.keys()) - allowed)
+    if extra:
+        raise HTTPException(
+            status_code=400,
+            detail=f"FEED_AUTO rejects unsupported argument(s): {', '.join(extra)}")
+
+    for key in ("MODULE", "CHANNEL", "EXTRUDER"):
+        if key not in a:
+            raise HTTPException(
+                status_code=400,
+                detail=f"FEED_AUTO requires {key}")
+    module = str(a.get("MODULE") or "").lower()
+    if module not in ("left", "right"):
+        raise HTTPException(
+            status_code=400,
+            detail="FEED_AUTO MODULE must be left or right")
+    try:
+        channel = int(a.get("CHANNEL"))
+        extruder = int(a.get("EXTRUDER"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="FEED_AUTO CHANNEL and EXTRUDER must be integers")
+    if channel not in (0, 1) or extruder not in (0, 1, 2, 3):
+        raise HTTPException(
+            status_code=400,
+            detail="FEED_AUTO CHANNEL must be 0..1 and EXTRUDER must be 0..3")
+    expected = {
+        0: ("left", 1),
+        1: ("left", 0),
+        2: ("right", 0),
+        3: ("right", 1),
+    }.get(extruder)
+    if expected != (module, channel):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "FEED_AUTO module/channel does not match EXTRUDER; "
+                f"T{extruder} expects MODULE={expected[0]} CHANNEL={expected[1]}"))
+
+    load = int(a.get("LOAD", 0) or 0)
+    unload = int(a.get("UNLOAD", 0) or 0)
+    auto = int(a.get("AUTO", 0) or 0)
+    if sum(1 for v in (load, unload, auto) if v) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="FEED_AUTO requires exactly one of LOAD=1, UNLOAD=1 or AUTO=1")
+    if load not in (0, 1) or unload not in (0, 1) or auto not in (0, 1):
+        raise HTTPException(
+            status_code=400,
+            detail="FEED_AUTO LOAD, UNLOAD and AUTO must be 0 or 1")
+    if "STAGE" in a and str(a.get("STAGE") or "").lower() not in ("prepare", "doing", "cancel"):
+        raise HTTPException(
+            status_code=400,
+            detail="FEED_AUTO STAGE must be prepare, doing or cancel")
+
 def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
     macro = str(name or "").strip().upper()
     if macro in OBSOLETE_MACROS_BLOCKED:
@@ -615,6 +677,8 @@ def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
                     f"missing {', '.join(missing)}"))
     if macro in EXPLICIT_PLAN_MACROS:
         _validate_plan_arg(macro, None if args is None else args.get("PLAN", args.get("plan")))
+    if macro == "FEED_AUTO":
+        _validate_feed_auto_args(args)
 
 def _validate_plan_arg(macro: str, plan: Any) -> None:
     plan_str = str(plan or "").strip()
@@ -763,6 +827,7 @@ async def version() -> dict:
 _PREFLIGHT_DIR = Path("/tmp/multiace-preflight")
 _PREFLIGHT_TTL = 86400.0
 _PREFLIGHT_FUZZY = 30
+_PREFLIGHT_MIXED_FUZZY = int(os.environ.get("MULTIACE_MIXED_FUZZY", "90"))
 
 _PREFLIGHT_MAX_SIZE = int(os.environ.get(
     "MULTIACE_PREFLIGHT_MAX_MB", "200")) * 1024 * 1024
@@ -807,8 +872,11 @@ def _cleanup_preflight_dir() -> None:
 
 async def _live_slots_async() -> list[dict]:
     status = await _query_state()
-    out = []
     parsed = _parse_state(status)
+    return _live_slots_from_parsed(parsed)
+
+def _live_slots_from_parsed(parsed: dict) -> list[dict]:
+    out = []
     failed = _load_failed_toolheads(parsed)
     if failed:
         raise HTTPException(
@@ -828,6 +896,50 @@ async def _live_slots_async() -> list[dict]:
             })
     return out
 
+def _live_loadout_from_parsed(parsed: dict, pp=None) -> list[dict]:
+    out = []
+    for t in parsed.get("toolheads", []) or []:
+        try:
+            head = int(t.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        if t.get("mode") != "native":
+            continue
+        color = (t.get("color") or "").strip().lower()
+        out.append({
+            "kind": "native",
+            "key": "native:%d" % head,
+            "head": head,
+            "material": t.get("material") or "",
+            "color": color,
+            "name": pp.approx_color_name(color) if (pp and color) else "",
+            "ready": bool(t.get("filament_detected")
+                          and t.get("filament_at_extruder")
+                          and t.get("channel_error") in (None, "", "ok")
+                          and str(t.get("channel_state") or "") in (
+                              "load_finish", "preload_finish")),
+            "state": t.get("channel_state") or "",
+        })
+    for s in _live_slots_from_parsed(parsed):
+        color = (s.get("color") or "").strip().lower()
+        head = s.get("target_head")
+        if head is None or head == "":
+            continue
+        out.append({
+            "kind": "ace",
+            "key": "ace:%d:%d:%d" % (
+                int(head), int(s.get("ace")), int(s.get("slot"))),
+            "head": head,
+            "ace": s.get("ace"),
+            "slot": s.get("slot"),
+            "material": s.get("material") or "",
+            "color": color,
+            "name": pp.approx_color_name(color) if (pp and color) else "",
+            "ready": True,
+            "state": "ready",
+        })
+    return out
+
 def _slot_to_dict(s: dict | None) -> dict | None:
     if s is None:
         return None
@@ -837,6 +949,306 @@ def _slot_to_dict(s: dict | None) -> dict | None:
         "target_head": s.get("target_head"),
         "material": s.get("material") or "",
         "color":    s.get("color") or "",
+    }
+
+def _target_to_dict(target: dict | None) -> dict | None:
+    if not target:
+        return None
+    out = {
+        "kind": target.get("kind"),
+        "head": target.get("head"),
+    }
+    if target.get("kind") == "ace":
+        out["ace"] = target.get("ace")
+        out["slot"] = target.get("slot")
+    return out
+
+def _norm_color_hex(value: Any) -> str:
+    return str(value or "").strip().lower().lstrip("#")
+
+def _norm_material(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+def _hex_rgb(value: Any) -> tuple[int, int, int] | None:
+    s = _norm_color_hex(value)
+    if len(s) < 6:
+        return None
+    try:
+        return int(s[:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return None
+
+def _color_distance(a: Any, b: Any) -> float | None:
+    ar = _hex_rgb(a)
+    br = _hex_rgb(b)
+    if ar is None or br is None:
+        return None
+    return (
+        (ar[0] - br[0]) ** 2
+        + (ar[1] - br[1]) ** 2
+        + (ar[2] - br[2]) ** 2
+    ) ** 0.5
+
+def _candidate_score(want_mat: str, want_color: str,
+                     have_mat: str, have_color: str) -> tuple[int, float, str] | None:
+    mat_match = bool(want_mat and have_mat and want_mat == have_mat)
+    dist = _color_distance(want_color, have_color)
+    exact_color = dist == 0
+    fuzzy_color = dist is not None and dist <= _PREFLIGHT_MIXED_FUZZY
+    if want_color and have_color:
+        if mat_match and exact_color:
+            return 0, 0.0, "material_color"
+        if mat_match and fuzzy_color:
+            return 1, float(dist), "material_fuzzy"
+        if exact_color:
+            return 2, 0.0, "color"
+        if fuzzy_color:
+            return 3, float(dist), "fuzzy"
+        return None
+    if mat_match and not want_color:
+        return 4, 999.0, "material"
+    if mat_match and not have_color:
+        return 5, 999.0, "material_no_color"
+    return None
+
+def _candidate_target_key(target: dict) -> str:
+    if target.get("kind") == "native":
+        return "native:%d" % int(target.get("head"))
+    return "ace:%d:%d:%d" % (
+        int(target.get("head")), int(target.get("ace")), int(target.get("slot")))
+
+def _target_from_loadout_item(item: dict) -> dict:
+    if item.get("kind") == "native":
+        return {"kind": "native", "head": int(item.get("head"))}
+    return {
+        "kind": "ace",
+        "head": int(item.get("head")),
+        "ace": int(item.get("ace")),
+        "slot": int(item.get("slot")),
+    }
+
+def _target_key_from_request(target: Any) -> str | None:
+    if not isinstance(target, dict):
+        return None
+    kind = str(target.get("kind") or "").lower()
+    try:
+        if kind == "native":
+            return "native:%d" % int(target.get("head"))
+        if kind == "ace":
+            return "ace:%d:%d:%d" % (
+                int(target.get("head")),
+                int(target.get("ace")),
+                int(target.get("slot")),
+            )
+    except (TypeError, ValueError):
+        return None
+    return None
+
+def _validate_manual_tool_targets(parsed: dict, requested: Any,
+                                  used_tools: set[int]) -> dict:
+    if not isinstance(requested, dict):
+        raise HTTPException(status_code=400, detail="tool_targets must be an object")
+    available = {
+        item.get("key"): item
+        for item in _live_loadout_from_parsed(parsed)
+        if item.get("ready")
+    }
+    out: dict[str, dict] = {}
+    used_keys: set[str] = set()
+    missing = []
+    invalid = []
+    duplicate = []
+    for t in sorted(used_tools):
+        raw = requested.get(str(t), requested.get(t))
+        if raw is None:
+            missing.append("T%d" % t)
+            continue
+        key = _target_key_from_request(raw)
+        item = available.get(key or "")
+        if item is None:
+            invalid.append("T%d" % t)
+            continue
+        if key in used_keys:
+            duplicate.append("T%d" % t)
+            continue
+        used_keys.add(key)
+        out[str(t)] = _target_from_loadout_item(item)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail="manual mapping missing " + ", ".join(missing))
+    if invalid:
+        raise HTTPException(
+            status_code=409,
+            detail="manual mapping target unavailable for " + ", ".join(invalid))
+    if duplicate:
+        raise HTTPException(
+            status_code=409,
+            detail="manual mapping reuses the same target for "
+            + ", ".join(duplicate))
+    return out
+
+def _build_mixed_resolver(parsed: dict, slicer_colors: dict,
+                          slicer_types: dict, used_tools: set[int]) -> dict:
+    """Resolve slicer tools to either native heads or ACE slots.
+
+    MVP policy is deliberately conservative: only exact material/color,
+    exact color, or exact material matches are accepted. Native heads are
+    candidates only when configured as native and filament is detected.
+    ACE slots are candidates only when their target head is configured
+    as ACE.
+    """
+    aces = parsed.get("aces", []) or []
+    toolheads = parsed.get("toolheads", []) or []
+    th_by_idx = {int(t.get("idx")): t for t in toolheads
+                 if t.get("idx") is not None}
+    route = parsed.get("route", {}) or {}
+    head_modes = route.get("head_modes", {}) or {}
+    ace_targets = route.get("ace_targets", {}) or {}
+
+    def _head_mode(head: int) -> str:
+        th = th_by_idx.get(head) or {}
+        mode = th.get("mode")
+        if mode in ("native", "ace"):
+            return mode
+        raw = head_modes.get(str(head), head_modes.get(head))
+        return raw if raw in ("native", "ace") else "native"
+
+    ace_head_for_ace: dict[int, int] = {}
+    for k, v in (ace_targets or {}).items():
+        if v is None or v == "":
+            continue
+        try:
+            ace_head_for_ace[int(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+
+    candidates: list[dict] = []
+    for th in toolheads:
+        try:
+            head = int(th.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        if _head_mode(head) != "native":
+            continue
+        if (not th.get("filament_detected")
+                or not th.get("filament_at_extruder")
+                or th.get("channel_error") not in (None, "", "ok")
+                or str(th.get("channel_state") or "") not in (
+                    "load_finish", "preload_finish")):
+            continue
+        candidates.append({
+            "kind": "native",
+            "head": head,
+            "material": th.get("material") or "",
+            "color": th.get("color") or "",
+        })
+
+    for ace in aces:
+        try:
+            ace_idx = int(ace.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        for slot in ace.get("slots", []) or []:
+            if slot.get("state") == "empty":
+                continue
+            try:
+                slot_idx = int(slot.get("idx"))
+            except (TypeError, ValueError):
+                continue
+            head = slot.get("target_head")
+            if head is None or head == "":
+                head = ace_head_for_ace.get(ace_idx)
+            try:
+                head = int(head)
+            except (TypeError, ValueError):
+                continue
+            if _head_mode(head) != "ace":
+                continue
+            candidates.append({
+                "kind": "ace",
+                "head": head,
+                "ace": ace_idx,
+                "slot": slot_idx,
+                "material": slot.get("material") or "",
+                "color": slot.get("color") or "",
+            })
+
+    resolver_candidates = []
+    for c in candidates:
+        target = _target_to_dict(c) or {}
+        target.update({
+            "material": c.get("material") or "",
+            "color": c.get("color") or "",
+            "key": _candidate_target_key(c),
+        })
+        resolver_candidates.append(target)
+
+    scored: list[tuple[tuple, int, dict, str, float]] = []
+    for t in sorted(used_tools):
+        want_mat = _norm_material(slicer_types.get(t))
+        want_color = _norm_color_hex(slicer_colors.get(t))
+        for order, c in enumerate(candidates):
+            score = _candidate_score(
+                want_mat, want_color,
+                _norm_material(c.get("material")),
+                _norm_color_hex(c.get("color")))
+            if score is None:
+                continue
+            rank, dist, tier = score
+            key = (rank, dist, 0 if c.get("kind") == "native" else 1,
+                   c.get("head", 99), c.get("ace", 99),
+                   c.get("slot", 99), order, t)
+            scored.append((key, t, dict(c), tier, float(dist)))
+
+    assigned: dict[int, dict] = {}
+    used_candidate_keys: set[str] = set()
+    for _key, t, c, tier, dist in sorted(scored, key=lambda row: row[0]):
+        ckey = _candidate_target_key(c)
+        if t in assigned or ckey in used_candidate_keys:
+            continue
+        c["tier"] = tier
+        c["distance"] = dist
+        assigned[t] = c
+        used_candidate_keys.add(ckey)
+
+    mapping: list[dict] = []
+    tool_targets: dict[str, dict] = {}
+    errors: list[dict] = []
+    for t in sorted(used_tools):
+        best = assigned.get(t)
+        row = {
+            "t": t,
+            "target": _target_to_dict(best),
+            "tier": best.get("tier") if best else "no_target",
+            "distance": best.get("distance") if best else None,
+            "loose_mat": False,
+            "slot": None,
+        }
+        if best and best.get("kind") == "ace":
+            row["slot"] = {
+                "ace": best.get("ace"),
+                "slot": best.get("slot"),
+                "target_head": best.get("head"),
+                "material": best.get("material") or "",
+                "color": best.get("color") or "",
+            }
+        if best:
+            target = _target_to_dict(best)
+            tool_targets[str(t)] = target
+        else:
+            errors.append({
+                "t": t,
+                "kind": "unmapped_tool",
+                "message": f"T{t}: no native head or ACE slot matches",
+            })
+        mapping.append(row)
+
+    return {
+        "mapping": mapping,
+        "tool_targets": tool_targets,
+        "errors": errors,
+        "candidates": resolver_candidates,
     }
 
 def _mapping_from_info(info: dict) -> list[dict]:
@@ -874,17 +1286,22 @@ def _remap_mapping(base_mapping: list[dict], remap_t_to_t: dict[int, int]) -> li
     return out
 
 def _real_swap_count(events, mapping):
-    by_t = {m["t"]: m["slot"] for m in mapping if m.get("slot")}
+    by_t = {m["t"]: (m.get("target") or m.get("slot"))
+            for m in mapping if (m.get("target") or m.get("slot"))}
     head_current = {}
     swaps = 0
     for t in events:
-        slot = by_t.get(t)
-        if slot is None:
+        target = by_t.get(t)
+        if target is None:
             continue
-        h = slot.get("target_head")
-        if h is None:
-            h = slot["slot"]
-        key = (slot["ace"], slot["slot"])
+        if target.get("kind") == "native":
+            h = target.get("head")
+            key = ("native", h)
+        else:
+            h = target.get("head", target.get("target_head"))
+            if h is None:
+                h = target.get("slot")
+            key = ("ace", target.get("ace"), target.get("slot"))
         if head_current.get(h) != key:
             swaps += 1
             head_current[h] = key
@@ -1072,6 +1489,8 @@ async def preflight(file: UploadFile = File(...)) -> dict:
     meta_buf = "".join(head_lines) + "".join(tail_lines)
     plan_proxy = "\n".join(plan_lines)
     del head_lines, tail_lines, plan_lines
+    if not used:
+        used = _used_tool_indices(pp, plan_proxy)
 
     slicer_colors = pp.parse_color_names(meta_buf)
     slicer_types  = pp.parse_filament_types(meta_buf)
@@ -1082,12 +1501,29 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         slicer_colors = {t: c for t, c in slicer_colors.items() if t in used}
         slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
 
-    live_slots = await _live_slots_async()
-    if not live_slots:
+    parsed = _parse_state(await _query_state())
+    failed = _load_failed_toolheads(parsed)
+    if failed:
+        raise HTTPException(
+            status_code=409,
+            detail="; ".join(_load_failed_message(t) for t in failed),
+        )
+    live_slots = _live_slots_from_parsed(parsed)
+    resolver = _build_mixed_resolver(
+        parsed, slicer_colors, slicer_types, used or set(slicer_colors.keys()))
+    if not resolver.get("candidates"):
         raise HTTPException(status_code=409,
-                            detail="no slots are loaded on the printer")
+                            detail="no native head or ACE slot is available")
+    (_PREFLIGHT_DIR / (token + ".targets")).write_text(
+        json.dumps(resolver.get("tool_targets", {}), indent=2),
+        encoding="utf-8")
+    (_PREFLIGHT_DIR / (token + ".used")).write_text(
+        json.dumps(sorted(used or set(slicer_colors.keys()))),
+        encoding="utf-8")
     num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
-    missing_mats = pp.check_material_availability(slicer_types, live_slots)
+    missing_mats = []
+    if resolver.get("errors"):
+        missing_mats = []
 
     out = {
         "token":         token,
@@ -1107,19 +1543,24 @@ async def preflight(file: UploadFile = File(...)) -> dict:
              "name": pp.approx_color_name(s["color"]) or ""}
             for s in sorted(live_slots, key=lambda x: (x["ace"], x["slot"]))
         ],
+        "live_loadout": sorted(
+            _live_loadout_from_parsed(parsed, pp),
+            key=lambda x: (
+                0 if x.get("kind") == "native" else 1,
+                x.get("head", 99),
+                x.get("ace", 99),
+                x.get("slot", 99),
+            )),
         "missing_materials": missing_mats,
+        "resolve_errors": resolver.get("errors", []),
+        "resolve_candidates": resolver.get("candidates", []),
+        "tool_targets": resolver.get("tool_targets", {}),
         "plans": {},
     }
-    if not missing_mats:
+    if not missing_mats and not resolver.get("errors"):
 
-        remap, info, _ = pp.match_colors_to_slots(
-            slicer_colors, live_slots, num_heads=4,
-            filament_types=slicer_types,
-            strict_color=False,
-            fuzzy_max_distance=_PREFLIGHT_FUZZY,
-        )
-        mapping = _mapping_from_info(info)
-        proxy_remapped = pp.apply_remap(plan_proxy, remap) if remap else plan_proxy
+        mapping = resolver.get("mapping", [])
+        proxy_remapped = plan_proxy
         result = pp.plan_loadout(proxy_remapped, num_aces=num_aces) or {}
         del plan_proxy, proxy_remapped
         out["plans"]["slicer"] = _build_plan(
@@ -1129,6 +1570,16 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         out["plans"]["optimize"] = _disabled_plan()
         out["plans"]["layer"] = _disabled_plan()
         del result
+    else:
+        out["plans"]["slicer"] = {
+            "feasible": False,
+            "swaps": 0,
+            "tool_changes": 0,
+            "mapping": resolver.get("mapping", []),
+            "reason": "; ".join(e.get("message", "") for e in resolver.get("errors", [])),
+        }
+        out["plans"]["optimize"] = _disabled_plan()
+        out["plans"]["layer"] = _disabled_plan()
     return out
 
 _PREFLIGHT_JOBS: dict[str, dict] = {}
@@ -1182,12 +1633,26 @@ def _prune_old_jobs() -> None:
                 except Exception: pass
         del _PREFLIGHT_JOBS[j]
 
+def _preflight_targets_path(token: str) -> Path:
+    return _PREFLIGHT_DIR / (token + ".targets")
+
+def _load_preflight_targets(token: str) -> dict:
+    p = _preflight_targets_path(token)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
 async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                                   safe_name: str,
                                   set_prefs: bool = False) -> None:
     state = _PREFLIGHT_JOBS[job_id]
     pp = _load_post_processor()
     src = _PREFLIGHT_DIR / (token + ".gcode")
+    tool_targets = _load_preflight_targets(token)
 
     tmp_a = _PREFLIGHT_DIR / (job_id + ".a.gcode")
     tmp_b = _PREFLIGHT_DIR / (job_id + ".b.gcode")
@@ -1220,24 +1685,48 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                 if m:
                     used.add(int(m.group(1)))
                     used.add(int(m.group(2)))
+        if not used:
+            try:
+                used = set(pp.parse_toolchanges(src.read_text(
+                    encoding="utf-8", errors="replace")))
+            except Exception:
+                used = set()
         if used:
             slicer_colors = {t: c for t, c in slicer_colors.items() if t in used}
             slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
+        elif tool_targets:
+            used = {int(t) for t in tool_targets.keys()}
 
-        live_slots = await _live_slots_async()
+        parsed = _parse_state(await _query_state())
+        failed = _load_failed_toolheads(parsed)
+        if failed:
+            raise RuntimeError(
+                "; ".join(_load_failed_message(t) for t in failed))
+        live_slots = _live_slots_from_parsed(parsed)
         ace_targets = pp._route_ace_targets_from_slots(live_slots)
         num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
-        missing_mats = pp.check_material_availability(slicer_types, live_slots)
-        if missing_mats:
-            raise RuntimeError(
-                "required material(s) not loaded: " + ", ".join(missing_mats))
         if mode == "slicer":
-            remap, _info, _ = pp.match_colors_to_slots(
-                slicer_colors, live_slots, num_heads=4,
-                filament_types=slicer_types,
-                strict_color=False,
-                fuzzy_max_distance=_PREFLIGHT_FUZZY,
-            )
+            if tool_targets:
+                missing_targets = sorted(
+                    t for t in used if str(t) not in tool_targets)
+                if missing_targets:
+                    raise RuntimeError(
+                        "preflight target mapping is incomplete for "
+                        + ", ".join("T%d" % t for t in missing_targets))
+                remap = {}
+            else:
+                missing_mats = pp.check_material_availability(
+                    slicer_types, live_slots)
+                if missing_mats:
+                    raise RuntimeError(
+                        "required material(s) not loaded: "
+                        + ", ".join(missing_mats))
+                remap, _info, _ = pp.match_colors_to_slots(
+                    slicer_colors, live_slots, num_heads=4,
+                    filament_types=slicer_types,
+                    strict_color=False,
+                    fuzzy_max_distance=_PREFLIGHT_FUZZY,
+                )
         else:
             raise RuntimeError(
                 "optimize/layer print modes are disabled for the "
@@ -1278,6 +1767,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             str(cur), str(nxt),
             _stage_progress(state, 45.0, 30.0),
             ace_targets,
+            tool_targets,
         )
         cur, nxt = nxt, cur
 
@@ -1330,6 +1820,7 @@ class _PreflightPrint(BaseModel):
     token: str
     mode:  str
     set_prefs: bool = False
+    tool_targets: dict[str, Any] | None = None
 
 @app.post("/api/preflight/print")
 async def preflight_print(req: _PreflightPrint) -> dict:
@@ -1344,6 +1835,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
         raise HTTPException(status_code=400, detail="invalid token")
     gpath = _PREFLIGHT_DIR / (req.token + ".gcode")
     npath = _PREFLIGHT_DIR / (req.token + ".name")
+    upath = _PREFLIGHT_DIR / (req.token + ".used")
     if not gpath.is_file():
         raise HTTPException(status_code=404,
                             detail="preflight token expired or unknown")
@@ -1357,6 +1849,19 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             status_code=409,
             detail="; ".join(_load_failed_message(t) for t in failed),
         )
+    if req.tool_targets is not None:
+        try:
+            used_raw = json.loads(upath.read_text(encoding="utf-8"))
+            used_tools = {int(t) for t in used_raw}
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="preflight used-tool metadata missing; run preflight again")
+        manual_targets = _validate_manual_tool_targets(
+            parsed, req.tool_targets, used_tools)
+        _preflight_targets_path(req.token).write_text(
+            json.dumps(manual_targets, indent=2),
+            encoding="utf-8")
     safe_name = (npath.read_text(encoding="utf-8").strip()
                  if npath.is_file() else (req.token + ".gcode"))
 

@@ -7,7 +7,7 @@
   <title>mUlt1ACE</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" type="image/svg+xml" href="icon.svg">
-  <link rel="stylesheet" href="style.css?v=preflight-head-map-1">
+  <link rel="stylesheet" href="style.css?v=preflight-manual-map-1">
 </head>
 <body>
 <div id="app">
@@ -215,13 +215,23 @@
               </span>
             </p>
             <div class="toolhead-native-panel" v-if="toolheadMode(t_.idx) === 'native'">
-              <p class="meta">
-                <span v-if="t_.material">{{ t_.material }}</span>
-                <span v-if="t_.brand"> · {{ t_.brand }}</span>
-                <span v-if="t_.sku"> · {{ t_.sku }}</span>
-                <span v-if="!t_.material" class="muted">Native material not set</span>
-              </p>
-              <button class="mini-btn" @click="openNativePicker(t_)">Material</button>
+              <button class="native-material-card"
+                      :style="t_.color ? {background: t_.color} : {}"
+                      @click="openNativePicker(t_)"
+                      :title="'Native T' + dispIdx(t_.idx) + ' material'">
+                <span class="native-card-head">
+                  <strong>Native</strong>
+                  <em>{{ t_.filament_at_extruder ? t('ui.common.loaded') : t('ui.common.empty') }}</em>
+                </span>
+                <span class="native-card-material">
+                  {{ t_.material || 'Material not set' }}
+                </span>
+                <span class="native-card-meta">
+                  <template v-if="t_.brand">{{ t_.brand }}</template>
+                  <template v-if="t_.sku"> · {{ t_.sku }}</template>
+                  <template v-if="!t_.brand && !t_.sku">Generic</template>
+                </span>
+              </button>
             </div>
             <div class="toolhead-ace-panel" v-if="toolheadMode(t_.idx) === 'ace'">
               <div v-if="toolheadAceSlots(t_.idx).length" class="toolhead-slot-strip">
@@ -241,6 +251,17 @@
               <button v-if="t_.load_failed" class="warn" @click="recoverLoadFailed(t_.idx)">
                 {{ t('ui.dashboard.recover') }}
               </button>
+              <template v-else-if="toolheadMode(t_.idx) === 'native'">
+                <button @click="loadNativeHead(t_.idx)"
+                        :disabled="!canLoadNativeHead(t_)">
+                  {{ t('ui.dashboard.load') }}
+                </button>
+                <button class="warn"
+                        @click="unloadNativeHead(t_.idx)"
+                        :disabled="!canUnloadNativeHead(t_)">
+                  {{ t('ui.dashboard.unload') }}
+                </button>
+              </template>
               <button v-else class="warn" @click="unloadHead(t_.idx)" :disabled="!t_.head_source_known && !t_.filament_at_extruder">{{ t('ui.dashboard.unload') }}</button>
             </div>
           </article>
@@ -674,18 +695,26 @@ reboot</pre>
       <template v-if="preflight.report">
         <h4>{{ t('ui.preflight.printer_loadout') }}</h4>
         <div class="preflight-grid">
-          <div v-for="s in preflight.report.live_slots"
-               :key="'ls-' + s.ace + '-' + s.slot"
+          <div v-for="s in (preflight.report.live_loadout || [])"
+               :key="'loadout-' + s.key"
                class="preflight-card">
             <div class="preflight-swatch"
                  :style="{background: s.color || '#444'}"></div>
             <div class="preflight-meta">
-              <div><strong>ACE {{ dispIdx(s.ace) }} · Slot {{ dispIdx(s.slot) }}</strong></div>
+              <div v-if="s.kind === 'native'">
+                <strong>Native T{{ dispIdx(s.head) }}</strong>
+              </div>
+              <div v-else>
+                <strong>ACE {{ dispIdx(s.ace) }} · Slot {{ dispIdx(s.slot) }}</strong>
+              </div>
               <div class="muted small">{{ s.material || '?' }}</div>
-              <div v-if="s.target_head != null" class="muted small">
-                → T{{ dispIdx(s.target_head) }}
+              <div v-if="s.head != null" class="muted small">
+                → T{{ dispIdx(s.head) }}
               </div>
               <div class="small">{{ s.name }}</div>
+              <div v-if="s.ready === false" class="preflight-infeasible small">
+                not ready · {{ s.state || '?' }}
+              </div>
               <div class="muted small">{{ s.color || '?' }}<br>RGB({{ rgbDec(s.color) }})</div>
             </div>
           </div>
@@ -739,12 +768,19 @@ reboot</pre>
                   <th>←</th>
                   <th>{{ t('ui.preflight.slicer') }}</th>
                   <th>{{ t('ui.preflight.match_tier') }}</th>
+                  <th v-if="mode === 'slicer'">Override</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="m in sortedMapping(preflight.report.plans[mode])" :key="'r-'+mode+'-'+m.t"
                     :class="{warn: tierWarn(m.tier)}">
-                  <td v-if="m.slot">
+                  <td v-if="mappingTargetKind(m) === 'native'">
+                    <span class="preflight-dot"
+                          :style="{background: mappingTargetColor(m)}"></span>
+                    Native T{{ dispIdx(physicalHeadForMapping(m)) }}
+                    <span class="muted small">· {{ mappingTargetMaterial(m) }}</span>
+                  </td>
+                  <td v-else-if="m.slot">
                     <span class="preflight-dot"
                           :style="{background: m.slot.color || '#444'}"></span>
                     ACE {{ dispIdx(m.slot.ace) }} Slot {{ dispIdx(m.slot.slot) }}
@@ -766,14 +802,31 @@ reboot</pre>
                     T{{ dispIdx(m.t) }}
                     <span class="muted small">· {{ slicerColorFor(m.t).material || '?' }}</span>
                   </td>
-                  <td class="small">{{ tierLabel(m.tier) }}</td>
+                  <td class="small">
+                    {{ tierLabel(m.tier) }}
+                    <span v-if="m.distance != null" class="muted small">
+                      · Δ{{ Math.round(m.distance) }}
+                    </span>
+                  </td>
+                  <td v-if="mode === 'slicer'">
+                    <select class="preflight-target-select"
+                            :value="mappingTargetValue(m)"
+                            @change="setManualMapping(m, $event.target.value)">
+                      <option value="">Select target</option>
+                      <option v-for="opt in preflightTargetOptions()"
+                              :key="'target-' + m.t + '-' + opt.key"
+                              :value="opt.key"
+                              :disabled="preflightTargetDisabled(opt, m)">
+                        {{ formatPreflightTarget(opt) }}
+                      </option>
+                    </select>
+                  </td>
                 </tr>
               </tbody>
             </table>
-            <div class="row" v-if="!preflight.report.missing_materials.length
-                                   && preflight.report.plans[mode].feasible">
+            <div class="row" v-if="preflightCanPrint(mode)">
               <button class="primary"
-                      :disabled="preflight.sending !== '' || mode !== 'slicer'"
+                      :disabled="preflight.sending !== ''"
                       @click="startPreflightPrint(mode)">
                 {{ preflight.sending === mode
                      ? t('ui.preflight.sending')
@@ -794,6 +847,6 @@ reboot</pre>
   </div>
 </div>
 <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
-<script src="app.js?v=preflight-head-map-1"></script>
+<script src="app.js?v=preflight-manual-map-1"></script>
 </body>
 </html>

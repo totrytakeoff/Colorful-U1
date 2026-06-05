@@ -36,6 +36,60 @@ def _route_virtual_tool(t_index, ace_targets=None, slots_per_ace=4):
     head = ace_targets.get(ace, slot)
     return head, ace, slot
 
+def _normalize_tool_targets(tool_targets=None):
+    """Return {slicer_t: normalized_target}.
+
+    A target is either:
+      {'kind': 'native', 'head': H}
+      {'kind': 'ace', 'head': H, 'ace': A, 'slot': S}
+
+    Missing/invalid entries are ignored so legacy callers can keep using
+    ace_targets and the old T -> ACE/slot formula.
+    """
+    out = {}
+    if not tool_targets:
+        return out
+    if isinstance(tool_targets, str):
+        try:
+            tool_targets = json.loads(tool_targets)
+        except ValueError:
+            return out
+    if not isinstance(tool_targets, dict):
+        return out
+    for k, v in tool_targets.items():
+        if not isinstance(v, dict):
+            continue
+        try:
+            t = int(k)
+            head = int(v.get('head'))
+        except (TypeError, ValueError):
+            continue
+        if t < 0 or t > 63 or head < 0 or head > 3:
+            continue
+        kind = str(v.get('kind') or '').lower()
+        if kind == 'native':
+            out[t] = {'kind': 'native', 'head': head}
+            continue
+        if kind != 'ace':
+            continue
+        try:
+            ace = int(v.get('ace'))
+            slot = int(v.get('slot'))
+        except (TypeError, ValueError):
+            continue
+        if ace < 0 or ace > 15 or slot < 0 or slot > 3:
+            continue
+        out[t] = {'kind': 'ace', 'head': head, 'ace': ace, 'slot': slot}
+    return out
+
+def _target_for_tool(t_index, ace_targets=None, tool_targets=None):
+    tool_targets = _normalize_tool_targets(tool_targets)
+    t = int(t_index)
+    if t in tool_targets:
+        return tool_targets[t]
+    head, ace, slot = _route_virtual_tool(t, ace_targets)
+    return {'kind': 'ace', 'head': head, 'ace': ace, 'slot': slot}
+
 def _route_ace_targets_from_slots(live_slots):
     targets = {}
     for s in live_slots or []:
@@ -53,13 +107,14 @@ def _initial_marker(head, ace, slot):
     return '; multiACE initial-load HEAD=%d ACE=%d SLOT=%d' % (
         head, ace, slot)
 
-def rewrite(gcode, ace_targets=None):
+def rewrite(gcode, ace_targets=None, tool_targets=None):
     ace_targets = _normalize_ace_targets(ace_targets)
+    tool_targets = _normalize_tool_targets(tool_targets)
 
     def _fix_m104(m):
         return re.sub(r'T(1[0-5]|[0-9])',
-                      lambda t: 'T%d' % _route_virtual_tool(
-                          int(t.group(1)), ace_targets)[0],
+                      lambda t: 'T%d' % _target_for_tool(
+                          int(t.group(1)), ace_targets, tool_targets)['head'],
                       m.group(0))
     gcode = re.sub(r'^M10[49][^\n]*',
                    _fix_m104, gcode, flags=re.MULTILINE)
@@ -67,7 +122,7 @@ def rewrite(gcode, ace_targets=None):
     gcode = re.sub(
         r'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=(1[0-5]|[0-9])',
         lambda m: 'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=%d'
-        % _route_virtual_tool(int(m.group(1)), ace_targets)[0],
+        % _target_for_tool(int(m.group(1)), ace_targets, tool_targets)['head'],
         gcode)
 
     split_re = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+',
@@ -79,15 +134,23 @@ def rewrite(gcode, ace_targets=None):
         pre, body = gcode[:m.start()], gcode[m.start():]
 
     def _expand_initial(m):
-        head, ace, slot = _route_virtual_tool(int(m.group(1)), ace_targets)
-        return 'T%d\n%s' % (head, _initial_marker(head, ace, slot))
+        target = _target_for_tool(int(m.group(1)), ace_targets, tool_targets)
+        head = target['head']
+        if target['kind'] != 'ace':
+            return 'T%d' % head
+        return 'T%d\n%s' % (
+            head, _initial_marker(head, target['ace'], target['slot']))
 
     pre = re.sub(r'^T(1[0-5]|[0-9])\s*$',
                  _expand_initial, pre, flags=re.MULTILINE)
 
     def _expand_swap(m):
-        n = int(m.group(1))
-        head, ace, slot = _route_virtual_tool(n, ace_targets)
+        target = _target_for_tool(int(m.group(1)), ace_targets, tool_targets)
+        head = target['head']
+        if target['kind'] != 'ace':
+            return 'T%d' % head
+        ace = target['ace']
+        slot = target['slot']
         return 'T%d\nACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d' % (
             head, head, ace, slot)
 
@@ -123,6 +186,8 @@ def rewrite(gcode, ace_targets=None):
         filtered_lines.append(line)
         i += 1
     body = '\n'.join(filtered_lines)
+    if pre and body and not pre.endswith(('\n', '\r')):
+        pre += '\n'
 
     total_active = len([l for l in filtered_lines if l.startswith('ACE_SWAP_HEAD')])
     return pre + body, total_active, skipped, swapbacks
@@ -1713,7 +1778,8 @@ def apply_remap_to_file(in_path, out_path, remap, progress=None):
         except Exception:
             pass
 
-def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None):
+def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
+                    tool_targets=None):
     """Streaming equivalent of rewrite(gcode). Same M104/M109 +
     SM_PRINT_PREEXTRUDE_FILAMENT handling, same body T4-T15 expansion
     + ACE_SWAP_HEAD dedupe + swap-back insertion. Returns
@@ -1723,14 +1789,15 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None):
     preextr_re = re.compile(r'^(SM_PRINT_PREEXTRUDE_FILAMENT INDEX=)(1[0-5]|[0-9])(\b.*)$')
     change_t  = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+')
     ace_targets = _normalize_ace_targets(ace_targets)
+    tool_targets = _normalize_tool_targets(tool_targets)
     bare_hi   = re.compile(r'^T(1[0-5]|[0-9])\s*$')
     bare_lo   = re.compile(r'^T([0-3])\s*$')
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
 
     def fix_m104(line):
         return re.sub(r'T(1[0-5]|[0-9])',
-                      lambda t: 'T%d' % _route_virtual_tool(
-                          int(t.group(1)), ace_targets)[0],
+                      lambda t: 'T%d' % _target_for_tool(
+                          int(t.group(1)), ace_targets, tool_targets)['head'],
                       line)
 
     in_body = False
@@ -1792,8 +1859,9 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None):
             if m_pre:
                 if pending_head is not None:
                     flush_pending_unmatched(fout)
-                head, _ace, _slot = _route_virtual_tool(
-                    int(m_pre.group(2)), ace_targets)
+                target = _target_for_tool(
+                    int(m_pre.group(2)), ace_targets, tool_targets)
+                head = target['head']
                 fout.write('%s%d%s\n' % (m_pre.group(1), head, m_pre.group(3)))
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
@@ -1806,10 +1874,13 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None):
                     flush_pending_unmatched(fout)
                 m = bare_hi.match(stripped)
                 if m:
-                    head, ace, slot = _route_virtual_tool(
-                        int(m.group(1)), ace_targets)
+                    target = _target_for_tool(
+                        int(m.group(1)), ace_targets, tool_targets)
+                    head = target['head']
                     fout.write('T%d\n' % head)
-                    fout.write(_initial_marker(head, ace, slot) + '\n')
+                    if target['kind'] == 'ace':
+                        fout.write(_initial_marker(
+                            head, target['ace'], target['slot']) + '\n')
                 else:
                     fout.write(line)
                 last_pr = _emit_progress(progress, seen, total, last_pr)
@@ -1843,9 +1914,15 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None):
 
             m = bare_hi.match(stripped)
             if m:
-                n = int(m.group(1))
-                head, ace, slot = _route_virtual_tool(n, ace_targets)
+                target = _target_for_tool(
+                    int(m.group(1)), ace_targets, tool_targets)
+                head = target['head']
                 fout.write('T%d\n' % head)
+                if target['kind'] != 'ace':
+                    last_pr = _emit_progress(progress, seen, total, last_pr)
+                    continue
+                ace = target['ace']
+                slot = target['slot']
                 key = (ace, slot)
                 if head_loaded.get(head) == key:
                     fout.write('; ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d  ; skipped (already loaded)\n' % (

@@ -1352,6 +1352,9 @@ class MultiAce:
             stale_heads = []
             ghost_heads = []
             for head in range(4):
+                if (head >= len(self._head_modes)
+                        or self._head_modes[head] != 'ace'):
+                    continue
                 sensor = self.printer.lookup_object(
                     'filament_motion_sensor e%d_filament' % head, None)
                 if sensor is None:
@@ -4113,6 +4116,13 @@ class MultiAce:
         if self._in_internal_load_head:
             return
         if head is None or head < 0 or head >= 4:
+            return
+        if (head >= len(self._head_modes)
+                or self._head_modes[head] != 'ace'):
+            self._fa_log.info(
+                '[load-hook] external native load on head=%d; leaving '
+                'ACE head_source empty (module=%s channel=%s)'
+                % (head, module, channel))
             return
         ace_index = self._active_device_index
         src = self._head_source.get(head)

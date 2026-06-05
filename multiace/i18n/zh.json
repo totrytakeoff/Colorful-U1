@@ -21,6 +21,7 @@
       "active": "当前",
       "offline": "离线",
       "empty": "空",
+      "loaded": "已进料",
       "select": "选择",
       "apply": "应用",
       "cancel": "取消",

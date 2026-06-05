@@ -59,7 +59,7 @@ def _make_ace(ace_idx: int) -> dict[str, Any]:
 
 def _default_state() -> dict[str, Any]:
     aces = [_make_ace(0)]
-    return {
+    state = {
         "ace": {
             "status": "ready",
             "temp": 32,
@@ -111,6 +111,17 @@ def _default_state() -> dict[str, Any]:
         },
         "idle_timeout": {"state": "Idle", "printing_time": 0.0},
     }
+    # Seed one native head with a known filament so mixed native/ACE
+    # preflight can be tested without touching hardware.
+    native_feed = state["filament_feed left"]["extruder1"]
+    native_feed["filament_detected"] = True
+    native_feed["filament_in_toolhead"] = True
+    native_feed["filament_at_extruder"] = True
+    state["print_task_config"]["filament_vendor"][1] = "DryRunNative"
+    state["print_task_config"]["filament_type"][1] = "PLA"
+    state["print_task_config"]["filament_sub_type"][1] = "Basic"
+    state["print_task_config"]["filament_color_rgba"][1] = "DC2828FF"
+    return state
 
 
 def _feed_empty() -> dict[str, Any]:
@@ -259,6 +270,18 @@ def _set_head_loaded(state: dict[str, Any], head: int, ace: int, slot: int) -> N
     feed["filament_at_extruder"] = True
 
 
+def _set_native_head_loaded(state: dict[str, Any], head: int) -> None:
+    state["ace"]["head_source"][str(head)] = None
+    module, key = _head_key(head)
+    feed = state[module][key]
+    feed["filament_detected"] = True
+    feed["filament_in_ace"] = False
+    feed["filament_in_toolhead"] = True
+    feed["filament_at_extruder"] = True
+    feed["channel_state"] = "load_finish"
+    feed["channel_error"] = "ok"
+
+
 def _set_head_empty(state: dict[str, Any], head: int) -> None:
     state["ace"]["head_source"][str(head)] = None
     module, key = _head_key(head)
@@ -267,6 +290,8 @@ def _set_head_empty(state: dict[str, Any], head: int) -> None:
     feed["filament_in_ace"] = False
     feed["filament_in_toolhead"] = False
     feed["filament_at_extruder"] = False
+    feed["channel_state"] = "unload_finish"
+    feed["channel_error"] = "ok"
 
 
 def _check_load_route(state: dict[str, Any], head: int, ace: int, slot: int) -> None:
@@ -347,6 +372,30 @@ def _apply_script(script: str) -> None:
         elif cmd == "ACE_UNLOAD_ALL_HEADS":
             for h in range(4):
                 _set_head_empty(state, h)
+        elif cmd == "FEED_AUTO":
+            head = int(args.get("EXTRUDER", "0"))
+            module = args.get("MODULE", "")
+            channel = int(args.get("CHANNEL", "0"))
+            expected_module, expected_key = _head_key(head)
+            expected_channel = {
+                0: 1,
+                1: 0,
+                2: 0,
+                3: 1,
+            }.get(head)
+            if f"filament_feed {module}" != expected_module or channel != expected_channel:
+                raise ValueError(
+                    f"FEED_AUTO route mismatch for T{head}: "
+                    f"MODULE={module} CHANNEL={channel}")
+            head_modes = (state["ace"].get("route", {}) or {}).get("head_modes", {}) or {}
+            if head_modes.get(str(head)) != "native":
+                raise ValueError(f"FEED_AUTO dry-run direct path is only for native T{head}")
+            if int(args.get("LOAD", "0") or 0) == 1:
+                _set_native_head_loaded(state, head)
+            elif int(args.get("UNLOAD", "0") or 0) == 1:
+                _set_head_empty(state, head)
+            else:
+                raise ValueError("FEED_AUTO dry-run supports LOAD=1 or UNLOAD=1")
         elif cmd == "SAVE_VARIABLE":
             var = args.get("VARIABLE")
             val = args.get("VALUE", "")

@@ -219,6 +219,7 @@ createApp({
       'ACE_SWAP_HEAD',
       'ACE_UNLOAD_HEAD',
       'ACE_UNLOAD_ALL_HEADS',
+      'FEED_AUTO',
     ]);
     const ASYNC_QUEUE_MIN_SETTLE_MS = 3000;
     const ASYNC_QUEUE_TIMEOUT_MS = 20 * 60 * 1000;
@@ -235,6 +236,16 @@ createApp({
         const missing = ['HEAD', 'ACE', 'SLOT'].filter(k => !(k in a));
         if (missing.length) {
           throw new Error(`${name} requires HEAD, ACE and SLOT; missing ${missing.join(', ')}`);
+        }
+      }
+      if (name === 'FEED_AUTO') {
+        const missing = ['MODULE', 'CHANNEL', 'EXTRUDER'].filter(k => !(k in a));
+        if (missing.length) {
+          throw new Error(`${name} requires MODULE, CHANNEL and EXTRUDER; missing ${missing.join(', ')}`);
+        }
+        const actions = ['LOAD', 'UNLOAD', 'AUTO'].filter(k => Number(a[k] || 0) === 1);
+        if (actions.length !== 1) {
+          throw new Error(`${name} requires exactly one of LOAD=1, UNLOAD=1 or AUTO=1`);
         }
       }
       if (name === 'SET_ACE_MODE' || name === 'ACE_RUN_MODE_SWITCH') {
@@ -411,6 +422,10 @@ createApp({
         const th = _toolheadByIdx(a.HEAD);
         return th ? [th] : [];
       }
+      if ('EXTRUDER' in a) {
+        const th = _toolheadByIdx(a.EXTRUDER);
+        return th ? [th] : [];
+      }
       return state.toolheads.slice();
     }
     function _asyncItemDone(it) {
@@ -435,6 +450,21 @@ createApp({
       if (it.cmd === 'ACE_UNLOAD_ALL_HEADS') {
         return state.toolheads.every(th => !th.head_source_known
           && !th.load_failed && !_toolheadBusy(th));
+      }
+      if (it.cmd === 'FEED_AUTO') {
+        const th = _toolheadByIdx(a.EXTRUDER);
+        if (!th || _toolheadBusy(th)) return false;
+        if (Number(a.LOAD || 0) === 1) {
+          return !!th.filament_at_extruder && !th.load_failed;
+        }
+        if (Number(a.UNLOAD || 0) === 1) {
+          if (String(a.STAGE || '').toLowerCase() === 'prepare') {
+            return String(th.channel_state || '') === 'unload_heat_finish'
+              || it.jobStatus === 'done';
+          }
+          return !th.filament_at_extruder && !th.head_source_known;
+        }
+        return it.jobStatus === 'done';
       }
       return false;
     }
@@ -581,6 +611,10 @@ createApp({
           return `Unload T${di(a.HEAD ?? 0)}`;
         case 'ACE_UNLOAD_ALL_HEADS':
           return 'Unload all';
+        case 'FEED_AUTO':
+          if (Number(a.LOAD || 0) === 1) return `Load Native T${di(a.EXTRUDER ?? 0)}`;
+          if (Number(a.UNLOAD || 0) === 1) return `Unload Native T${di(a.EXTRUDER ?? 0)}`;
+          return `Feed T${di(a.EXTRUDER ?? 0)}`;
         case 'ACE_SWITCH':
           return `ACE ${di(a.TARGET ?? 0)}`;
         case 'ACE_DRY':
@@ -687,6 +721,44 @@ createApp({
     }
     function unloadHead(idx) {
       run("ACE_UNLOAD_HEAD", {HEAD: idx});
+    }
+    function _nativeFeedArgs(headIdx, action) {
+      const h = Number(headIdx);
+      const map = {
+        0: {MODULE: 'left',  CHANNEL: 1},
+        1: {MODULE: 'left',  CHANNEL: 0},
+        2: {MODULE: 'right', CHANNEL: 0},
+        3: {MODULE: 'right', CHANNEL: 1},
+      }[h];
+      if (!map) throw new Error(`Invalid native toolhead T${dispIdx(headIdx)}`);
+      return {MODULE: map.MODULE, CHANNEL: map.CHANNEL, EXTRUDER: h, [action]: 1};
+    }
+    function canLoadNativeHead(th) {
+      return !!th
+        && toolheadMode(th.idx) === 'native'
+        && th.module_exist
+        && th.filament_detected
+        && !th.filament_at_extruder
+        && !th.head_source_known
+        && !th.load_failed
+        && !_toolheadBusy(th);
+    }
+    function canUnloadNativeHead(th) {
+      return !!th
+        && toolheadMode(th.idx) === 'native'
+        && th.module_exist
+        && (th.filament_at_extruder || th.filament_detected)
+        && !_toolheadBusy(th);
+    }
+    function loadNativeHead(idx) {
+      const th = _toolheadByIdx(idx);
+      if (!canLoadNativeHead(th)) return;
+      enqueue("FEED_AUTO", _nativeFeedArgs(idx, "LOAD"));
+    }
+    function unloadNativeHead(idx) {
+      const th = _toolheadByIdx(idx);
+      if (!canUnloadNativeHead(th)) return;
+      enqueue("FEED_AUTO", _nativeFeedArgs(idx, "UNLOAD"));
     }
     function recoverLoadFailed(idx) {
       run("ACE_UNLOAD_HEAD", {HEAD: idx});
@@ -1783,13 +1855,22 @@ createApp({
         fallback:         "fallback ⚠",
         duplicate:        "duplicate ⚠",
         no_slot:          "no slot ⚠",
+        no_target:        "no target ⚠",
+        material_color:   "material+color",
+        material_fuzzy:   "material+fuzzy",
+        color:            "color",
+        material:         "material",
+        material_no_color:"material only ⚠",
+        manual:           "manual",
       };
       return t_map[tier] || tier;
     }
     function tierWarn(tier) {
       return tier && (tier === "fallback"
                       || tier === "duplicate"
-                      || tier === "no_slot");
+                      || tier === "no_slot"
+                      || tier === "no_target"
+                      || tier === "material_no_color");
     }
     function rgbDec(hex) {
       const s = (hex || "").replace(/^#/, "");
@@ -1803,13 +1884,145 @@ createApp({
       return (preflight.report?.slicer_colors || []).find(c => c.t === tIdx) || {};
     }
     function physicalHeadForMapping(m) {
+      const th = m?.target?.head;
+      if (th != null && th !== '') return Number(th);
       const h = m?.slot?.target_head;
       if (h != null && h !== '') return Number(h);
       return null;
     }
+    function mappingTargetKind(m) {
+      return m?.target?.kind || (m?.slot ? 'ace' : '');
+    }
+    function mappingTargetColor(m) {
+      if (m?.slot?.color) return m.slot.color;
+      const head = physicalHeadForMapping(m);
+      const th = state.toolheads.find(t => Number(t.idx) === Number(head));
+      return th?.color || '#444';
+    }
+    function mappingTargetMaterial(m) {
+      if (m?.slot?.material) return m.slot.material;
+      const head = physicalHeadForMapping(m);
+      const th = state.toolheads.find(t => Number(t.idx) === Number(head));
+      return th?.material || '?';
+    }
+    function targetKey(target) {
+      if (!target) return "";
+      if (target.kind === "native") return `native:${Number(target.head)}`;
+      if (target.kind === "ace") {
+        return `ace:${Number(target.head)}:${Number(target.ace)}:${Number(target.slot)}`;
+      }
+      return "";
+    }
+    function loadoutItemTarget(item) {
+      if (!item) return null;
+      if (item.kind === "native") return {kind: "native", head: Number(item.head)};
+      return {
+        kind: "ace",
+        head: Number(item.head),
+        ace: Number(item.ace),
+        slot: Number(item.slot),
+      };
+    }
+    function loadoutItemSlot(item) {
+      if (!item || item.kind !== "ace") return null;
+      return {
+        ace: Number(item.ace),
+        slot: Number(item.slot),
+        target_head: Number(item.head),
+        material: item.material || "",
+        color: item.color || "",
+      };
+    }
+    function preflightTargetOptions() {
+      return (preflight.report?.live_loadout || [])
+        .filter(item => item.ready !== false);
+    }
+    function formatPreflightTarget(item) {
+      if (!item) return "-";
+      const mat = item.material || "?";
+      if (item.kind === "native") {
+        return `Native T${dispIdx(item.head)} · ${mat}`;
+      }
+      return `ACE ${dispIdx(item.ace)} Slot ${dispIdx(item.slot)} → T${dispIdx(item.head)} · ${mat}`;
+    }
+    function mappingTargetValue(m) {
+      return targetKey(m?.target);
+    }
+    function selectedPreflightTargetKeys(exceptRow = null) {
+      const plan = preflight.report?.plans?.slicer;
+      const keys = new Set();
+      for (const row of plan?.mapping || []) {
+        if (exceptRow && row === exceptRow) continue;
+        const key = targetKey(row.target);
+        if (key) keys.add(key);
+      }
+      return keys;
+    }
+    function preflightTargetDisabled(item, row) {
+      const key = item?.key || "";
+      return key && selectedPreflightTargetKeys(row).has(key);
+    }
+    function refreshManualPlanState() {
+      const plan = preflight.report?.plans?.slicer;
+      if (!plan || !Array.isArray(plan.mapping)) return;
+      const seen = new Set();
+      let duplicate = false;
+      for (const row of plan.mapping) {
+        const key = targetKey(row.target);
+        if (!key) continue;
+        if (seen.has(key)) duplicate = true;
+        seen.add(key);
+      }
+      const complete = plan.mapping.length > 0
+        && plan.mapping.every(row => !!row.target)
+        && !duplicate;
+      plan.feasible = complete;
+      plan.reason = duplicate ? "duplicate target mapping" : "";
+    }
+    function setManualMapping(row, key) {
+      const rep = preflight.report;
+      if (!rep || !row) return;
+      const item = (rep.live_loadout || []).find(x => x.key === key);
+      if (!item || item.ready === false || preflightTargetDisabled(item, row)) {
+        refreshManualPlanState();
+        return;
+      }
+      if (!rep.tool_targets) rep.tool_targets = {};
+      const target = loadoutItemTarget(item);
+      rep.tool_targets[String(row.t)] = target;
+      row.target = target;
+      row.slot = loadoutItemSlot(item);
+      row.tier = "manual";
+      row.distance = null;
+      row.loose_mat = false;
+      refreshManualPlanState();
+    }
+    function preflightCanPrint(mode) {
+      if (mode !== "slicer") return false;
+      const rep = preflight.report;
+      const plan = rep?.plans?.[mode];
+      if (!rep || !plan || preflight.sending) return false;
+      if ((rep.missing_materials || []).length) return false;
+      const seen = new Set();
+      for (const row of plan.mapping || []) {
+        const key = targetKey(row.target);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+      }
+      return (plan.mapping || []).length > 0;
+    }
     function sortedMapping(plan) {
       const rows = (plan && plan.mapping) || [];
       return rows.slice().sort((a, b) => {
+        const ta = a.target || {};
+        const tb = b.target || {};
+        if (ta.kind !== tb.kind) {
+          if (ta.kind === 'native') return -1;
+          if (tb.kind === 'native') return 1;
+        }
+        if (ta.head != null && tb.head != null && Number(ta.head) !== Number(tb.head)) {
+          return Number(ta.head) - Number(tb.head);
+        }
         const sa = a.slot, sb = b.slot;
         if (!sa && !sb) return a.t - b.t;
         if (!sa) return  1;
@@ -1898,7 +2111,11 @@ createApp({
         const r = await fetch(`${API}/preflight/print`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({token: rep.token, mode}),
+          body: JSON.stringify({
+            token: rep.token,
+            mode,
+            tool_targets: rep.tool_targets || {},
+          }),
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) {
@@ -1996,6 +2213,7 @@ createApp({
       tab, version, printerName, printerFw, connClass, connText, screenAvailable,
       state, loadError, run, macroLog,
       slotTitle, switchAce, loadSlot, unloadHead, recoverLoadFailed,
+      loadNativeHead, unloadNativeHead, canLoadNativeHead, canUnloadNativeHead,
       isToolheadOccupied, toolheadOps,
       toolheadMode, setToolheadMode, canChangeToolheadMode, toolheadAceSlots,
       aceTarget, aceTargetOptions, setAceTarget, canChangeAceTarget,
@@ -2007,6 +2225,9 @@ createApp({
       preflight, closePreflight, startPreflightPrint, stageLabel,
       tierLabel, tierWarn, rgbDec, sortedMapping,
       slicerColorFor, physicalHeadForMapping,
+      mappingTargetKind, mappingTargetColor, mappingTargetMaterial,
+      mappingTargetValue, setManualMapping, preflightTargetDisabled,
+      preflightTargetOptions, formatPreflightTarget, preflightCanPrint,
       updateState, updateCheck, updateApply,
       debugState, debugEnable, debugDisable,
       plugins, refreshPlugins, pluginIframeSrc,
