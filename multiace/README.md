@@ -1,4 +1,18 @@
-# mUlt1ACE
+# Colorful-U1 / mUlt1ACE
+
+This tree is now maintained as **Colorful-U1**, a downstream experimental
+branch of mUlt1ACE focused on explicit Snapmaker U1 native + ACE mixed routing.
+
+Use the top-level [Colorful-U1 README](../README.md) for the current project
+summary, tested mixed-routing workflow, and roadmap. The original mUlt1ACE
+notes below are kept for installation context, upstream behavior and historical
+reference.
+
+Upstream lineage:
+
+```text
+BlackFrogKok/SnapAce -> decay71/multiACE -> Colorful-U1
+```
 
 ## What's new in 0.81b
 
