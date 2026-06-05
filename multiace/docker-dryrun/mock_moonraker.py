@@ -14,6 +14,8 @@ STATE_PATH = Path("/data/state.json")
 GCODE_LOG = Path("/data/gcode.log")
 CFG_PATH = Path("/data/ace.cfg")
 UPLOAD_DIR = Path("/data/uploaded")
+SLOT_OVERRIDE_PATH = Path("/data/slot_overrides.json")
+NATIVE_OVERRIDE_PATH = Path("/data/native_overrides.json")
 
 app = FastAPI(title="multiACE dry-run Moonraker")
 
@@ -117,6 +119,8 @@ def _default_state() -> dict[str, Any]:
     native_feed["filament_detected"] = True
     native_feed["filament_in_toolhead"] = True
     native_feed["filament_at_extruder"] = True
+    native_feed["channel_state"] = "load_finish"
+    native_feed["channel_error"] = "ok"
     state["print_task_config"]["filament_vendor"][1] = "DryRunNative"
     state["print_task_config"]["filament_type"][1] = "PLA"
     state["print_task_config"]["filament_sub_type"][1] = "Basic"
@@ -501,6 +505,21 @@ async def gcode_log() -> JSONResponse:
     return JSONResponse({"lines": GCODE_LOG.read_text(encoding="utf-8").splitlines()})
 
 
+@app.get("/dry-run/uploaded/{name:path}")
+async def uploaded_file(name: str) -> JSONResponse:
+    safe_name = Path(name or "").name
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    path = UPLOAD_DIR / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="uploaded file not found")
+    return JSONResponse({
+        "name": safe_name,
+        "size": path.stat().st_size,
+        "content": path.read_text(encoding="utf-8", errors="replace"),
+    })
+
+
 @app.post("/dry-run/reset")
 async def reset() -> dict[str, Any]:
     state = _default_state()
@@ -508,4 +527,11 @@ async def reset() -> dict[str, Any]:
     _save_state(state)
     if GCODE_LOG.exists():
         GCODE_LOG.unlink()
+    for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
+        if p.exists():
+            p.unlink()
+    if UPLOAD_DIR.exists():
+        for p in UPLOAD_DIR.iterdir():
+            if p.is_file():
+                p.unlink()
     return {"ok": True, "state": state}

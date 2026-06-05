@@ -600,6 +600,24 @@ body { padding-bottom: 64px; }
   border: 1px solid var(--border); border-radius: 4px;
   font-size: .78rem;
 }
+.preflight-command-preview {
+  margin-top: .7rem;
+  border-top: 1px solid var(--border);
+  padding-top: .55rem;
+}
+.preflight-command-preview h4 { margin-top: 0; }
+.preflight-command {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: .08rem 0;
+  padding: .14rem .28rem;
+  background: rgba(0,0,0,.24);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  white-space: normal;
+  word-break: break-word;
+}
 .preflight-warn { background: rgba(196, 101, 30, .12);
                   border: 1px solid var(--warn, #c4651e);
                   padding: .6rem .8rem; border-radius: 4px;

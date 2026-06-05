@@ -60,6 +60,19 @@ Reset the virtual printer state:
 curl -X POST http://localhost:7125/dry-run/reset
 ```
 
+## Preflight regression
+
+With the dry-run stack running, execute:
+
+```sh
+python3 multiace/docker-dryrun/regression_preflight.py
+```
+
+The script uploads a small mixed native/ACE G-code through the real Web
+preflight API, verifies the persisted source map, sends the print to the mock
+Moonraker upload endpoint, and checks that the rewritten file contains both a
+native tool command and an explicit `ACE_SWAP_HEAD`.
+
 ## Limits
 
 This validates UI configuration, state parsing, command generation, and

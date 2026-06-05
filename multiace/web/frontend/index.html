@@ -824,6 +824,44 @@ reboot</pre>
                 </tr>
               </tbody>
             </table>
+            <div v-if="mode === 'slicer' && sourceMapEntries().length"
+                 class="preflight-command-preview">
+              <h4>{{ t('ui.preflight.command_preview') }}</h4>
+              <table class="preflight-mapping">
+                <thead>
+                  <tr>
+                    <th>{{ t('ui.preflight.slicer') }}</th>
+                    <th>{{ t('ui.preflight.target') }}</th>
+                    <th>{{ t('ui.preflight.commands') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="entry in sourceMapEntries()"
+                      :key="'source-map-' + entry.slicer_tool">
+                    <td>
+                      T{{ dispIdx(entry.slicer_tool) }}
+                      <span class="muted small">· {{ entry.material || '?' }}</span>
+                    </td>
+                    <td>
+                      <template v-if="entry.target && entry.target.kind === 'native'">
+                        Native T{{ dispIdx(entry.target.head) }}
+                      </template>
+                      <template v-else-if="entry.target && entry.target.kind === 'ace'">
+                        ACE {{ dispIdx(entry.target.ace) }}
+                        Slot {{ dispIdx(entry.target.slot) }}
+                        → T{{ dispIdx(entry.target.head) }}
+                      </template>
+                      <span v-else class="muted">-</span>
+                    </td>
+                    <td>
+                      <code v-for="cmd in (entry.commands || [])"
+                            :key="'cmd-' + entry.slicer_tool + '-' + cmd"
+                            class="preflight-command">{{ cmd }}</code>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
             <div class="row" v-if="preflightCanPrint(mode)">
               <button class="primary"
                       :disabled="preflight.sending !== ''"

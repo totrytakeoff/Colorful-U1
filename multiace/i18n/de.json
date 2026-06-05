@@ -214,7 +214,10 @@
       "slicer":     "Slicer",
       "printer":    "Drucker",
       "physical_head": "Physischer Kopf",
-      "match_tier": "Match"
+      "match_tier": "Match",
+      "command_preview": "Finale Befehlsvorschau",
+      "target": "Ziel",
+      "commands": "Befehle"
     },
     "queue": {
       "send_all_tooltip": "Alle Queue-Befehle an den Drucker senden (UI darf danach geschlossen werden)",

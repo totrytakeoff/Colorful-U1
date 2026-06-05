@@ -1616,8 +1616,15 @@ createApp({
       }
       return opts;
     }
+    function printerBusyForTopology() {
+      const s = String(state.printer_state || "").toLowerCase();
+      return s === "printing" || s === "paused" || s === "busy";
+    }
     async function saveTopology() {
       if (topologySaving.value) return;
+      if (printerBusyForTopology()) {
+        throw new Error('Topology changes are locked while the printer is busy.');
+      }
       topologySaving.value = true;
       if (!config.content) await loadConfig();
       const newContent = formToCfgContent(config.content);
@@ -1651,6 +1658,10 @@ createApp({
       setMacroLog('Discarded pending toolhead topology changes.');
     }
     async function setToolheadMode(idx, mode) {
+      if (printerBusyForTopology()) {
+        setMacroLog('Toolhead topology is locked while the printer is busy.');
+        return;
+      }
       const targetMode = mode === 'ace' ? 'ace' : 'native';
       const th = state.toolheads.find(t => t.idx === idx);
       if (th && (th.head_source_known || th.filament_at_extruder || th.load_failed)) {
@@ -1680,12 +1691,14 @@ createApp({
     function canChangeToolheadMode(th) {
       if (!th) return !topologySaving.value;
       return !topologySaving.value
+        && !printerBusyForTopology()
         && !th.head_source_known
         && !th.filament_at_extruder
         && !th.load_failed;
     }
     function canChangeAceTarget(aceIdx) {
       if (topologySaving.value) return false;
+      if (printerBusyForTopology()) return false;
       if (state.toolheads.some(t =>
         (t.ace === aceIdx && t.head_source_known)
         || (t.failed_ace === aceIdx && t.load_failed))) {
@@ -1701,6 +1714,10 @@ createApp({
       return true;
     }
     async function setAceTarget(aceIdx, value) {
+      if (printerBusyForTopology()) {
+        setMacroLog('ACE topology is locked while the printer is busy.');
+        return;
+      }
       const target = value === '' ? '' : Number(value);
       if (target !== '' && toolheadMode(target) !== 'ace') {
         setMacroLog(`T${dispIdx(target)} must be set to ACE before assigning ACE ${dispIdx(aceIdx)}.`);
@@ -1955,6 +1972,52 @@ createApp({
         color: item.color || "",
       };
     }
+    function commandPreviewForTarget(target) {
+      if (!target) return [];
+      const head = Number(target.head);
+      if (!Number.isFinite(head)) return [];
+      if (target.kind === "native") return [`T${head}`];
+      if (target.kind === "ace") {
+        const ace = Number(target.ace);
+        const slot = Number(target.slot);
+        if (!Number.isFinite(ace) || !Number.isFinite(slot)) return [`T${head}`];
+        return [`T${head}`, `ACE_SWAP_HEAD HEAD=${head} ACE=${ace} SLOT=${slot}`];
+      }
+      return [];
+    }
+    function refreshPreflightSourceMap() {
+      const rep = preflight.report;
+      const plan = rep?.plans?.slicer;
+      if (!rep || !plan || !Array.isArray(plan.mapping)) return;
+      const existing = rep.source_map || {};
+      const prevByTool = new Map((existing.entries || []).map(e => [Number(e.slicer_tool), e]));
+      const entries = plan.mapping.slice().sort((a, b) => a.t - b.t).map(row => {
+        const prev = prevByTool.get(Number(row.t)) || {};
+        const c = slicerColorFor(row.t);
+        const commands = commandPreviewForTarget(row.target);
+        return {
+          ...prev,
+          slicer_tool: Number(row.t),
+          slicer_label: `T${Number(row.t)}`,
+          material: c.material || prev.material || "",
+          color: c.hex || prev.color || "",
+          target: row.target || null,
+          commands,
+          summary: commands.join(" + "),
+        };
+      });
+      rep.source_map = {
+        ...existing,
+        token: rep.token,
+        filename: rep.filename,
+        tool_targets: rep.tool_targets || {},
+        entries,
+      };
+    }
+    function sourceMapEntries() {
+      const entries = preflight.report?.source_map?.entries || [];
+      return entries.slice().sort((a, b) => Number(a.slicer_tool) - Number(b.slicer_tool));
+    }
     function preflightTargetOptions() {
       return (preflight.report?.live_loadout || [])
         .filter(item => item.ready !== false);
@@ -2018,6 +2081,7 @@ createApp({
       row.distance = null;
       row.loose_mat = false;
       refreshManualPlanState();
+      refreshPreflightSourceMap();
     }
     function preflightCanPrint(mode) {
       if (mode !== "slicer") return false;
@@ -2250,6 +2314,7 @@ createApp({
       mappingTargetKind, mappingTargetColor, mappingTargetMaterial,
       mappingTargetValue, setManualMapping, preflightTargetDisabled,
       preflightTargetOptions, formatPreflightTarget, preflightCanPrint,
+      sourceMapEntries,
       updateState, updateCheck, updateApply,
       debugState, debugEnable, debugDisable,
       plugins, refreshPlugins, pluginIframeSrc,

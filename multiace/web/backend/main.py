@@ -856,6 +856,7 @@ _PREFLIGHT_DIR = Path("/tmp/multiace-preflight")
 _PREFLIGHT_TTL = 86400.0
 _PREFLIGHT_FUZZY = 30
 _PREFLIGHT_MIXED_FUZZY = int(os.environ.get("MULTIACE_MIXED_FUZZY", "90"))
+_PREFLIGHT_SOURCE_MAP_VERSION = 1
 
 _PREFLIGHT_MAX_SIZE = int(os.environ.get(
     "MULTIACE_PREFLIGHT_MAX_MB", "200")) * 1024 * 1024
@@ -1072,6 +1073,103 @@ def _target_key_from_request(target: Any) -> str | None:
         return None
     return None
 
+def _target_command_preview(target: dict | None) -> list[str]:
+    if not target:
+        return []
+    try:
+        head = int(target.get("head"))
+    except (TypeError, ValueError):
+        return []
+    if target.get("kind") == "native":
+        return [f"T{head}"]
+    if target.get("kind") == "ace":
+        try:
+            ace = int(target.get("ace"))
+            slot = int(target.get("slot"))
+        except (TypeError, ValueError):
+            return [f"T{head}"]
+        return [
+            f"T{head}",
+            f"ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}",
+        ]
+    return []
+
+def _build_preflight_source_map(
+        *,
+        token: str,
+        filename: str,
+        slicer_colors: dict[int, str],
+        slicer_types: dict[int, str],
+        tool_targets: dict[str, dict],
+        parsed: dict,
+        used_tools: set[int],
+) -> dict:
+    route = parsed.get("route", {}) or {}
+    entries = []
+    for t in sorted(used_tools):
+        target = tool_targets.get(str(t), tool_targets.get(t))
+        commands = _target_command_preview(target)
+        entries.append({
+            "slicer_tool": t,
+            "slicer_label": f"T{t}",
+            "material": slicer_types.get(t, "") or "",
+            "color": (slicer_colors.get(t, "") or "").lower(),
+            "target": target,
+            "commands": commands,
+            "summary": " + ".join(commands),
+        })
+    return {
+        "version": _PREFLIGHT_SOURCE_MAP_VERSION,
+        "token": token,
+        "filename": filename,
+        "created_at": time.time(),
+        "route": {
+            "mode": route.get("mode"),
+            "primary_head": route.get("primary_head"),
+            "ace_targets": route.get("ace_targets", {}),
+            "head_modes": route.get("head_modes", {}),
+            "error": route.get("error"),
+        },
+        "used_tools": sorted(used_tools),
+        "tool_targets": tool_targets,
+        "entries": entries,
+    }
+
+def _preflight_source_map_path(token: str) -> Path:
+    return _PREFLIGHT_DIR / (token + ".source_map.json")
+
+def _save_preflight_source_map(source_map: dict) -> None:
+    token = source_map.get("token")
+    if not token or not re.fullmatch(r"[0-9a-f]{32}", str(token)):
+        return
+    _preflight_source_map_path(str(token)).write_text(
+        json.dumps(source_map, indent=2, sort_keys=True),
+        encoding="utf-8")
+
+def _load_preflight_source_map(token: str) -> dict:
+    p = _preflight_source_map_path(token)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
+    colors: dict[int, str] = {}
+    materials: dict[int, str] = {}
+    for entry in source_map.get("entries", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            t = int(entry.get("slicer_tool"))
+        except (TypeError, ValueError):
+            continue
+        colors[t] = entry.get("color", "") or ""
+        materials[t] = entry.get("material", "") or ""
+    return colors, materials
+
 def _validate_manual_tool_targets(parsed: dict, requested: Any,
                                   used_tools: set[int]) -> dict:
     if not isinstance(requested, dict):
@@ -1115,6 +1213,17 @@ def _validate_manual_tool_targets(parsed: dict, requested: Any,
             detail="manual mapping reuses the same target for "
             + ", ".join(duplicate))
     return out
+
+def _used_tools_for_preflight(used: set[int], slicer_colors: dict,
+                              tool_targets: dict | None = None) -> set[int]:
+    if used:
+        return set(used)
+    if tool_targets:
+        try:
+            return {int(t) for t in tool_targets.keys()}
+        except Exception:
+            pass
+    return set(slicer_colors.keys())
 
 def _build_mixed_resolver(parsed: dict, slicer_colors: dict,
                           slicer_types: dict, used_tools: set[int]) -> dict:
@@ -1537,16 +1646,28 @@ async def preflight(file: UploadFile = File(...)) -> dict:
             detail="; ".join(_load_failed_message(t) for t in failed),
         )
     live_slots = _live_slots_from_parsed(parsed)
+    used_tools = _used_tools_for_preflight(used, slicer_colors)
     resolver = _build_mixed_resolver(
-        parsed, slicer_colors, slicer_types, used or set(slicer_colors.keys()))
+        parsed, slicer_colors, slicer_types, used_tools)
     if not resolver.get("candidates"):
         raise HTTPException(status_code=409,
                             detail="no native head or ACE slot is available")
+    tool_targets = resolver.get("tool_targets", {})
+    source_map = _build_preflight_source_map(
+        token=token,
+        filename=safe_name,
+        slicer_colors=slicer_colors,
+        slicer_types=slicer_types,
+        tool_targets=tool_targets,
+        parsed=parsed,
+        used_tools=used_tools,
+    )
     (_PREFLIGHT_DIR / (token + ".targets")).write_text(
-        json.dumps(resolver.get("tool_targets", {}), indent=2),
+        json.dumps(tool_targets, indent=2),
         encoding="utf-8")
+    _save_preflight_source_map(source_map)
     (_PREFLIGHT_DIR / (token + ".used")).write_text(
-        json.dumps(sorted(used or set(slicer_colors.keys()))),
+        json.dumps(sorted(used_tools)),
         encoding="utf-8")
     num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
     missing_mats = []
@@ -1582,7 +1703,8 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         "missing_materials": missing_mats,
         "resolve_errors": resolver.get("errors", []),
         "resolve_candidates": resolver.get("candidates", []),
-        "tool_targets": resolver.get("tool_targets", {}),
+        "tool_targets": tool_targets,
+        "source_map": source_map,
         "plans": {},
     }
     if not missing_mats and not resolver.get("errors"):
@@ -1681,6 +1803,9 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
     pp = _load_post_processor()
     src = _PREFLIGHT_DIR / (token + ".gcode")
     tool_targets = _load_preflight_targets(token)
+    source_map = _load_preflight_source_map(token)
+    if source_map:
+        state["source_map"] = source_map
 
     tmp_a = _PREFLIGHT_DIR / (job_id + ".a.gcode")
     tmp_b = _PREFLIGHT_DIR / (job_id + ".b.gcode")
@@ -1833,6 +1958,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         _set_stage(state, "done", 100.0)
         state["filename"] = safe_name
         state["mode"]     = mode
+        state["source_map"] = _load_preflight_source_map(token) or source_map
         state["done"]     = True
     except Exception as exc:
         state["error"] = str(exc)
@@ -1877,6 +2003,8 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             status_code=409,
             detail="; ".join(_load_failed_message(t) for t in failed),
         )
+    safe_name = (npath.read_text(encoding="utf-8").strip()
+                 if npath.is_file() else (req.token + ".gcode"))
     if req.tool_targets is not None:
         try:
             used_raw = json.loads(upath.read_text(encoding="utf-8"))
@@ -1890,8 +2018,18 @@ async def preflight_print(req: _PreflightPrint) -> dict:
         _preflight_targets_path(req.token).write_text(
             json.dumps(manual_targets, indent=2),
             encoding="utf-8")
-    safe_name = (npath.read_text(encoding="utf-8").strip()
-                 if npath.is_file() else (req.token + ".gcode"))
+        existing_map = _load_preflight_source_map(req.token)
+        slicer_colors, slicer_types = _source_map_slicer_meta(existing_map)
+        source_map = _build_preflight_source_map(
+            token=req.token,
+            filename=safe_name,
+            slicer_colors=slicer_colors,
+            slicer_types=slicer_types,
+            tool_targets=manual_targets,
+            parsed=parsed,
+            used_tools=used_tools,
+        )
+        _save_preflight_source_map(source_map)
 
     _prune_old_jobs()
     import uuid as _uuid
@@ -1904,6 +2042,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
         "filename": safe_name,
         "mode":     req.mode,
         "ts":       time.time(),
+        "source_map": _load_preflight_source_map(req.token),
     }
     asyncio.create_task(_run_preflight_pipeline(
         job_id, req.token, req.mode, safe_name, req.set_prefs))
@@ -1923,7 +2062,17 @@ async def preflight_print_status(job_id: str) -> dict:
         "error":   state.get("error"),
         "filename": state.get("filename"),
         "mode":    state.get("mode"),
+        "source_map": state.get("source_map") or {},
     }
+
+@app.get("/api/preflight/source-map")
+async def preflight_source_map(token: str) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    source_map = _load_preflight_source_map(token)
+    if not source_map:
+        raise HTTPException(status_code=404, detail="source map not found")
+    return source_map
 
 _cfg_scalar_cache: dict = {"mtime": 0.0, "values": {}}
 

@@ -31,6 +31,24 @@ Phase 4: 切片软件集成
 目标：让当前已经能打印的 native/ACE 混合链路变成可复现、可排查、可回归的
 稳定基线。
 
+### 实现进度：2026-06-05
+
+已落地第一轮收尾：
+
+- Web 后端为每次 preflight 生成并持久化 `source_map`。
+- `source_map` 记录 slicer tool、材料、颜色、最终 target、命令预览和
+  当前 topology 快照。
+- 新增 `GET /api/preflight/source-map?token=<token>`，方便 Web UI、
+  dry-run 测试和后续切片软件集成复用同一份映射结果。
+- preflight 发送打印时会重新校验手动映射，并用最终 target 覆盖保存
+  `source_map`。
+- Web preflight 弹窗新增最终命令预览，能直接看到 native `Tn` 和
+  `ACE_SWAP_HEAD HEAD=<head> ACE=<ace> SLOT=<slot>`。
+- 打印机处于 `printing`、`paused` 或 `busy` 时，Dashboard 锁定工具头
+  topology 修改和提交。
+- Docker dry-run 增加 `regression_preflight.py`，覆盖 mixed preflight、
+  source map、发送打印和最终上传 G-code 校验。
+
 ### 必做项
 
 1. 固化 dry-run 回归测试：

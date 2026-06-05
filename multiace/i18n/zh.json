@@ -212,7 +212,10 @@
       "slicer": "切片",
       "printer": "打印机",
       "physical_head": "物理头",
-      "match_tier": "匹配"
+      "match_tier": "匹配",
+      "command_preview": "最终命令预览",
+      "target": "目标",
+      "commands": "命令"
     },
     "queue": {
       "send_all_tooltip": "将所有排队命令发送到打印机（之后可以关闭界面）",
