@@ -153,7 +153,9 @@ Longer-term work:
 - richer purge/wipe strategies.
 
 See [native/ACE MVP plan](multiace/docs/native_ace_mvp_plan.md) for the current
-engineering notes and TODO list.
+engineering notes and TODO list. See
+[post-MVP optimization plan](multiace/docs/post_mvp_optimization_plan.md) for
+the swap optimization and slicer-integration roadmap.
 
 ## Installation
 

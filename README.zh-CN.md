@@ -130,6 +130,8 @@ ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
 - 更完善的 purge/wipe 策略。
 
 当前工程记录和 TODO 见 [native/ACE MVP plan](multiace/docs/native_ace_mvp_plan.md)。
+换料效率优化与切片软件集成路线见
+[post-MVP optimization plan](multiace/docs/post_mvp_optimization_plan.md)。
 
 ## 安装与测试
 
