@@ -148,6 +148,18 @@ def uploaded_content(filename: str) -> str:
     return uploaded.get("content") or ""
 
 
+def run_script(script: str, expect_status: int = 200) -> dict:
+    return post_json(
+        f"{MOONRAKER}/printer/gcode/script",
+        {"script": script},
+        expect_status=expect_status,
+    )
+
+
+def moonraker_state() -> dict:
+    return request("GET", f"{MOONRAKER}/printer/objects/query")["result"]["status"]
+
+
 def assert_source_map_shape(report: dict) -> None:
     source_map = report.get("source_map") or {}
     stats = source_map.get("swap_stats") or {}
@@ -351,13 +363,66 @@ def test_wrong_feed_auto_channel_rejected() -> None:
         "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
         "ace_targets": {"0": None},
     })
-    err = post_json(
-        f"{MOONRAKER}/printer/gcode/script",
-        {"script": "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1"},
-        expect_status=400,
-    )
+    err = run_script("FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
+                     expect_status=400)
     assert_true("route mismatch" in str(err),
                 f"wrong FEED_AUTO channel should be rejected: {err}")
+
+
+def test_stale_head_source_cleared_on_print_start() -> None:
+    set_scenario({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {"head": 0, "ace": 0, "slot": 1, "material": "PETG", "color": "1E78DC"},
+        ],
+    })
+    before = moonraker_state()
+    assert_true(before["ace"]["head_source"]["0"] is not None,
+                f"test setup should have stale head_source: {before['ace']['head_source']}")
+    assert_true(not before["filament_feed left"]["extruder0"]["filament_detected"],
+                "test setup should have an empty ACE head sensor")
+
+    run_script("PRINT_START")
+    after = moonraker_state()
+    assert_true(after["ace"]["head_source"]["0"] is None,
+                f"PRINT_START should clear stale head_source: {after['ace']['head_source']}")
+    assert_true(after["ace"].get("ghost_heads", []) == [],
+                f"empty stale source should not become ghost: {after['ace'].get('ghost_heads')}")
+    run_script("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0")
+    loaded = moonraker_state()
+    assert_true(loaded["ace"]["head_source"]["0"]["slot"] == 0,
+                f"swap after stale cleanup should load target slot: {loaded['ace']['head_source']}")
+
+
+def test_ghost_head_refuses_swap() -> None:
+    set_scenario({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "native_heads": [
+            {"head": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+    })
+    before = moonraker_state()
+    assert_true(before["ace"]["head_source"]["0"] is None,
+                f"test setup should have no head_source: {before['ace']['head_source']}")
+    assert_true(before["filament_feed left"]["extruder0"]["filament_detected"],
+                "test setup should have filament detected at ACE head")
+
+    run_script("PRINT_START")
+    after = moonraker_state()
+    assert_true(after["ace"].get("ghost_heads") == [0],
+                f"PRINT_START should mark ghost head: {after['ace'].get('ghost_heads')}")
+    err = run_script("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0", expect_status=400)
+    assert_true("ghost" in str(err).lower(),
+                f"ghost swap should be rejected: {err}")
 
 
 def main() -> int:
@@ -368,6 +433,8 @@ def main() -> int:
         test_unmapped_tool_is_not_feasible,
         test_duplicate_manual_mapping_rejected,
         test_wrong_feed_auto_channel_rejected,
+        test_stale_head_source_cleared_on_print_start,
+        test_ghost_head_refuses_swap,
     ]
     for test in tests:
         test()

@@ -51,6 +51,9 @@ Phase 4: 切片软件集成
 - 2026-06-06：Docker dry-run 增加场景切换接口，回归扩展为多用例：
   native-only、single ACE head、native + one ACE head、unmapped slicer tool、
   duplicate manual target 和 wrong `FEED_AUTO` channel。
+- 2026-06-06：Docker dry-run 补齐 `stale head_source` / ghost head 行为：
+  `PRINT_START` 会清理“传感器空但 source 仍存在”的旧记录，也会标记
+  “传感器有料但无 source”的 ghost head 并拒绝后续 swap。
 
 ### 必做项
 
@@ -61,7 +64,7 @@ Phase 4: 切片软件集成
    - unmapped slicer tool。已覆盖。
    - duplicate manual target。已覆盖。
    - wrong `FEED_AUTO` channel。已覆盖。
-   - stale `head_source`。
+   - stale `head_source`。已覆盖。
 
 2. 保存 preflight source map：
    - 每个 slicer tool 的材料、颜色、原始 T 编号。

@@ -372,10 +372,30 @@ def _apply_script(script: str) -> None:
             ace = int(args.get("ACE", "0"))
             slot = int(args.get("SLOT", "0"))
             _check_load_route(state, head, ace, slot)
+            if head in (state["ace"].get("ghost_heads") or []):
+                raise ValueError(
+                    f"SWAP refused: head {head} is a ghost with no head_source")
             _set_head_loaded(state, head, ace, slot)
         elif cmd == "ACE_UNLOAD_ALL_HEADS":
             for h in range(4):
                 _set_head_empty(state, h)
+            state["ace"]["ghost_heads"] = []
+        elif cmd == "PRINT_START":
+            route = state["ace"].get("route", {}) or {}
+            head_modes = route.get("head_modes", {}) or {}
+            ghost_heads = []
+            for h in range(4):
+                if head_modes.get(str(h)) != "ace":
+                    continue
+                module, key = _head_key(h)
+                feed = state[module][key]
+                detected = bool(feed.get("filament_detected"))
+                src = state["ace"]["head_source"].get(str(h))
+                if detected and src is None:
+                    ghost_heads.append(h)
+                elif (not detected) and src is not None:
+                    state["ace"]["head_source"][str(h)] = None
+            state["ace"]["ghost_heads"] = ghost_heads
         elif cmd == "FEED_AUTO":
             head = int(args.get("EXTRUDER", "0"))
             module = args.get("MODULE", "")
@@ -435,12 +455,22 @@ class DryRunSlot(BaseModel):
     brand: str = "DryRunACE"
     status: str = "ready"
 
+class DryRunHeadSource(BaseModel):
+    head: int
+    ace: int = 0
+    slot: int = 0
+    material: str = "PLA"
+    color: str = "FFFFFF"
+    brand: str = "DryRunACE"
+    load_failed: bool = False
+
 class DryRunScenario(BaseModel):
     ace_device_count: int = 1
     head_modes: dict[str, str] | None = None
     ace_targets: dict[str, int | None] | None = None
     native_heads: list[DryRunNativeHead] = []
     slots: list[DryRunSlot] = []
+    head_sources: list[DryRunHeadSource] = []
 
 
 @app.get("/server/info")
@@ -623,6 +653,19 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
         })
         state["ace"]["aces"][ace]["gate_status"][slot] = (
             0 if item.status == "empty" else 1)
+
+    for src in payload.head_sources:
+        head = int(src.head)
+        if head < 0 or head >= 4:
+            raise HTTPException(status_code=400, detail=f"invalid head source {head}")
+        state["ace"]["head_source"][str(head)] = {
+            "ace_index": int(src.ace),
+            "slot": int(src.slot),
+            "type": src.material,
+            "color": src.color.strip().lstrip("#")[:6].upper() or "FFFFFF",
+            "brand": src.brand,
+            "load_failed": bool(src.load_failed),
+        }
 
     _save_state(state)
     for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
