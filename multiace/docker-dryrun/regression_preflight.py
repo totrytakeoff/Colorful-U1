@@ -74,7 +74,7 @@ def assert_true(cond: bool, message: str) -> None:
 
 def reset_default() -> None:
     request("POST", f"{MOONRAKER}/dry-run/reset")
-    post_json(f"{MOONRAKER}/dry-run/scenario", {
+    scenario = {
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
         "ace_targets": {"0": 0},
         "native_heads": [
@@ -86,11 +86,121 @@ def reset_default() -> None:
             {"ace": 0, "slot": 2, "material": "PLA", "color": "#f5d23c"},
             {"ace": 0, "slot": 3, "material": "ABS", "color": "#28c878"},
         ],
-    })
+    }
+    post_json(f"{MOONRAKER}/dry-run/scenario", scenario)
+    push_source_graph(scenario)
 
 
 def set_scenario(payload: dict[str, Any]) -> None:
     post_json(f"{MOONRAKER}/dry-run/scenario", payload)
+    push_source_graph(payload)
+
+
+def source_graph_for(payload: dict[str, Any]) -> dict[str, Any]:
+    ace_count = max(1, min(8, int(payload.get("ace_device_count") or 1)))
+    heads = {}
+    sources = {}
+    edges = []
+    channels = {
+        0: {"module": "left", "channel": 1},
+        1: {"module": "left", "channel": 0},
+        2: {"module": "right", "channel": 0},
+        3: {"module": "right", "channel": 1},
+    }
+    for head in range(4):
+        heads[f"head:{head}"] = {
+            "index": head,
+            "enabled": True,
+            "label": f"T{head}",
+            "native_channel": channels[head],
+        }
+        sources[f"native:{head}"] = {
+            "kind": "native_feeder",
+            "head": head,
+            "label": f"Native T{head}",
+            "material": "",
+            "brand": "",
+            "subtype": "",
+            "color": "",
+            "ready": False,
+            "execution_profile": "u1_native_feeder",
+        }
+        edges.append({
+            "source": f"native:{head}",
+            "head": f"head:{head}",
+            "enabled": True,
+            "priority": 10,
+        })
+    for ace in range(ace_count):
+        for slot in range(4):
+            sources[f"ace:{ace}:{slot}"] = {
+                "kind": "ace_slot",
+                "ace": ace,
+                "slot": slot,
+                "label": f"ACE {ace + 1} Slot {slot + 1}",
+                "material": "",
+                "brand": "",
+                "subtype": "",
+                "color": "",
+                "ready": False,
+                "execution_profile": "ace_v1_slot",
+            }
+
+    head_modes = payload.get("head_modes") or {
+        "0": "ace", "1": "native", "2": "native", "3": "native",
+    }
+    ace_targets = payload.get("ace_targets") or {"0": 0}
+    for ace in range(ace_count):
+        target = ace_targets.get(str(ace), ace_targets.get(ace))
+        try:
+            head = int(target)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= head < 4:
+            continue
+        if str(head_modes.get(str(head), head_modes.get(head, ""))).lower() != "ace":
+            continue
+        for slot in range(4):
+            edges.append({
+                "source": f"ace:{ace}:{slot}",
+                "head": f"head:{head}",
+                "enabled": True,
+                "priority": 50,
+                "constraints": {
+                    "requires_empty_head_before_load": True,
+                    "allows_preload_while_other_head_prints": True,
+                },
+            })
+
+    return {
+        "version": 1,
+        "heads": heads,
+        "sources": sources,
+        "edges": edges,
+        "profiles": {
+            "ace_v1_slot": {
+                "kind": "ace_slot",
+                "capabilities": {
+                    "can_preload": True,
+                    "can_swap_in_print": True,
+                    "requires_source_tracking": True,
+                },
+            },
+            "u1_native_feeder": {
+                "kind": "native_feeder",
+                "capabilities": {
+                    "can_preload": False,
+                    "can_swap_in_print": False,
+                    "requires_source_tracking": False,
+                },
+            },
+        },
+    }
+
+
+def push_source_graph(payload: dict[str, Any]) -> None:
+    result = post_json(f"{WEB}/source-graph", {"graph": source_graph_for(payload)})
+    assert_true(result.get("ok"), f"source graph save failed: {result}")
 
 
 def gcode(types: str, colors: str, body: str) -> str:
@@ -113,6 +223,21 @@ def target_for(report: dict, tool: int) -> dict:
 
 def commands_for(report: dict, tool: int) -> list[str]:
     return entries_by_tool(report)[tool].get("commands") or []
+
+
+def assert_route_plan_shape(report: dict) -> None:
+    route_plan = report.get("route_plan") or {}
+    source_map = report.get("source_map") or {}
+    graph_meta = source_map.get("source_graph") or {}
+    assert_true(route_plan.get("source_graph_hash") == graph_meta.get("hash"),
+                f"route plan graph hash mismatch: {route_plan}")
+    events = route_plan.get("events") or []
+    assert_true(events, f"route plan missing events: {route_plan}")
+    for event in events:
+        assert_true(event.get("source"), f"route event missing source: {event}")
+        assert_true(str(event.get("head") or "").startswith("head:"),
+                    f"route event missing graph head id: {event}")
+        assert_true(event.get("commands"), f"route event missing commands: {event}")
 
 
 def start_print(report: dict, tool_targets: dict | None = None,
@@ -162,6 +287,9 @@ def moonraker_state() -> dict:
 
 def assert_source_map_shape(report: dict) -> None:
     source_map = report.get("source_map") or {}
+    graph_meta = source_map.get("source_graph") or {}
+    assert_true(str(graph_meta.get("hash") or "").startswith("sha256:"),
+                f"source map missing source graph hash: {source_map}")
     stats = source_map.get("swap_stats") or {}
     assert_true("tool_events" in stats, f"source map missing swap stats: {source_map}")
     suggestion = source_map.get("optimization_suggestion") or {}
@@ -194,12 +322,14 @@ def test_mixed_native_ace_print() -> None:
         ),
     )
     assert_source_map_shape(report)
+    assert_route_plan_shape(report)
     assert_true(len(entries_by_tool(report)) == 2, "mixed case should map two tools")
     t0 = target_for(report, 0)
     t1 = target_for(report, 1)
-    assert_true(t0 == {"kind": "native", "head": 1},
+    assert_true(t0 == {"kind": "native", "head": 1, "source": "native:1"},
                 f"T0 should map to native T1, got {t0}")
-    assert_true(t1 == {"kind": "ace", "head": 0, "ace": 0, "slot": 1},
+    assert_true(t1 == {
+        "kind": "ace", "head": 0, "source": "ace:0:1", "ace": 0, "slot": 1},
                 f"T1 should map to ACE0 slot1 -> T0, got {t1}")
     assert_true(commands_for(report, 0) == ["T1"],
                 f"T0 command preview mismatch: {commands_for(report, 0)}")
@@ -219,6 +349,9 @@ def test_mixed_native_ace_print() -> None:
     saved_map = request("GET", f"{WEB}/preflight/source-map?token={report['token']}")
     assert_true(saved_map.get("entries") == (report.get("source_map") or {}).get("entries"),
                 "saved source map differs from preflight response")
+    saved_plan = request("GET", f"{WEB}/preflight/route-plan?token={report['token']}")
+    assert_true(saved_plan.get("events") == (report.get("route_plan") or {}).get("events"),
+                "saved route plan differs from preflight response")
     started = start_print(report)
     status = wait_job(started["job_id"])
     final_stats = ((status.get("source_map") or {}).get("swap_stats") or {})
@@ -253,9 +386,12 @@ def test_native_only_print() -> None:
         ),
     )
     assert_source_map_shape(report)
-    assert_true(target_for(report, 0) == {"kind": "native", "head": 0},
+    assert_route_plan_shape(report)
+    assert_true(target_for(report, 0) == {
+        "kind": "native", "head": 0, "source": "native:0"},
                 f"T0 native-only mapping mismatch: {target_for(report, 0)}")
-    assert_true(target_for(report, 1) == {"kind": "native", "head": 1},
+    assert_true(target_for(report, 1) == {
+        "kind": "native", "head": 1, "source": "native:1"},
                 f"T1 native-only mapping mismatch: {target_for(report, 1)}")
     stats = (report.get("source_map") or {}).get("swap_stats") or {}
     assert_true(stats.get("active_ace_swaps") == 0,
@@ -293,9 +429,12 @@ def test_single_ace_head_print() -> None:
         ),
     )
     assert_source_map_shape(report)
-    assert_true(target_for(report, 0) == {"kind": "ace", "head": 0, "ace": 0, "slot": 0},
+    assert_route_plan_shape(report)
+    assert_true(target_for(report, 0) == {
+        "kind": "ace", "head": 0, "source": "ace:0:0", "ace": 0, "slot": 0},
                 f"T0 single ACE mapping mismatch: {target_for(report, 0)}")
-    assert_true(target_for(report, 1) == {"kind": "ace", "head": 0, "ace": 0, "slot": 1},
+    assert_true(target_for(report, 1) == {
+        "kind": "ace", "head": 0, "source": "ace:0:1", "ace": 0, "slot": 1},
                 f"T1 single ACE mapping mismatch: {target_for(report, 1)}")
     stats = (report.get("source_map") or {}).get("swap_stats") or {}
     assert_true(stats.get("active_ace_swaps") == 2,
@@ -347,7 +486,7 @@ def test_duplicate_manual_mapping_rejected() -> None:
             """,
         ),
     )
-    native_target = {"kind": "native", "head": 1}
+    native_target = {"kind": "native", "head": 1, "source": "native:1"}
     err = start_print(
         report,
         tool_targets={"0": native_target, "1": native_target},

@@ -28,6 +28,7 @@ services:
       MULTIACE_OVERRIDE_FILE: /data/slot_overrides.json
       MULTIACE_NATIVE_OVERRIDE_FILE: /data/native_overrides.json
       MULTIACE_MATERIALS_FILE: /data/materials.json
+      MULTIACE_SOURCE_GRAPH_PATH: /data/source_graph.json
       MULTIACE_I18N_DIR: /app/multiace/i18n
     volumes:
       - dryrun-data:/data

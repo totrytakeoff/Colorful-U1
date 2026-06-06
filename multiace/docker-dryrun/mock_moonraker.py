@@ -16,6 +16,7 @@ CFG_PATH = Path("/data/ace.cfg")
 UPLOAD_DIR = Path("/data/uploaded")
 SLOT_OVERRIDE_PATH = Path("/data/slot_overrides.json")
 NATIVE_OVERRIDE_PATH = Path("/data/native_overrides.json")
+SOURCE_GRAPH_PATH = Path("/data/source_graph.json")
 
 app = FastAPI(title="multiACE dry-run Moonraker")
 
@@ -147,6 +148,7 @@ def _load_state() -> dict[str, Any]:
     if not STATE_PATH.exists():
         state = _default_state()
         _apply_cfg_route(state)
+        _write_source_graph_from_route(state)
         _save_state(state)
         return state
     state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -157,6 +159,116 @@ def _load_state() -> dict[str, Any]:
 def _save_state(state: dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _native_channel(head: int) -> dict[str, int | str]:
+    return {
+        0: {"module": "left", "channel": 1},
+        1: {"module": "left", "channel": 0},
+        2: {"module": "right", "channel": 0},
+        3: {"module": "right", "channel": 1},
+    }[head]
+
+
+def _default_source_graph(ace_count: int) -> dict[str, Any]:
+    heads: dict[str, Any] = {}
+    sources: dict[str, Any] = {}
+    edges: list[dict[str, Any]] = []
+    for head in range(4):
+        heads[f"head:{head}"] = {
+            "index": head,
+            "enabled": True,
+            "label": f"T{head}",
+            "native_channel": _native_channel(head),
+        }
+        sources[f"native:{head}"] = {
+            "kind": "native_feeder",
+            "head": head,
+            "label": f"Native T{head}",
+            "material": "",
+            "brand": "",
+            "subtype": "",
+            "color": "",
+            "ready": False,
+            "execution_profile": "u1_native_feeder",
+        }
+        edges.append({
+            "source": f"native:{head}",
+            "head": f"head:{head}",
+            "enabled": True,
+            "priority": 10,
+        })
+    for ace in range(max(1, min(8, ace_count))):
+        for slot in range(4):
+            sources[f"ace:{ace}:{slot}"] = {
+                "kind": "ace_slot",
+                "ace": ace,
+                "slot": slot,
+                "label": f"ACE {ace + 1} Slot {slot + 1}",
+                "material": "",
+                "brand": "",
+                "subtype": "",
+                "color": "",
+                "ready": False,
+                "execution_profile": "ace_v1_slot",
+            }
+    return {
+        "version": 1,
+        "heads": heads,
+        "sources": sources,
+        "edges": edges,
+        "profiles": {
+            "ace_v1_slot": {
+                "kind": "ace_slot",
+                "capabilities": {
+                    "can_preload": True,
+                    "can_swap_in_print": True,
+                    "requires_source_tracking": True,
+                },
+            },
+            "u1_native_feeder": {
+                "kind": "native_feeder",
+                "capabilities": {
+                    "can_preload": False,
+                    "can_swap_in_print": False,
+                    "requires_source_tracking": False,
+                },
+            },
+        },
+    }
+
+
+def _write_source_graph_from_route(state: dict[str, Any]) -> None:
+    ace_count = int(state["ace"].get("device_count", 1) or 1)
+    graph = _default_source_graph(ace_count)
+    route = state["ace"].get("route", {}) or {}
+    ace_targets = route.get("ace_targets", {}) or {}
+    slot_targets = route.get("slot_targets", {}) or {}
+    for ace in range(ace_count):
+        ace_target = ace_targets.get(str(ace), ace_targets.get(ace))
+        for slot in range(4):
+            slot_target = slot_targets.get(str(slot), slot_targets.get(slot))
+            head = slot_target if slot_target is not None else ace_target
+            try:
+                head_i = int(head)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= head_i < 4:
+                continue
+            graph["edges"].append({
+                "source": f"ace:{ace}:{slot}",
+                "head": f"head:{head_i}",
+                "enabled": True,
+                "priority": 50,
+                "constraints": {
+                    "requires_empty_head_before_load": True,
+                    "allows_preload_while_other_head_prints": True,
+                },
+            })
+    SOURCE_GRAPH_PATH.write_text(
+        json.dumps(graph, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _read_ace_cfg() -> dict[str, str]:
@@ -577,6 +689,7 @@ async def uploaded_file(name: str) -> JSONResponse:
 async def reset() -> dict[str, Any]:
     state = _default_state()
     _apply_cfg_route(state)
+    _write_source_graph_from_route(state)
     _save_state(state)
     if GCODE_LOG.exists():
         GCODE_LOG.unlink()
@@ -614,6 +727,7 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
             f"ace{ace_idx}_head: {'none' if target is None else int(target)}")
     CFG_PATH.write_text("\n".join(cfg_lines) + "\n", encoding="utf-8")
     _apply_cfg_route(state)
+    _write_source_graph_from_route(state)
 
     for h in range(4):
         _set_head_empty(state, h)

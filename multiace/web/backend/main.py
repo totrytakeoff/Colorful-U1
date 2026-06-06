@@ -28,6 +28,11 @@ from typing import Any
 
 import websockets
 
+try:
+    from . import source_graph as sg
+except ImportError:
+    import source_graph as sg
+
 _trace = logging.getLogger("multiace")
 _trace.setLevel(logging.INFO)
 if not _trace.handlers:
@@ -62,6 +67,10 @@ NATIVE_OVERRIDE_FILE = os.environ.get(
 MATERIALS_FILE = os.environ.get(
     "MULTIACE_MATERIALS_FILE",
     "/home/lava/printer_data/config/extended/multiace/materials.json",
+)
+MULTIACE_SOURCE_GRAPH_PATH = os.environ.get(
+    "MULTIACE_SOURCE_GRAPH_PATH",
+    "/home/lava/printer_data/config/extended/multiace/source_graph.json",
 )
 DEFAULT_MATERIALS = [
     "PLA", "PLA+", "PLA-CF",
@@ -592,6 +601,9 @@ class ConfigUpdate(BaseModel):
     content: str
     restart_klipper: bool = False
 
+class SourceGraphUpdate(BaseModel):
+    graph: dict[str, Any]
+
 EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
 EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
 OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
@@ -848,6 +860,7 @@ async def version() -> dict:
         "web": VERSION,
         "moonraker_url": MOONRAKER_URL,
         "config_path": MULTIACE_CFG_PATH,
+        "source_graph_path": MULTIACE_SOURCE_GRAPH_PATH,
         "frontend_dir": FRONTEND_DIR,
         "printer": printer,
     }
@@ -925,49 +938,28 @@ def _live_slots_from_parsed(parsed: dict) -> list[dict]:
             })
     return out
 
+def _ace_count_from_parsed(parsed: dict) -> int:
+    try:
+        return max(1, len(parsed.get("aces", []) or []))
+    except Exception:
+        return 1
+
+def _load_source_graph(parsed: dict | None = None) -> tuple[dict, dict]:
+    return sg.load_graph(
+        MULTIACE_SOURCE_GRAPH_PATH,
+        ace_count=_ace_count_from_parsed(parsed or {}),
+        parsed=parsed,
+    )
+
 def _live_loadout_from_parsed(parsed: dict, pp=None) -> list[dict]:
-    out = []
-    for t in parsed.get("toolheads", []) or []:
-        try:
-            head = int(t.get("idx"))
-        except (TypeError, ValueError):
-            continue
-        if t.get("mode") != "native":
-            continue
-        color = (t.get("color") or "").strip().lower()
-        out.append({
-            "kind": "native",
-            "key": "native:%d" % head,
-            "head": head,
-            "material": t.get("material") or "",
-            "color": color,
-            "name": pp.approx_color_name(color) if (pp and color) else "",
-            "ready": bool(t.get("filament_detected")
-                          and t.get("filament_at_extruder")
-                          and t.get("channel_error") in (None, "", "ok")
-                          and str(t.get("channel_state") or "") in (
-                              "load_finish", "preload_finish")),
-            "state": t.get("channel_state") or "",
-        })
-    for s in _live_slots_from_parsed(parsed):
-        color = (s.get("color") or "").strip().lower()
-        head = s.get("target_head")
-        if head is None or head == "":
-            continue
-        out.append({
-            "kind": "ace",
-            "key": "ace:%d:%d:%d" % (
-                int(head), int(s.get("ace")), int(s.get("slot"))),
-            "head": head,
-            "ace": s.get("ace"),
-            "slot": s.get("slot"),
-            "material": s.get("material") or "",
-            "color": color,
-            "name": pp.approx_color_name(color) if (pp and color) else "",
-            "ready": True,
-            "state": "ready",
-        })
-    return out
+    graph, meta = _load_source_graph(parsed)
+    if meta.get("errors"):
+        raise HTTPException(
+            status_code=409,
+            detail="source graph invalid: " + "; ".join(meta.get("errors") or []),
+        )
+    color_name_fn = pp.approx_color_name if pp else None
+    return sg.live_loadout(graph, parsed, color_name_fn=color_name_fn)
 
 def _slot_to_dict(s: dict | None) -> dict | None:
     if s is None:
@@ -987,6 +979,8 @@ def _target_to_dict(target: dict | None) -> dict | None:
         "kind": target.get("kind"),
         "head": target.get("head"),
     }
+    if target.get("source"):
+        out["source"] = target.get("source")
     if target.get("kind") == "ace":
         out["ace"] = target.get("ace")
         out["slot"] = target.get("slot")
@@ -1048,13 +1042,19 @@ def _candidate_target_key(target: dict) -> str:
 
 def _target_from_loadout_item(item: dict) -> dict:
     if item.get("kind") == "native":
-        return {"kind": "native", "head": int(item.get("head"))}
-    return {
+        out = {"kind": "native", "head": int(item.get("head"))}
+        if item.get("source"):
+            out["source"] = item.get("source")
+        return out
+    out = {
         "kind": "ace",
         "head": int(item.get("head")),
         "ace": int(item.get("ace")),
         "slot": int(item.get("slot")),
     }
+    if item.get("source"):
+        out["source"] = item.get("source")
+    return out
 
 def _target_key_from_request(target: Any) -> str | None:
     if not isinstance(target, dict):
@@ -1311,6 +1311,7 @@ def _build_preflight_source_map(
         used_tools: set[int],
         events: list[int] | tuple[int, ...] | None = None,
 ) -> dict:
+    graph, graph_meta = _load_source_graph(parsed)
     route = parsed.get("route", {}) or {}
     events_list = list(events or [])
     entries = []
@@ -1331,6 +1332,13 @@ def _build_preflight_source_map(
         "token": token,
         "filename": filename,
         "created_at": time.time(),
+        "source_graph": {
+            "hash": graph_meta.get("hash"),
+            "source": graph_meta.get("source"),
+            "path": graph_meta.get("path"),
+            "errors": graph_meta.get("errors", []),
+            "warnings": graph_meta.get("warnings", []),
+        },
         "route": {
             "mode": route.get("mode"),
             "primary_head": route.get("primary_head"),
@@ -1400,6 +1408,51 @@ def _load_preflight_source_map(token: str) -> dict:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+def _route_plan_from_source_map(source_map: dict) -> dict:
+    graph_meta = source_map.get("source_graph") or {}
+    events = []
+    for idx, entry in enumerate(source_map.get("entries") or []):
+        target = entry.get("target") or {}
+        source = target.get("source")
+        head = target.get("head")
+        commands = entry.get("commands") or _target_command_preview(target)
+        action = "select"
+        if target.get("kind") == "ace":
+            action = "swap"
+        elif target.get("kind") == "native" and len(commands) > 1:
+            action = "load"
+        events.append({
+            "index": idx,
+            "slicer_tool": entry.get("slicer_tool"),
+            "source": source,
+            "head": None if head is None else f"head:{head}",
+            "action": action,
+            "commands": commands,
+            "target": target,
+        })
+    tool_map = {}
+    for entry in source_map.get("entries") or []:
+        target = entry.get("target") or {}
+        tool = entry.get("slicer_tool")
+        if tool is None:
+            continue
+        head = target.get("head")
+        tool_map[str(tool)] = {
+            "source": target.get("source"),
+            "head": None if head is None else f"head:{head}",
+            "target": target,
+        }
+    return {
+        "version": 1,
+        "token": source_map.get("token"),
+        "filename": source_map.get("filename"),
+        "created_at": source_map.get("created_at"),
+        "source_graph_hash": graph_meta.get("hash"),
+        "tool_map": tool_map,
+        "events": events,
+        "stats": source_map.get("swap_stats") or {},
+    }
 
 def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
     colors: dict[int, str] = {}
@@ -1472,88 +1525,33 @@ def _used_tools_for_preflight(used: set[int], slicer_colors: dict,
 
 def _build_mixed_resolver(parsed: dict, slicer_colors: dict,
                           slicer_types: dict, used_tools: set[int]) -> dict:
-    """Resolve slicer tools to either native heads or ACE slots.
+    """Resolve slicer tools to source graph route targets.
 
-    MVP policy is deliberately conservative: only exact material/color,
-    exact color, or exact material matches are accepted. Native heads are
-    candidates only when configured as native and filament is detected.
-    ACE slots are candidates only when their target head is configured
-    as ACE.
+    This intentionally no longer builds candidates directly from the legacy
+    head_mode / aceN_head route status. The only accepted print candidates are
+    enabled source graph edges whose runtime source is ready.
     """
-    aces = parsed.get("aces", []) or []
-    toolheads = parsed.get("toolheads", []) or []
-    th_by_idx = {int(t.get("idx")): t for t in toolheads
-                 if t.get("idx") is not None}
-    route = parsed.get("route", {}) or {}
-    head_modes = route.get("head_modes", {}) or {}
-    ace_targets = route.get("ace_targets", {}) or {}
-
-    def _head_mode(head: int) -> str:
-        th = th_by_idx.get(head) or {}
-        mode = th.get("mode")
-        if mode in ("native", "ace"):
-            return mode
-        raw = head_modes.get(str(head), head_modes.get(head))
-        return raw if raw in ("native", "ace") else "native"
-
-    ace_head_for_ace: dict[int, int] = {}
-    for k, v in (ace_targets or {}).items():
-        if v is None or v == "":
-            continue
-        try:
-            ace_head_for_ace[int(k)] = int(v)
-        except (TypeError, ValueError):
-            continue
-
     candidates: list[dict] = []
-    for th in toolheads:
-        try:
-            head = int(th.get("idx"))
-        except (TypeError, ValueError):
+    for item in _live_loadout_from_parsed(parsed):
+        if item.get("ready") is False:
             continue
-        if _head_mode(head) != "native":
-            continue
-        if (not th.get("filament_detected")
-                or not th.get("filament_at_extruder")
-                or th.get("channel_error") not in (None, "", "ok")
-                or str(th.get("channel_state") or "") not in (
-                    "load_finish", "preload_finish")):
-            continue
-        candidates.append({
-            "kind": "native",
-            "head": head,
-            "material": th.get("material") or "",
-            "color": th.get("color") or "",
-        })
-
-    for ace in aces:
-        try:
-            ace_idx = int(ace.get("idx"))
-        except (TypeError, ValueError):
-            continue
-        for slot in ace.get("slots", []) or []:
-            if slot.get("state") == "empty":
-                continue
-            try:
-                slot_idx = int(slot.get("idx"))
-            except (TypeError, ValueError):
-                continue
-            head = slot.get("target_head")
-            if head is None or head == "":
-                head = ace_head_for_ace.get(ace_idx)
-            try:
-                head = int(head)
-            except (TypeError, ValueError):
-                continue
-            if _head_mode(head) != "ace":
-                continue
+        if item.get("kind") == "native":
+            candidates.append({
+                "kind": "native",
+                "source": item.get("source"),
+                "head": int(item.get("head")),
+                "material": item.get("material") or "",
+                "color": item.get("color") or "",
+            })
+        elif item.get("kind") == "ace":
             candidates.append({
                 "kind": "ace",
-                "head": head,
-                "ace": ace_idx,
-                "slot": slot_idx,
-                "material": slot.get("material") or "",
-                "color": slot.get("color") or "",
+                "source": item.get("source"),
+                "head": int(item.get("head")),
+                "ace": int(item.get("ace")),
+                "slot": int(item.get("slot")),
+                "material": item.get("material") or "",
+                "color": item.get("color") or "",
             })
 
     resolver_candidates = []
@@ -1958,6 +1956,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         "resolve_candidates": resolver.get("candidates", []),
         "tool_targets": tool_targets,
         "source_map": source_map,
+        "route_plan": _route_plan_from_source_map(source_map),
         "plans": {},
     }
     if not missing_mats and not resolver.get("errors"):
@@ -2047,6 +2046,22 @@ def _load_preflight_targets(token: str) -> dict:
         return {}
     return data if isinstance(data, dict) else {}
 
+def _ace_targets_from_tool_targets(tool_targets: dict) -> dict[int, int]:
+    ace_targets: dict[int, int] = {}
+    for target in (tool_targets or {}).values():
+        if not isinstance(target, dict) or target.get("kind") != "ace":
+            continue
+        try:
+            ace = int(target.get("ace"))
+            head = int(target.get("head"))
+        except (TypeError, ValueError):
+            continue
+        if ace in ace_targets and ace_targets[ace] != head:
+            raise RuntimeError(
+                "source graph maps ACE %d to multiple heads in one print plan" % ace)
+        ace_targets[ace] = head
+    return ace_targets
+
 async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                                   safe_name: str,
                                   set_prefs: bool = False) -> None:
@@ -2107,7 +2122,6 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             raise RuntimeError(
                 "; ".join(_load_failed_message(t) for t in failed))
         live_slots = _live_slots_from_parsed(parsed)
-        ace_targets = pp._route_ace_targets_from_slots(live_slots)
         num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
         if mode == "slicer":
             if tool_targets:
@@ -2119,18 +2133,8 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                         + ", ".join("T%d" % t for t in missing_targets))
                 remap = {}
             else:
-                missing_mats = pp.check_material_availability(
-                    slicer_types, live_slots)
-                if missing_mats:
-                    raise RuntimeError(
-                        "required material(s) not loaded: "
-                        + ", ".join(missing_mats))
-                remap, _info, _ = pp.match_colors_to_slots(
-                    slicer_colors, live_slots, num_heads=4,
-                    filament_types=slicer_types,
-                    strict_color=False,
-                    fuzzy_max_distance=_PREFLIGHT_FUZZY,
-                )
+                raise RuntimeError(
+                    "preflight target mapping missing; run source graph preflight again")
         else:
             raise RuntimeError(
                 "optimize/layer print modes are disabled for the "
@@ -2166,6 +2170,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         nxt = tmp_b
 
         _set_stage(state, "rewrite", 45.0)
+        ace_targets = _ace_targets_from_tool_targets(tool_targets)
         await asyncio.to_thread(
             pp.rewrite_to_file,
             str(cur), str(nxt),
@@ -2325,6 +2330,15 @@ async def preflight_source_map(token: str) -> dict:
     if not source_map:
         raise HTTPException(status_code=404, detail="source map not found")
     return source_map
+
+@app.get("/api/preflight/route-plan")
+async def preflight_route_plan(token: str) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    source_map = _load_preflight_source_map(token)
+    if not source_map:
+        raise HTTPException(status_code=404, detail="source map not found")
+    return _route_plan_from_source_map(source_map)
 
 _cfg_scalar_cache: dict = {"mtime": 0.0, "values": {}}
 
@@ -2552,6 +2566,43 @@ async def get_state() -> dict:
     except httpx.HTTPError as e:
         return {"error": f"moonraker: {e}"}
     return _parse_state(status)
+
+@app.get("/api/source-graph")
+async def get_source_graph() -> dict:
+    """Return the configured source graph plus validation metadata."""
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    return {
+        "graph": graph,
+        "meta": meta,
+    }
+
+@app.post("/api/source-graph")
+async def update_source_graph(payload: SourceGraphUpdate) -> dict:
+    """Persist a source graph without restarting Klipper or moving hardware."""
+    try:
+        meta = sg.save_graph(MULTIACE_SOURCE_GRAPH_PATH, payload.graph)
+    except sg.SourceGraphError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "meta": meta,
+    }
+
+@app.get("/api/source-state")
+async def get_source_state() -> dict:
+    """Return runtime source/head state interpreted through the source graph."""
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    state = sg.source_state(graph, parsed)
+    state["meta"] = meta
+    return state
 
 @app.get("/api/aces")
 async def list_aces() -> dict:
