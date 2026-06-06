@@ -48,16 +48,19 @@ Phase 4: 切片软件集成
   topology 修改和提交。
 - Docker dry-run 增加 `regression_preflight.py`，覆盖 mixed preflight、
   source map、发送打印和最终上传 G-code 校验。
+- 2026-06-06：Docker dry-run 增加场景切换接口，回归扩展为多用例：
+  native-only、single ACE head、native + one ACE head、unmapped slicer tool、
+  duplicate manual target 和 wrong `FEED_AUTO` channel。
 
 ### 必做项
 
 1. 固化 dry-run 回归测试：
-   - native-only。
-   - single ACE head。
-   - native + one ACE head。
-   - unmapped slicer tool。
-   - duplicate manual target。
-   - wrong `FEED_AUTO` channel。
+   - native-only。已覆盖。
+   - single ACE head。已覆盖。
+   - native + one ACE head。已覆盖。
+   - unmapped slicer tool。已覆盖。
+   - duplicate manual target。已覆盖。
+   - wrong `FEED_AUTO` channel。已覆盖。
    - stale `head_source`。
 
 2. 保存 preflight source map：

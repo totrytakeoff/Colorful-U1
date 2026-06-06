@@ -419,6 +419,29 @@ def _apply_script(script: str) -> None:
 class ScriptPayload(BaseModel):
     script: str
 
+class DryRunNativeHead(BaseModel):
+    head: int
+    material: str = "PLA"
+    color: str = "#ffffff"
+    vendor: str = "DryRunNative"
+    subtype: str = "Basic"
+    loaded: bool = True
+
+class DryRunSlot(BaseModel):
+    ace: int = 0
+    slot: int
+    material: str = "PLA"
+    color: str = "#ffffff"
+    brand: str = "DryRunACE"
+    status: str = "ready"
+
+class DryRunScenario(BaseModel):
+    ace_device_count: int = 1
+    head_modes: dict[str, str] | None = None
+    ace_targets: dict[str, int | None] | None = None
+    native_heads: list[DryRunNativeHead] = []
+    slots: list[DryRunSlot] = []
+
 
 @app.get("/server/info")
 async def server_info() -> dict[str, Any]:
@@ -530,6 +553,83 @@ async def reset() -> dict[str, Any]:
     for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
         if p.exists():
             p.unlink()
+    if UPLOAD_DIR.exists():
+        for p in UPLOAD_DIR.iterdir():
+            if p.is_file():
+                p.unlink()
+    return {"ok": True, "state": state}
+
+
+@app.post("/dry-run/scenario")
+async def scenario(payload: DryRunScenario) -> dict[str, Any]:
+    state = _default_state()
+    cfg_lines = [
+        "[save_variables]",
+        "filename: /data/ace_vars.cfg",
+        "[ace]",
+        f"ace_device_count: {max(1, min(8, payload.ace_device_count))}",
+    ]
+    head_modes = payload.head_modes or {
+        "0": "ace", "1": "native", "2": "native", "3": "native",
+    }
+    for head in range(4):
+        mode = str(head_modes.get(str(head), head_modes.get(head, "native"))).lower()
+        if mode not in ("ace", "native"):
+            mode = "native"
+        cfg_lines.append(f"head{head}_mode: {mode}")
+    ace_targets = payload.ace_targets or {"0": 0}
+    for ace_idx in range(max(1, min(8, payload.ace_device_count))):
+        target = ace_targets.get(str(ace_idx), ace_targets.get(ace_idx))
+        cfg_lines.append(
+            f"ace{ace_idx}_head: {'none' if target is None else int(target)}")
+    CFG_PATH.write_text("\n".join(cfg_lines) + "\n", encoding="utf-8")
+    _apply_cfg_route(state)
+
+    for h in range(4):
+        _set_head_empty(state, h)
+        state["print_task_config"]["filament_vendor"][h] = "NONE"
+        state["print_task_config"]["filament_type"][h] = "NONE"
+        state["print_task_config"]["filament_sub_type"][h] = "NONE"
+        state["print_task_config"]["filament_color_rgba"][h] = "FFFFFFFF"
+
+    for native in payload.native_heads:
+        head = int(native.head)
+        if head < 0 or head >= 4:
+            raise HTTPException(status_code=400, detail=f"invalid native head {head}")
+        if native.loaded:
+            _set_native_head_loaded(state, head)
+        else:
+            _set_head_empty(state, head)
+        rgba = native.color.strip().lstrip("#")[:6].upper() or "FFFFFF"
+        state["print_task_config"]["filament_vendor"][head] = native.vendor
+        state["print_task_config"]["filament_type"][head] = native.material
+        state["print_task_config"]["filament_sub_type"][head] = native.subtype
+        state["print_task_config"]["filament_color_rgba"][head] = rgba + "FF"
+
+    for item in payload.slots:
+        ace = int(item.ace)
+        slot = int(item.slot)
+        if ace < 0 or ace >= len(state["ace"]["aces"]) or slot < 0 or slot >= 4:
+            raise HTTPException(status_code=400, detail=f"invalid ACE slot {ace}/{slot}")
+        c = item.color.strip().lstrip("#")[:6]
+        rgb = [int(c[i:i + 2], 16) for i in (0, 2, 4)] if len(c) == 6 else [255, 255, 255]
+        state["ace"]["aces"][ace]["slots"][slot].update({
+            "status": item.status,
+            "type": item.material,
+            "material": item.material,
+            "brand": item.brand,
+            "color": rgb,
+            "rfid": 0 if item.status == "empty" else 2,
+        })
+        state["ace"]["aces"][ace]["gate_status"][slot] = (
+            0 if item.status == "empty" else 1)
+
+    _save_state(state)
+    for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
+        if p.exists():
+            p.unlink()
+    if GCODE_LOG.exists():
+        GCODE_LOG.unlink()
     if UPLOAD_DIR.exists():
         for p in UPLOAD_DIR.iterdir():
             if p.is_file():
