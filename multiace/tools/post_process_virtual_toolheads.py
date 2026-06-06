@@ -158,6 +158,20 @@ def _route_plan_event_cursor(route_plan=None):
 def _commands_from_route_event(event):
     if not isinstance(event, dict):
         return []
+    steps = event.get('steps') or []
+    if isinstance(steps, list):
+        out = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            cmd = step.get('command')
+            if cmd is None:
+                continue
+            s = str(cmd).strip()
+            if s:
+                out.append(s)
+        if out:
+            return out
     commands = event.get('commands') or []
     if not isinstance(commands, list):
         return []

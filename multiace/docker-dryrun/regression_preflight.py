@@ -272,6 +272,15 @@ def assert_route_plan_shape(report: dict) -> None:
                     f"route event edge head mismatch: {event}")
         assert_true("source_changed" in event,
                     f"route event missing source_changed: {event}")
+        steps = event.get("steps") or []
+        assert_true(steps, f"route event missing structured steps: {event}")
+        step_commands = [
+            step.get("command")
+            for step in steps
+            if isinstance(step, dict) and step.get("command")
+        ]
+        assert_true(step_commands == event.get("commands"),
+                    f"route event commands should mirror steps: {event}")
         assert_true(event.get("commands"), f"route event missing commands: {event}")
 
 
@@ -644,7 +653,10 @@ def test_route_plan_only_rewrite() -> None:
                 "slicer_tool": 0,
                 "source": "native:1",
                 "head": "head:1",
-                "commands": ["T1", "M117 ROUTE_EVENT_T0"],
+                "steps": [
+                    {"kind": "select_head", "head": "head:1", "command": "T1"},
+                    {"kind": "notify", "command": "M117 ROUTE_EVENT_T0"},
+                ],
                 "target": {
                     "kind": "native", "head": 1, "source": "native:1",
                 },
@@ -655,10 +667,17 @@ def test_route_plan_only_rewrite() -> None:
                 "slicer_tool": 1,
                 "source": "ace:0:1",
                 "head": "head:0",
-                "commands": [
-                    "T0",
-                    "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
-                    "M117 ROUTE_EVENT_T1",
+                "steps": [
+                    {"kind": "select_head", "head": "head:0", "command": "T0"},
+                    {
+                        "kind": "swap_source",
+                        "source": "ace:0:1",
+                        "head": "head:0",
+                        "ace": 0,
+                        "slot": 1,
+                        "command": "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+                    },
+                    {"kind": "notify", "command": "M117 ROUTE_EVENT_T1"},
                 ],
                 "target": {
                     "kind": "ace", "head": 0, "source": "ace:0:1",

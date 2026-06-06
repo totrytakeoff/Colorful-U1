@@ -1477,6 +1477,36 @@ def _route_plan_target_entry(target: dict | None) -> dict:
         "target": target,
     }
 
+def _route_plan_steps(target: dict | None, source_changed: bool) -> list[dict]:
+    target = target or {}
+    if not target:
+        return []
+    steps = []
+    try:
+        head = int(target.get("head"))
+    except (TypeError, ValueError):
+        return steps
+    steps.append({
+        "kind": "select_head",
+        "head": f"head:{head}",
+        "command": f"T{head}",
+    })
+    if target.get("kind") == "ace" and source_changed:
+        try:
+            ace = int(target.get("ace"))
+            slot = int(target.get("slot"))
+        except (TypeError, ValueError):
+            return steps
+        steps.append({
+            "kind": "swap_source",
+            "source": target.get("source"),
+            "head": f"head:{head}",
+            "ace": ace,
+            "slot": slot,
+            "command": f"ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}",
+        })
+    return steps
+
 def _route_plan_event(
         *,
         index: int,
@@ -1486,7 +1516,6 @@ def _route_plan_event(
 ) -> dict:
     target = target or {}
     entry = _route_plan_target_entry(target)
-    commands = _target_command_preview(target)
     if not target:
         action = "unmapped"
     elif target.get("kind") == "ace":
@@ -1495,6 +1524,8 @@ def _route_plan_event(
         action = "select"
     else:
         action = "select_loaded"
+    steps = _route_plan_steps(target, source_changed)
+    commands = [step.get("command") for step in steps if step.get("command")]
     return {
         "index": index,
         "event_type": "tool_select",
@@ -1505,6 +1536,7 @@ def _route_plan_event(
         "execution_profile": entry.get("execution_profile"),
         "action": action,
         "source_changed": bool(source_changed),
+        "steps": steps,
         "commands": commands,
         "target": target,
     }
