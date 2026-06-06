@@ -1695,6 +1695,7 @@ def _build_route_plan(
         used_tools: set[int],
         events: list[int] | tuple[int, ...] | None,
         profiles: dict | None = None,
+        initial_state: dict | None = None,
         stats: dict | None = None,
         created_at: float | None = None,
 ) -> dict:
@@ -1752,6 +1753,7 @@ def _build_route_plan(
             "errors": graph_meta.get("errors", []),
             "warnings": graph_meta.get("warnings", []),
         },
+        "initial_state": initial_state or {},
         "used_tools": sorted(used_tools),
         "tool_map": tool_map,
         "events": route_events,
@@ -1816,6 +1818,35 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
             % (plan_hash, graph_hash))
     if meta.get("errors"):
         errors.append("source graph invalid: " + "; ".join(meta.get("errors") or []))
+    initial_state = route_plan.get("initial_state") or {}
+    if initial_state:
+        if not isinstance(initial_state, dict):
+            errors.append("route plan initial_state must be an object")
+            initial_state = {}
+        elif initial_state.get("source_graph_hash") not in (None, graph_hash):
+            errors.append(
+                "route plan initial_state graph hash mismatch: initial=%s current=%s"
+                % (initial_state.get("source_graph_hash"), graph_hash))
+        heads_state = initial_state.get("heads") or {}
+        if heads_state and not isinstance(heads_state, dict):
+            errors.append("route plan initial_state.heads must be an object")
+        elif isinstance(heads_state, dict):
+            for head_id, state in heads_state.items():
+                if head_id not in (graph.get("heads") or {}):
+                    errors.append(
+                        "route plan initial_state references unknown head %r"
+                        % head_id)
+                    continue
+                if not isinstance(state, dict):
+                    errors.append(
+                        "route plan initial_state[%s] must be an object"
+                        % head_id)
+                    continue
+                current = state.get("current_source")
+                if current and current not in (graph.get("sources") or {}):
+                    errors.append(
+                        "route plan initial_state[%s] references unknown source %r"
+                        % (head_id, current))
 
     sources = graph.get("sources") or {}
     heads = graph.get("heads") or {}
@@ -2352,6 +2383,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         used_tools=used_tools,
         events=events,
         profiles=(graph.get("profiles") or {}),
+        initial_state=sg.source_state(graph, parsed),
         stats=source_map.get("swap_stats") or {},
         created_at=source_map.get("created_at"),
     )
@@ -2760,6 +2792,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             used_tools=used_tools,
             events=_load_preflight_events(req.token),
             profiles=(graph.get("profiles") or {}),
+            initial_state=sg.source_state(graph, parsed),
             stats=source_map.get("swap_stats") or {},
             created_at=source_map.get("created_at"),
         )
@@ -3242,6 +3275,7 @@ async def preview_source_actions(payload: SourceActionPreviewBatch) -> dict:
             "errors": meta.get("errors", []),
             "warnings": meta.get("warnings", []),
         },
+        "initial_state": sg.source_state(graph, parsed),
         "events": events,
         "commands": commands,
     }

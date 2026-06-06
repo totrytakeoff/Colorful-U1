@@ -257,6 +257,19 @@ def assert_route_plan_shape(report: dict) -> None:
                 f"route plan should use v2 schema: {route_plan}")
     assert_true(route_plan.get("source_graph_hash") == graph_meta.get("hash"),
                 f"route plan graph hash mismatch: {route_plan}")
+    initial_state = route_plan.get("initial_state") or {}
+    assert_true(initial_state.get("source_graph_hash") == route_plan.get("source_graph_hash"),
+                f"route plan initial state graph hash mismatch: {route_plan}")
+    heads = initial_state.get("heads") or {}
+    assert_true(set(heads.keys()) >= {"head:0", "head:1", "head:2", "head:3"},
+                f"route plan initial state missing heads: {route_plan}")
+    for head_id, state in heads.items():
+        assert_true(state.get("head") == head_id,
+                    f"initial state head id mismatch: {state}")
+        assert_true("current_source" in state,
+                    f"initial state missing current source: {state}")
+        assert_true(state.get("source_confidence"),
+                    f"initial state missing confidence: {state}")
     events = route_plan.get("events") or []
     assert_true(events, f"route plan missing events: {route_plan}")
     for event in events:
@@ -651,6 +664,9 @@ def test_source_action_profile_preview() -> None:
     route_plan = batch.get("route_plan") or {}
     assert_true(route_plan.get("version") == 2,
                 f"source action batch should return route plan v2: {batch}")
+    assert_true((route_plan.get("initial_state") or {}).get("source_graph_hash")
+                == route_plan.get("source_graph_hash"),
+                f"source action batch should include initial state: {batch}")
     events = route_plan.get("events") or []
     assert_true([e.get("event_type") for e in events] == [
         "source_action", "source_action", "source_action"],
