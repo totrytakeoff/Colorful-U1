@@ -1178,6 +1178,128 @@ def _build_swap_stats(events: list[int] | tuple[int, ...],
         "events_sample": sample,
     }
 
+def _build_fewer_swaps_suggestion(
+        parsed: dict,
+        slicer_colors: dict[int, str],
+        slicer_types: dict[int, str],
+        used_tools: set[int],
+        events: list[int],
+        current_tool_targets: dict[str, dict],
+) -> dict:
+    current_stats = _build_swap_stats(events, current_tool_targets)
+    loadout = [
+        item for item in _live_loadout_from_parsed(parsed)
+        if item.get("ready") is not False
+    ]
+    if not used_tools or not loadout:
+        return {
+            "feasible": False,
+            "reason": "no tools or no ready loadout",
+            "current": current_stats,
+        }
+
+    tool_counts = current_stats.get("tool_counts", {}) or {}
+    candidates_by_tool: dict[int, list[dict]] = {}
+    for t in sorted(used_tools):
+        want_mat = _norm_material(slicer_types.get(t))
+        want_color = _norm_color_hex(slicer_colors.get(t))
+        rows = []
+        for order, item in enumerate(loadout):
+            score = _candidate_score(
+                want_mat,
+                want_color,
+                _norm_material(item.get("material")),
+                _norm_color_hex(item.get("color")),
+            )
+            if score is None:
+                continue
+            rank, dist, tier = score
+            target = _target_from_loadout_item(item)
+            rows.append({
+                "key": item.get("key"),
+                "target": target,
+                "tier": tier,
+                "rank": rank,
+                "distance": float(dist),
+                "order": order,
+                "kind_bias": 0 if item.get("kind") == "native" else 1,
+            })
+        if not rows:
+            return {
+                "feasible": False,
+                "reason": f"T{t}: no matching ready target",
+                "current": current_stats,
+            }
+        rows.sort(key=lambda r: (
+            r["rank"], r["distance"], r["kind_bias"],
+            _target_key_from_request(r["target"]) or "", r["order"]))
+        candidates_by_tool[t] = rows[:8]
+
+    order = sorted(
+        used_tools,
+        key=lambda t: (
+            -int(tool_counts.get(str(t), 0) or 0),
+            len(candidates_by_tool.get(t, [])),
+            t,
+        ),
+    )
+
+    beam = [({}, set(), 0, 0.0)]
+    for t in order:
+        expanded = []
+        for assignment, used_keys, rank_sum, dist_sum in beam:
+            for cand in candidates_by_tool[t]:
+                key = cand.get("key")
+                if not key or key in used_keys:
+                    continue
+                nxt = dict(assignment)
+                nxt[str(t)] = cand["target"]
+                nkeys = set(used_keys)
+                nkeys.add(key)
+                expanded.append((
+                    nxt,
+                    nkeys,
+                    rank_sum + int(cand["rank"]),
+                    dist_sum + float(cand["distance"]),
+                ))
+        if not expanded:
+            return {
+                "feasible": False,
+                "reason": "not enough distinct matching targets",
+                "current": current_stats,
+            }
+        expanded.sort(key=lambda row: (
+            _build_swap_stats(events, row[0]).get("active_ace_swaps", 999999),
+            row[2],
+            row[3],
+            json.dumps(row[0], sort_keys=True),
+        ))
+        beam = expanded[:256]
+
+    best = min(
+        beam,
+        key=lambda row: (
+            _build_swap_stats(events, row[0]).get("active_ace_swaps", 999999),
+            row[2],
+            row[3],
+            json.dumps(row[0], sort_keys=True),
+        ),
+    )
+    tool_targets = best[0]
+    suggested_stats = _build_swap_stats(events, tool_targets)
+    current_swaps = int(current_stats.get("active_ace_swaps") or 0)
+    suggested_swaps = int(suggested_stats.get("active_ace_swaps") or 0)
+    saved = max(0, current_swaps - suggested_swaps)
+    return {
+        "feasible": True,
+        "reason": "",
+        "saves_swaps": saved,
+        "improves": suggested_swaps < current_swaps,
+        "current": current_stats,
+        "suggested": suggested_stats,
+        "tool_targets": tool_targets,
+    }
+
 def _build_preflight_source_map(
         *,
         token: str,
@@ -1190,6 +1312,7 @@ def _build_preflight_source_map(
         events: list[int] | tuple[int, ...] | None = None,
 ) -> dict:
     route = parsed.get("route", {}) or {}
+    events_list = list(events or [])
     entries = []
     for t in sorted(used_tools):
         target = tool_targets.get(str(t), tool_targets.get(t))
@@ -1217,7 +1340,15 @@ def _build_preflight_source_map(
         },
         "used_tools": sorted(used_tools),
         "tool_targets": tool_targets,
-        "swap_stats": _build_swap_stats(list(events or []), tool_targets),
+        "swap_stats": _build_swap_stats(events_list, tool_targets),
+        "optimization_suggestion": _build_fewer_swaps_suggestion(
+            parsed,
+            slicer_colors,
+            slicer_types,
+            used_tools,
+            events_list,
+            tool_targets,
+        ),
         "entries": entries,
     }
 

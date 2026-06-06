@@ -110,6 +110,10 @@ Phase 4: 切片软件集成
 - 手动映射发送打印时，后端会基于完整 toolchange events 重新生成最终
   `swap_stats`。
 - Docker dry-run 回归脚本增加 `swap_stats` 校验。
+- 后端开始生成 `optimization_suggestion`，用于估算“少换料映射”相对当前映射
+  可减少的 ACE swap 次数。
+- Web preflight 页面显示少换料建议；默认不改变打印行为，必须由用户显式点击
+  “套用建议”才会写入当前映射表。
 
 ### 2.1 减少换料次数
 

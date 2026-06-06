@@ -222,7 +222,12 @@
       "same_source_skips": "Same-Source-Skips",
       "tool_events": "Tool-Events",
       "swap_time_est": "geschätzte Wechselzeit",
-      "stats_refresh_on_send": "Statistik wird beim Senden aktualisiert"
+      "stats_refresh_on_send": "Statistik wird beim Senden aktualisiert",
+      "fewer_swaps_suggestion": "Weniger-Wechsel-Vorschlag",
+      "apply_suggestion": "Vorschlag übernehmen",
+      "suggestion_applied": "Vorschlag wurde auf das Mapping angewendet.",
+      "saves": "spart",
+      "no_suggestion": "Kein besseres Mapping"
     },
     "queue": {
       "send_all_tooltip": "Alle Queue-Befehle an den Drucker senden (UI darf danach geschlossen werden)",

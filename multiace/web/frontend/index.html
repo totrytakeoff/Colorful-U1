@@ -784,6 +784,31 @@ reboot</pre>
                 {{ t('ui.preflight.stats_refresh_on_send') }}
               </span>
             </div>
+            <div v-if="mode === 'slicer' && optimizationSuggestion()"
+                 class="preflight-optimization">
+              <template v-if="optimizationSuggestion().feasible">
+                <span>
+                  {{ t('ui.preflight.fewer_swaps_suggestion') }}:
+                  <strong>{{ optimizationSuggestion().suggested.active_ace_swaps }}</strong>
+                  {{ t('ui.preflight.ace_swaps_est') }}
+                </span>
+                <span v-if="optimizationSuggestion().saves_swaps > 0"
+                      class="preflight-optimization-save">
+                  {{ t('ui.preflight.saves') }}
+                  <strong>{{ optimizationSuggestion().saves_swaps }}</strong>
+                </span>
+                <button type="button"
+                        class="small"
+                        :disabled="!suggestionCanApply() || preflight.sending !== ''"
+                        @click="applyOptimizationSuggestion">
+                  {{ t('ui.preflight.apply_suggestion') }}
+                </button>
+              </template>
+              <span v-else class="muted small">
+                {{ t('ui.preflight.no_suggestion') }}:
+                {{ optimizationSuggestion().reason || '-' }}
+              </span>
+            </div>
             <table class="preflight-mapping" v-if="preflight.report.plans[mode].mapping.length">
               <thead>
                 <tr>

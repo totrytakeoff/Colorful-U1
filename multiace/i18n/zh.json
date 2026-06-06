@@ -220,7 +220,12 @@
       "same_source_skips": "同源跳过",
       "tool_events": "工具事件",
       "swap_time_est": "预计换料耗时",
-      "stats_refresh_on_send": "发送后刷新统计"
+      "stats_refresh_on_send": "发送后刷新统计",
+      "fewer_swaps_suggestion": "少换料建议",
+      "apply_suggestion": "套用建议",
+      "suggestion_applied": "已将少换料建议套用到映射。",
+      "saves": "可减少",
+      "no_suggestion": "没有更优映射"
     },
     "queue": {
       "send_all_tooltip": "将所有排队命令发送到打印机（之后可以关闭界面）",

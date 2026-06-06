@@ -607,6 +607,27 @@ body { padding-bottom: 64px; }
   border-color: var(--warn, #c4651e);
   background: rgba(196, 101, 30, .12);
 }
+.preflight-optimization {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .45rem .6rem;
+  align-items: center;
+  margin: .25rem 0 .45rem;
+  font-size: .8rem;
+  color: var(--muted);
+}
+.preflight-optimization span {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: .18rem .42rem;
+  background: rgba(30, 88, 140, .16);
+}
+.preflight-optimization strong { color: var(--fg); }
+.preflight-optimization-save {
+  color: var(--ok, #3aa76d);
+  border-color: var(--ok, #3aa76d) !important;
+  background: rgba(58, 167, 109, .12) !important;
+}
 .preflight-mapping { width: 100%; border-collapse: collapse; margin: .4rem 0;
                      font-size: .82rem; }
 .preflight-mapping th { text-align: left; padding: .2rem .4rem;

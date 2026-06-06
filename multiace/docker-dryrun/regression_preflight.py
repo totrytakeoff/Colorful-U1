@@ -97,6 +97,14 @@ def main() -> int:
                 f"unexpected min swap estimate: {stats}")
     assert_true(stats.get("estimated_swap_seconds_max") == 240,
                 f"unexpected max swap estimate: {stats}")
+    suggestion = source_map.get("optimization_suggestion") or {}
+    assert_true("feasible" in suggestion,
+                f"optimization suggestion missing feasibility: {suggestion}")
+    assert_true("current" in suggestion,
+                f"optimization suggestion missing current stats: {suggestion}")
+    if suggestion.get("feasible"):
+        assert_true("suggested" in suggestion and "tool_targets" in suggestion,
+                    f"feasible suggestion missing suggested mapping: {suggestion}")
 
     token = report["token"]
     saved_map = request("GET", f"{WEB}/preflight/source-map?token={token}")

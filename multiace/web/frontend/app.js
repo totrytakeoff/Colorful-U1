@@ -1972,6 +1972,11 @@ createApp({
         color: item.color || "",
       };
     }
+    function loadoutItemForTarget(target) {
+      const key = targetKey(target);
+      if (!key) return null;
+      return (preflight.report?.live_loadout || []).find(item => item.key === key) || null;
+    }
     function commandPreviewForTarget(target) {
       if (!target) return [];
       const head = Number(target.head);
@@ -2024,6 +2029,14 @@ createApp({
     }
     function swapStats() {
       return preflight.report?.source_map?.swap_stats || null;
+    }
+    function optimizationSuggestion() {
+      return preflight.report?.source_map?.optimization_suggestion || null;
+    }
+    function suggestionCanApply() {
+      const s = optimizationSuggestion();
+      return !!(s && s.feasible && s.improves && Number(s.saves_swaps || 0) > 0
+        && s.tool_targets && Object.keys(s.tool_targets).length);
     }
     function formatSecondsRange(minSec, maxSec) {
       const a = Number(minSec || 0);
@@ -2110,6 +2123,36 @@ createApp({
         seen.add(key);
       }
       return (plan.mapping || []).length > 0;
+    }
+    function applyOptimizationSuggestion() {
+      const rep = preflight.report;
+      const plan = rep?.plans?.slicer;
+      const suggestion = optimizationSuggestion();
+      if (!rep || !plan || !suggestionCanApply()) return;
+      rep.tool_targets = {...suggestion.tool_targets};
+      for (const row of plan.mapping || []) {
+        const target = rep.tool_targets[String(row.t)];
+        if (!target) continue;
+        const item = loadoutItemForTarget(target);
+        row.target = target;
+        row.slot = item ? loadoutItemSlot(item) : null;
+        row.tier = "manual";
+        row.distance = null;
+        row.loose_mat = false;
+      }
+      refreshManualPlanState();
+      refreshPreflightSourceMap();
+      rep.source_map.swap_stats = {
+        ...(suggestion.suggested || rep.source_map.swap_stats || {}),
+        mapping_changed: true,
+      };
+      rep.source_map.optimization_suggestion = {
+        ...suggestion,
+        current: suggestion.suggested || suggestion.current,
+        saves_swaps: 0,
+        improves: false,
+      };
+      setMacroLog(t("ui.preflight.suggestion_applied"));
     }
     function sortedMapping(plan) {
       const rows = (plan && plan.mapping) || [];
@@ -2328,7 +2371,8 @@ createApp({
       mappingTargetKind, mappingTargetColor, mappingTargetMaterial,
       mappingTargetValue, setManualMapping, preflightTargetDisabled,
       preflightTargetOptions, formatPreflightTarget, preflightCanPrint,
-      sourceMapEntries, swapStats, formatSecondsRange,
+      sourceMapEntries, swapStats, optimizationSuggestion,
+      suggestionCanApply, applyOptimizationSuggestion, formatSecondsRange,
       updateState, updateCheck, updateApply,
       debugState, debugEnable, debugDisable,
       plugins, refreshPlugins, pluginIframeSrc,

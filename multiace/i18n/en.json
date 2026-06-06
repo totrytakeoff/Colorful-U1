@@ -222,7 +222,12 @@
       "same_source_skips": "same-source skips",
       "tool_events": "tool events",
       "swap_time_est": "swap time estimate",
-      "stats_refresh_on_send": "stats refresh after send"
+      "stats_refresh_on_send": "stats refresh after send",
+      "fewer_swaps_suggestion": "Fewer-swaps suggestion",
+      "apply_suggestion": "Apply suggestion",
+      "suggestion_applied": "Fewer-swaps suggestion applied to the mapping.",
+      "saves": "saves",
+      "no_suggestion": "No better mapping"
     },
     "queue": {
       "send_all_tooltip": "Send all queued commands to the printer (UI can be closed afterwards)",
