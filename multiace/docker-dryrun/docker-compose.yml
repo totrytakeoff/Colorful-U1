@@ -34,6 +34,7 @@ services:
       - dryrun-data:/data
       - ../web/backend:/app/multiace/web/backend:ro
       - ../web/frontend:/app/multiace/web/frontend:ro
+      - ../tools:/app/multiace/tools:ro
       - ../i18n:/app/multiace/i18n:ro
       - ../config/extended/ace.cfg:/app/multiace/config/extended/ace.cfg:ro
     ports:

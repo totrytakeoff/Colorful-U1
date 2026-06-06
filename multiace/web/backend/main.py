@@ -1454,6 +1454,19 @@ def _route_plan_from_source_map(source_map: dict) -> dict:
         "stats": source_map.get("swap_stats") or {},
     }
 
+def _route_plan_targets(route_plan: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    tool_map = route_plan.get("tool_map") or {}
+    if not isinstance(tool_map, dict):
+        return out
+    for tool, item in tool_map.items():
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target")
+        if isinstance(target, dict):
+            out[str(tool)] = target
+    return out
+
 def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
     colors: dict[int, str] = {}
     materials: dict[int, str] = {}
@@ -2070,6 +2083,8 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
     src = _PREFLIGHT_DIR / (token + ".gcode")
     tool_targets = _load_preflight_targets(token)
     source_map = _load_preflight_source_map(token)
+    route_plan = _route_plan_from_source_map(source_map) if source_map else {}
+    route_targets = _route_plan_targets(route_plan)
     if source_map:
         state["source_map"] = source_map
 
@@ -2113,6 +2128,8 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         if used:
             slicer_colors = {t: c for t, c in slicer_colors.items() if t in used}
             slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
+        elif route_targets:
+            used = {int(t) for t in route_targets.keys()}
         elif tool_targets:
             used = {int(t) for t in tool_targets.keys()}
 
@@ -2124,7 +2141,15 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         live_slots = _live_slots_from_parsed(parsed)
         num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
         if mode == "slicer":
-            if tool_targets:
+            if route_targets:
+                missing_targets = sorted(
+                    t for t in used if str(t) not in route_targets)
+                if missing_targets:
+                    raise RuntimeError(
+                        "route plan mapping is incomplete for "
+                        + ", ".join("T%d" % t for t in missing_targets))
+                remap = {}
+            elif tool_targets:
                 missing_targets = sorted(
                     t for t in used if str(t) not in tool_targets)
                 if missing_targets:
@@ -2170,13 +2195,14 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         nxt = tmp_b
 
         _set_stage(state, "rewrite", 45.0)
-        ace_targets = _ace_targets_from_tool_targets(tool_targets)
+        if not route_plan:
+            raise RuntimeError(
+                "route plan missing; run source graph preflight again")
         await asyncio.to_thread(
             pp.rewrite_to_file,
             str(cur), str(nxt),
             _stage_progress(state, 45.0, 30.0),
-            ace_targets,
-            tool_targets,
+            route_plan=route_plan,
         )
         cur, nxt = nxt, cur
 

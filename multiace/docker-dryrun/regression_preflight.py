@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import sys
 import tempfile
 import textwrap
@@ -277,6 +278,15 @@ def uploaded_content(filename: str) -> str:
         f"{MOONRAKER}/dry-run/uploaded/{urllib.parse.quote(filename)}",
     )
     return uploaded.get("content") or ""
+
+
+def load_postprocessor():
+    path = Path(__file__).resolve().parents[1] / "tools" / "post_process_virtual_toolheads.py"
+    spec = importlib.util.spec_from_file_location("multiace_postprocess_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def run_script(script: str, expect_status: int = 200) -> dict:
@@ -590,6 +600,43 @@ def test_source_graph_edge_required_for_ace_swap() -> None:
                 f"ACE swap should require source graph edge: {err}")
 
 
+def test_route_plan_only_rewrite() -> None:
+    pp = load_postprocessor()
+    route_plan = {
+        "version": 1,
+        "tool_map": {
+            "0": {
+                "source": "native:1",
+                "head": "head:1",
+                "target": {"kind": "native", "head": 1, "source": "native:1"},
+            },
+            "1": {
+                "source": "ace:0:1",
+                "head": "head:0",
+                "target": {
+                    "kind": "ace", "head": 0, "source": "ace:0:1",
+                    "ace": 0, "slot": 1,
+                },
+            },
+        },
+    }
+    src = gcode(
+        "PLA;PETG",
+        "#dc2828;#1e78dc",
+        """
+        T0
+        ; Change Tool 0 -> Tool 1
+        T1
+        G1 X10 Y10 E1
+        """,
+    )
+    out, active, _skipped, _swapbacks = pp.rewrite(src, route_plan=route_plan)
+    assert_true("T1" in out, f"route-plan rewrite missing native T1: {out}")
+    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in out,
+                f"route-plan rewrite missing ACE swap: {out}")
+    assert_true(active == 1, f"route-plan rewrite active swap mismatch: {active}")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -601,6 +648,7 @@ def main() -> int:
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,
+        test_route_plan_only_rewrite,
     ]
     for test in tests:
         test()

@@ -69,6 +69,8 @@ def _normalize_tool_targets(tool_targets=None):
         kind = str(v.get('kind') or '').lower()
         if kind == 'native':
             out[t] = {'kind': 'native', 'head': head}
+            if v.get('source'):
+                out[t]['source'] = v.get('source')
             continue
         if kind != 'ace':
             continue
@@ -80,11 +82,55 @@ def _normalize_tool_targets(tool_targets=None):
         if ace < 0 or ace > 15 or slot < 0 or slot > 3:
             continue
         out[t] = {'kind': 'ace', 'head': head, 'ace': ace, 'slot': slot}
+        if v.get('source'):
+            out[t]['source'] = v.get('source')
     return out
 
-def _target_for_tool(t_index, ace_targets=None, tool_targets=None):
-    tool_targets = _normalize_tool_targets(tool_targets)
+def _normalize_route_plan_targets(route_plan=None):
+    """Return {slicer_t: normalized_target} from a route_plan.
+
+    route_plan is the new source-graph rewrite contract. It may be a dict or
+    JSON string and should contain tool_map entries like:
+      "0": {"source": "ace:0:1", "head": "head:3", "target": {...}}
+
+    The existing rewrite implementation still works in terms of normalized
+    native/ACE targets, so this adapter is intentionally narrow.
+    """
+    if not route_plan:
+        return {}
+    if isinstance(route_plan, str):
+        try:
+            route_plan = json.loads(route_plan)
+        except ValueError:
+            return {}
+    if not isinstance(route_plan, dict):
+        return {}
+    raw_targets = {}
+    tool_map = route_plan.get('tool_map') or {}
+    if isinstance(tool_map, dict):
+        for k, v in tool_map.items():
+            if not isinstance(v, dict):
+                continue
+            target = v.get('target') if isinstance(v.get('target'), dict) else v
+            raw_targets[k] = target
+    if not raw_targets:
+        for event in route_plan.get('events') or []:
+            if not isinstance(event, dict):
+                continue
+            t = event.get('slicer_tool')
+            target = event.get('target')
+            if t is None or not isinstance(target, dict):
+                continue
+            raw_targets[str(t)] = target
+    return _normalize_tool_targets(raw_targets)
+
+def _target_for_tool(t_index, ace_targets=None, tool_targets=None,
+                     route_plan=None):
+    route_targets = _normalize_route_plan_targets(route_plan)
     t = int(t_index)
+    if t in route_targets:
+        return route_targets[t]
+    tool_targets = _normalize_tool_targets(tool_targets)
     if t in tool_targets:
         return tool_targets[t]
     head, ace, slot = _route_virtual_tool(t, ace_targets)
@@ -107,9 +153,12 @@ def _initial_marker(head, ace, slot):
     return '; multiACE initial-load HEAD=%d ACE=%d SLOT=%d' % (
         head, ace, slot)
 
-def rewrite(gcode, ace_targets=None, tool_targets=None):
+def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     ace_targets = _normalize_ace_targets(ace_targets)
     tool_targets = _normalize_tool_targets(tool_targets)
+    route_plan_targets = _normalize_route_plan_targets(route_plan)
+    if route_plan_targets:
+        tool_targets = route_plan_targets
 
     def _fix_m104(m):
         return re.sub(r'T(1[0-5]|[0-9])',
@@ -1779,7 +1828,7 @@ def apply_remap_to_file(in_path, out_path, remap, progress=None):
             pass
 
 def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
-                    tool_targets=None):
+                    tool_targets=None, route_plan=None):
     """Streaming equivalent of rewrite(gcode). Same M104/M109 +
     SM_PRINT_PREEXTRUDE_FILAMENT handling, same body T4-T15 expansion
     + ACE_SWAP_HEAD dedupe + swap-back insertion. Returns
@@ -1790,6 +1839,9 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     change_t  = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+')
     ace_targets = _normalize_ace_targets(ace_targets)
     tool_targets = _normalize_tool_targets(tool_targets)
+    route_plan_targets = _normalize_route_plan_targets(route_plan)
+    if route_plan_targets:
+        tool_targets = route_plan_targets
     bare_hi   = re.compile(r'^T(1[0-5]|[0-9])\s*$')
     bare_lo   = re.compile(r'^T([0-3])\s*$')
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
