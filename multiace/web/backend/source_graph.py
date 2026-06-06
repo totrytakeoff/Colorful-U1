@@ -95,6 +95,8 @@ def default_graph(ace_count: int = 1) -> dict[str, Any]:
         sources[native_id] = {
             "kind": "native_feeder",
             "head": head,
+            "module": NATIVE_CHANNELS[head]["module"],
+            "channel": NATIVE_CHANNELS[head]["channel"],
             "label": f"Native T{head}",
             "material": "",
             "brand": "",
@@ -231,6 +233,16 @@ def validate_graph(graph: dict[str, Any]) -> tuple[list[str], list[str]]:
                 head = None
             if head is not None and (head < 0 or head >= HEAD_COUNT):
                 errors.append(f"{source_id}: native head must be 0..3")
+            module = source.get("module")
+            channel = source.get("channel")
+            if module is None and head in NATIVE_CHANNELS:
+                module = NATIVE_CHANNELS[head]["module"]
+            if channel is None and head in NATIVE_CHANNELS:
+                channel = NATIVE_CHANNELS[head]["channel"]
+            if module not in ("left", "right"):
+                errors.append(f"{source_id}: native module must be left or right")
+            if channel not in (0, 1):
+                errors.append(f"{source_id}: native channel must be 0 or 1")
         if kind == "ace_slot":
             try:
                 ace = int(source.get("ace"))
@@ -330,6 +342,22 @@ def _head_sensor(parsed: dict[str, Any], head: int) -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
     return {}
+
+
+def _native_channel_for_source(source: dict[str, Any]) -> dict[str, Any]:
+    module = source.get("module")
+    channel = source.get("channel")
+    try:
+        head = int(source.get("head"))
+    except (TypeError, ValueError):
+        head = None
+    if (module is None or channel is None) and head in NATIVE_CHANNELS:
+        default = NATIVE_CHANNELS[head]
+        if module is None:
+            module = default.get("module")
+        if channel is None:
+            channel = default.get("channel")
+    return {"module": module, "channel": channel}
 
 
 def _source_for_loaded_toolhead(graph: dict[str, Any], parsed: dict[str, Any],
@@ -487,9 +515,10 @@ def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
             "execution_profile": source.get("execution_profile") or "",
         }
         if kind == "native_feeder":
+            channel = _native_channel_for_source(source)
             row.update({
-                "module": (head.get("native_channel") or {}).get("module"),
-                "channel": (head.get("native_channel") or {}).get("channel"),
+                "module": channel.get("module"),
+                "channel": channel.get("channel"),
             })
         if kind == "ace_slot":
             row.update({

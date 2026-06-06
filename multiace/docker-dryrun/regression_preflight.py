@@ -118,6 +118,8 @@ def source_graph_for(payload: dict[str, Any]) -> dict[str, Any]:
         sources[f"native:{head}"] = {
             "kind": "native_feeder",
             "head": head,
+            "module": channels[head]["module"],
+            "channel": channels[head]["channel"],
             "label": f"Native T{head}",
             "material": "",
             "brand": "",
@@ -687,6 +689,45 @@ def test_source_action_profile_preview() -> None:
                 f"route plan validate hash error mismatch: {bad_validation}")
 
 
+def test_source_transition_preview_unloads_previous_source() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {"head": 0, "ace": 0, "slot": 1, "material": "PETG", "color": "1E78DC"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    push_graph(graph)
+    preview = post_json(f"{WEB}/source-transition/preview", {
+        "source": "native:1",
+        "head": "head:0",
+    })
+    assert_true(preview.get("ok"), f"source transition preview should validate: {preview}")
+    commands = preview.get("commands") or []
+    assert_true(commands == [
+        "ACE_UNLOAD_HEAD HEAD=0",
+        "T0",
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
+    ], f"source transition commands mismatch: {preview}")
+    event = preview.get("event") or {}
+    assert_true(event.get("previous_source") == "ace:0:1",
+                f"transition should record previous source: {preview}")
+    assert_true([s.get("kind") for s in event.get("steps") or []] == [
+        "unload_source", "select_head", "load_source"],
+        f"transition step order mismatch: {preview}")
+
+
 def test_stale_head_source_cleared_on_print_start() -> None:
     set_scenario({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -877,6 +918,7 @@ def main() -> int:
         test_manual_mapping_can_reuse_source_edge,
         test_wrong_feed_auto_channel_rejected,
         test_source_action_profile_preview,
+        test_source_transition_preview_unloads_previous_source,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,

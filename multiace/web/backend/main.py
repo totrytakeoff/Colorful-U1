@@ -612,6 +612,10 @@ class SourceActionPreview(BaseModel):
 class SourceActionPreviewBatch(BaseModel):
     actions: list[SourceActionPreview]
 
+class SourceTransitionPreview(BaseModel):
+    source: str
+    head: str | int
+
 class RoutePlanValidateRequest(BaseModel):
     route_plan: dict[str, Any]
 
@@ -1511,6 +1515,21 @@ def _head_index_from_id(head: str | int | None) -> int | None:
     except (TypeError, ValueError):
         return None
 
+def _native_source_channel(source: dict) -> dict:
+    module = source.get("module")
+    channel = source.get("channel")
+    try:
+        source_head = int(source.get("head"))
+    except (TypeError, ValueError):
+        source_head = None
+    if (module is None or channel is None) and source_head in sg.NATIVE_CHANNELS:
+        default = sg.NATIVE_CHANNELS[source_head]
+        if module is None:
+            module = default.get("module")
+        if channel is None:
+            channel = default.get("channel")
+    return {"module": module, "channel": channel}
+
 def _profile_step(
         *,
         target: dict,
@@ -1598,7 +1617,7 @@ def _target_from_graph_source_edge(
         "execution_profile": source.get("execution_profile") or "",
     }
     if kind == "native_feeder":
-        channel = head.get("native_channel") or {}
+        channel = _native_source_channel(source)
         target["module"] = channel.get("module")
         target["channel"] = channel.get("channel")
     elif kind == "ace_slot":
@@ -1683,6 +1702,70 @@ def _source_action_event(
         "execution_profile": entry.get("execution_profile"),
         "steps": [step],
         "commands": [step.get("command")] if step.get("command") else [],
+        "target": target,
+    }
+
+def _source_transition_event(
+        *,
+        index: int,
+        target: dict,
+        initial_state: dict,
+        graph: dict,
+) -> dict:
+    profiles = graph.get("profiles") or {}
+    head_id = target.get("head_id") or target.get("head")
+    if not str(head_id).startswith("head:"):
+        head_id = "head:%s" % target.get("head")
+    current_source = (
+        ((initial_state.get("heads") or {}).get(head_id) or {})
+        .get("current_source")
+    )
+    steps = []
+    if current_source and current_source != target.get("source"):
+        current_target = _target_from_graph_source_edge(
+            graph, current_source, head_id)
+        if current_target:
+            unload = _profile_step(
+                target=current_target,
+                profiles=profiles,
+                action="unload",
+            )
+            if unload:
+                steps.append(unload)
+    try:
+        head = int(target.get("head"))
+    except (TypeError, ValueError):
+        head = None
+    if head is not None:
+        steps.append({
+            "kind": "select_head",
+            "head": f"head:{head}",
+            "command": f"T{head}",
+        })
+    if current_source != target.get("source"):
+        action = "swap" if target.get("kind") == "ace" else "load"
+        load_or_swap = _profile_step(
+            target=target,
+            profiles=profiles,
+            action=action,
+        )
+        if load_or_swap:
+            steps.append(load_or_swap)
+    commands = [s.get("command") for s in steps if s.get("command")]
+    entry = _route_plan_target_entry(target)
+    return {
+        "index": index,
+        "event_type": "source_transition",
+        "action": "select_loaded" if current_source == target.get("source")
+                  else ("swap" if target.get("kind") == "ace" else "load"),
+        "source": entry.get("source"),
+        "head": entry.get("head"),
+        "edge": entry.get("edge"),
+        "execution_profile": entry.get("execution_profile"),
+        "source_changed": current_source != target.get("source"),
+        "previous_source": current_source,
+        "steps": steps,
+        "commands": commands,
         "target": target,
     }
 
@@ -1898,17 +1981,26 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                 continue
             kind = step.get("kind")
             command = step.get("command")
+            step_source = step.get("source") or source_id
             if not kind:
                 errors.append("route event[%d] step[%d] missing kind"
                               % (idx, step_idx))
             if command:
                 commands.append(command)
+            if step_source and step_source not in sources:
+                errors.append("route event[%d] step[%d] references unknown source %r"
+                              % (idx, step_idx, step_source))
             if step.get("source") and step.get("source") != source_id:
-                errors.append("route event[%d] step[%d] source mismatch"
-                              % (idx, step_idx))
+                if not (kind == "unload_source"
+                        and step.get("source") == event.get("previous_source")):
+                    errors.append("route event[%d] step[%d] source mismatch"
+                                  % (idx, step_idx))
             if step.get("head") and step.get("head") != head_id:
                 errors.append("route event[%d] step[%d] head mismatch"
                               % (idx, step_idx))
+            if step_source and head_id and (step_source, head_id) not in enabled_edges:
+                errors.append("route event[%d] step[%d] has no enabled edge %s -> %s"
+                              % (idx, step_idx, step_source, head_id))
             action = step.get("profile_action")
             profile_id = step.get("profile") or event.get("execution_profile")
             if action:
@@ -1923,7 +2015,7 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                             "route event[%d] step[%d] profile action %r missing command"
                             % (idx, step_idx, action))
             if kind in ("load_source", "unload_source"):
-                source = sources.get(source_id) if source_id in sources else {}
+                source = sources.get(step_source) if step_source in sources else {}
                 if source.get("kind") == "native_feeder":
                     if step.get("module") not in ("left", "right"):
                         errors.append("route event[%d] step[%d] native module missing"
@@ -1932,7 +2024,7 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                         errors.append("route event[%d] step[%d] native channel missing"
                                       % (idx, step_idx))
             if kind == "swap_source":
-                source = sources.get(source_id) if source_id in sources else {}
+                source = sources.get(step_source) if step_source in sources else {}
                 if source.get("kind") == "ace_slot":
                     if step.get("ace") is None or step.get("slot") is None:
                         errors.append("route event[%d] step[%d] ACE slot missing"
@@ -3284,6 +3376,56 @@ async def preview_source_actions(payload: SourceActionPreviewBatch) -> dict:
         "targets": targets,
         "events": events,
         "commands": commands,
+        "route_plan": route_plan,
+    }
+
+@app.post("/api/source-transition/preview")
+async def preview_source_transition(payload: SourceTransitionPreview) -> dict:
+    """Preview a graph-driven transition to one source on one head.
+
+    This is planning only: it returns the unload/select/load-or-swap commands
+    needed for the current source state, but it does not move hardware.
+    """
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    target = _target_from_graph_source_edge(graph, payload.source, payload.head)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail="enabled source edge not found")
+    initial_state = sg.source_state(graph, parsed)
+    event = _source_transition_event(
+        index=0,
+        target=target,
+        initial_state=initial_state,
+        graph=graph,
+    )
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "initial_state": initial_state,
+        "events": [event],
+        "commands": event.get("commands") or [],
+    }
+    errors = _validate_route_plan_for_graph(route_plan, graph, meta)
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "source_graph": route_plan["source_graph"],
+        "initial_state": initial_state,
+        "target": target,
+        "event": event,
+        "commands": route_plan["commands"],
         "route_plan": route_plan,
     }
 
