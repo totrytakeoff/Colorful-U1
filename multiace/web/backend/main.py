@@ -1799,6 +1799,114 @@ def _route_plan_targets(route_plan: dict) -> dict[str, dict]:
             out[str(tool)] = target
     return out
 
+def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(route_plan, dict):
+        return ["route plan must be an object"]
+    if route_plan.get("version") != 2:
+        errors.append("route plan version must be 2")
+    graph_hash = meta.get("hash")
+    plan_hash = route_plan.get("source_graph_hash")
+    if plan_hash and graph_hash and plan_hash != graph_hash:
+        errors.append(
+            "route plan source graph hash mismatch: plan=%s current=%s"
+            % (plan_hash, graph_hash))
+    if meta.get("errors"):
+        errors.append("source graph invalid: " + "; ".join(meta.get("errors") or []))
+
+    sources = graph.get("sources") or {}
+    heads = graph.get("heads") or {}
+    profiles = graph.get("profiles") or {}
+    enabled_edges = set()
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or not edge.get("enabled", True):
+            continue
+        enabled_edges.add((edge.get("source"), edge.get("head")))
+
+    events = route_plan.get("events") or []
+    if not isinstance(events, list) or not events:
+        errors.append("route plan events must be a non-empty list")
+        events = []
+    for idx, event in enumerate(events):
+        if not isinstance(event, dict):
+            errors.append("route event[%d] must be an object" % idx)
+            continue
+        source_id = event.get("source")
+        head_id = event.get("head")
+        if not source_id or source_id not in sources:
+            errors.append("route event[%d] references unknown source %r"
+                          % (idx, source_id))
+        if not head_id or head_id not in heads:
+            errors.append("route event[%d] references unknown head %r"
+                          % (idx, head_id))
+        if source_id and head_id and (source_id, head_id) not in enabled_edges:
+            errors.append("route event[%d] has no enabled edge %s -> %s"
+                          % (idx, source_id, head_id))
+        target = event.get("target") if isinstance(event.get("target"), dict) else {}
+        if target:
+            if target.get("source") and target.get("source") != source_id:
+                errors.append("route event[%d] target source mismatch" % idx)
+            target_head = target.get("head_id")
+            if not target_head and target.get("head") is not None:
+                target_head = "head:%s" % target.get("head")
+            if target_head and target_head != head_id:
+                errors.append("route event[%d] target head mismatch" % idx)
+
+        steps = event.get("steps") or []
+        if not isinstance(steps, list) or not steps:
+            errors.append("route event[%d] steps must be a non-empty list" % idx)
+            steps = []
+        commands = []
+        for step_idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                errors.append("route event[%d] step[%d] must be an object"
+                              % (idx, step_idx))
+                continue
+            kind = step.get("kind")
+            command = step.get("command")
+            if not kind:
+                errors.append("route event[%d] step[%d] missing kind"
+                              % (idx, step_idx))
+            if command:
+                commands.append(command)
+            if step.get("source") and step.get("source") != source_id:
+                errors.append("route event[%d] step[%d] source mismatch"
+                              % (idx, step_idx))
+            if step.get("head") and step.get("head") != head_id:
+                errors.append("route event[%d] step[%d] head mismatch"
+                              % (idx, step_idx))
+            action = step.get("profile_action")
+            profile_id = step.get("profile") or event.get("execution_profile")
+            if action:
+                profile = profiles.get(profile_id)
+                if not isinstance(profile, dict):
+                    errors.append("route event[%d] step[%d] profile %r missing"
+                                  % (idx, step_idx, profile_id))
+                else:
+                    action_spec = profile.get(action)
+                    if not isinstance(action_spec, dict) or not action_spec.get("command"):
+                        errors.append(
+                            "route event[%d] step[%d] profile action %r missing command"
+                            % (idx, step_idx, action))
+            if kind in ("load_source", "unload_source"):
+                source = sources.get(source_id) if source_id in sources else {}
+                if source.get("kind") == "native_feeder":
+                    if step.get("module") not in ("left", "right"):
+                        errors.append("route event[%d] step[%d] native module missing"
+                                      % (idx, step_idx))
+                    if step.get("channel") not in (0, 1):
+                        errors.append("route event[%d] step[%d] native channel missing"
+                                      % (idx, step_idx))
+            if kind == "swap_source":
+                source = sources.get(source_id) if source_id in sources else {}
+                if source.get("kind") == "ace_slot":
+                    if step.get("ace") is None or step.get("slot") is None:
+                        errors.append("route event[%d] step[%d] ACE slot missing"
+                                      % (idx, step_idx))
+        if commands != (event.get("commands") or []):
+            errors.append("route event[%d] commands do not mirror steps" % idx)
+    return errors
+
 def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
     colors: dict[int, str] = {}
     materials: dict[int, str] = {}
@@ -2520,6 +2628,11 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         if not route_plan:
             raise RuntimeError(
                 "route plan missing; run source graph preflight again")
+        graph, graph_meta = _load_source_graph(parsed)
+        route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
+        if route_errors:
+            raise RuntimeError(
+                "route plan validation failed: " + "; ".join(route_errors[:8]))
         await asyncio.to_thread(
             pp.rewrite_to_file,
             str(cur), str(nxt),

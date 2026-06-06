@@ -316,6 +316,23 @@ def wait_job(job_id: str) -> dict:
     return status
 
 
+def wait_job_error(job_id: str, needle: str) -> dict:
+    status: dict = {}
+    for _ in range(80):
+        status = request(
+            "GET",
+            f"{WEB}/preflight/print/status?job_id={urllib.parse.quote(job_id)}",
+        )
+        if status.get("done"):
+            break
+        time.sleep(0.25)
+    assert_true(status.get("done"), f"print job did not finish: {status}")
+    error = str(status.get("error") or "")
+    assert_true(needle.lower() in error.lower(),
+                f"print job error should contain {needle!r}, got {status}")
+    return status
+
+
 def uploaded_content(filename: str) -> str:
     uploaded = request(
         "GET",
@@ -711,6 +728,40 @@ def test_source_graph_edge_required_for_ace_swap() -> None:
                 f"ACE swap should require source graph edge: {err}")
 
 
+def test_route_plan_rejects_graph_hash_change() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_hash_change.gcode",
+        gcode(
+            "PETG",
+            "#1e78dc",
+            """
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    graph = source_graph_for({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    })
+    graph["edges"].append({
+        "source": "ace:0:1",
+        "head": "head:1",
+        "enabled": False,
+        "priority": 999,
+    })
+    push_graph(graph)
+    started = post_json(f"{WEB}/preflight/print", {
+        "token": report["token"],
+        "mode": "slicer",
+    })
+    wait_job_error(started["job_id"], "hash mismatch")
+
+
 def test_route_plan_only_rewrite() -> None:
     pp = load_postprocessor()
     route_plan = {
@@ -786,6 +837,7 @@ def main() -> int:
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,
+        test_route_plan_rejects_graph_hash_change,
         test_route_plan_only_rewrite,
     ]
     for test in tests:
