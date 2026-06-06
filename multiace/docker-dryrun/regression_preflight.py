@@ -370,6 +370,10 @@ def test_mixed_native_ace_print() -> None:
                 "saved route plan differs from preflight response")
     started = start_print(report)
     status = wait_job(started["job_id"])
+    assert_true(
+        (status.get("route_plan") or {}).get("events")
+        == (report.get("route_plan") or {}).get("events"),
+        "print status route plan differs from preflight response")
     final_stats = ((status.get("source_map") or {}).get("swap_stats") or {})
     assert_true(final_stats.get("active_ace_swaps") == 1,
                 f"final source map lost swap stats: {final_stats}")

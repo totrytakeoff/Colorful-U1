@@ -1409,6 +1409,29 @@ def _load_preflight_source_map(token: str) -> dict:
         return {}
     return data if isinstance(data, dict) else {}
 
+def _preflight_route_plan_path(token: str) -> Path:
+    return _PREFLIGHT_DIR / (token + ".route_plan.json")
+
+def _save_preflight_route_plan(route_plan: dict) -> None:
+    token = route_plan.get("token")
+    if not token or not re.fullmatch(r"[0-9a-f]{32}", str(token)):
+        return
+    _preflight_route_plan_path(str(token)).write_text(
+        json.dumps(route_plan, indent=2, sort_keys=True),
+        encoding="utf-8")
+
+def _load_preflight_route_plan(token: str) -> dict:
+    p = _preflight_route_plan_path(token)
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            return data
+    source_map = _load_preflight_source_map(token)
+    return _route_plan_from_source_map(source_map) if source_map else {}
+
 def _route_plan_from_source_map(source_map: dict) -> dict:
     graph_meta = source_map.get("source_graph") or {}
     events = []
@@ -1925,11 +1948,13 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         used_tools=used_tools,
         events=events,
     )
+    route_plan = _route_plan_from_source_map(source_map)
     (_PREFLIGHT_DIR / (token + ".targets")).write_text(
         json.dumps(tool_targets, indent=2),
         encoding="utf-8")
     _save_preflight_events(token, events)
     _save_preflight_source_map(source_map)
+    _save_preflight_route_plan(route_plan)
     (_PREFLIGHT_DIR / (token + ".used")).write_text(
         json.dumps(sorted(used_tools)),
         encoding="utf-8")
@@ -1969,7 +1994,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         "resolve_candidates": resolver.get("candidates", []),
         "tool_targets": tool_targets,
         "source_map": source_map,
-        "route_plan": _route_plan_from_source_map(source_map),
+        "route_plan": route_plan,
         "plans": {},
     }
     if not missing_mats and not resolver.get("errors"):
@@ -2083,10 +2108,12 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
     src = _PREFLIGHT_DIR / (token + ".gcode")
     tool_targets = _load_preflight_targets(token)
     source_map = _load_preflight_source_map(token)
-    route_plan = _route_plan_from_source_map(source_map) if source_map else {}
+    route_plan = _load_preflight_route_plan(token)
     route_targets = _route_plan_targets(route_plan)
     if source_map:
         state["source_map"] = source_map
+    if route_plan:
+        state["route_plan"] = route_plan
 
     tmp_a = _PREFLIGHT_DIR / (job_id + ".a.gcode")
     tmp_b = _PREFLIGHT_DIR / (job_id + ".b.gcode")
@@ -2241,6 +2268,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         state["filename"] = safe_name
         state["mode"]     = mode
         state["source_map"] = _load_preflight_source_map(token) or source_map
+        state["route_plan"] = _load_preflight_route_plan(token) or route_plan
         state["done"]     = True
     except Exception as exc:
         state["error"] = str(exc)
@@ -2312,7 +2340,9 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             used_tools=used_tools,
             events=_load_preflight_events(req.token),
         )
+        route_plan = _route_plan_from_source_map(source_map)
         _save_preflight_source_map(source_map)
+        _save_preflight_route_plan(route_plan)
 
     _prune_old_jobs()
     import uuid as _uuid
@@ -2326,6 +2356,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
         "mode":     req.mode,
         "ts":       time.time(),
         "source_map": _load_preflight_source_map(req.token),
+        "route_plan": _load_preflight_route_plan(req.token),
     }
     asyncio.create_task(_run_preflight_pipeline(
         job_id, req.token, req.mode, safe_name, req.set_prefs))
@@ -2346,6 +2377,7 @@ async def preflight_print_status(job_id: str) -> dict:
         "filename": state.get("filename"),
         "mode":    state.get("mode"),
         "source_map": state.get("source_map") or {},
+        "route_plan": state.get("route_plan") or {},
     }
 
 @app.get("/api/preflight/source-map")
@@ -2361,10 +2393,10 @@ async def preflight_source_map(token: str) -> dict:
 async def preflight_route_plan(token: str) -> dict:
     if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
         raise HTTPException(status_code=400, detail="invalid token")
-    source_map = _load_preflight_source_map(token)
-    if not source_map:
-        raise HTTPException(status_code=404, detail="source map not found")
-    return _route_plan_from_source_map(source_map)
+    route_plan = _load_preflight_route_plan(token)
+    if not route_plan:
+        raise HTTPException(status_code=404, detail="route plan not found")
+    return route_plan
 
 _cfg_scalar_cache: dict = {"mtime": 0.0, "values": {}}
 
