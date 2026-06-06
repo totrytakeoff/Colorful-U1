@@ -655,6 +655,20 @@ def test_source_action_profile_preview() -> None:
     assert_true([e.get("event_type") for e in events] == [
         "source_action", "source_action", "source_action"],
         f"source action batch event types mismatch: {batch}")
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": route_plan,
+    })
+    assert_true(validation.get("ok"),
+                f"source action route plan should validate: {validation}")
+    bad_plan = dict(route_plan)
+    bad_plan["source_graph_hash"] = "sha256:bad"
+    bad_validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": bad_plan,
+    })
+    assert_true(not bad_validation.get("ok"),
+                f"route plan validate should reject bad hash: {bad_validation}")
+    assert_true("hash mismatch" in "; ".join(bad_validation.get("errors") or []).lower(),
+                f"route plan validate hash error mismatch: {bad_validation}")
 
 
 def test_stale_head_source_cleared_on_print_start() -> None:

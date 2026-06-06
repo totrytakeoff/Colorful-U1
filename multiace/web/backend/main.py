@@ -612,6 +612,9 @@ class SourceActionPreview(BaseModel):
 class SourceActionPreviewBatch(BaseModel):
     actions: list[SourceActionPreview]
 
+class RoutePlanValidateRequest(BaseModel):
+    route_plan: dict[str, Any]
+
 EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
 EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
 OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
@@ -2837,6 +2840,38 @@ async def preflight_route_plan_validate(token: str) -> dict:
             "version": route_plan.get("version"),
             "source_graph_hash": route_plan.get("source_graph_hash"),
             "events": len(route_plan.get("events") or []),
+        },
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+    }
+
+@app.post("/api/route-plan/validate")
+async def route_plan_validate(payload: RoutePlanValidateRequest) -> dict:
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    route_plan = payload.route_plan
+    errors = _validate_route_plan_for_graph(route_plan, graph, meta)
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "route_plan": {
+            "version": route_plan.get("version") if isinstance(route_plan, dict) else None,
+            "source_graph_hash": (
+                route_plan.get("source_graph_hash")
+                if isinstance(route_plan, dict) else None
+            ),
+            "events": (
+                len(route_plan.get("events") or [])
+                if isinstance(route_plan, dict) else 0
+            ),
         },
         "source_graph": {
             "hash": meta.get("hash"),
