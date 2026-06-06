@@ -199,7 +199,13 @@ def source_graph_for(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def push_source_graph(payload: dict[str, Any]) -> None:
-    result = post_json(f"{WEB}/source-graph", {"graph": source_graph_for(payload)})
+    push_graph(source_graph_for(payload))
+
+
+def push_graph(graph: dict[str, Any]) -> None:
+    mr_result = post_json(f"{MOONRAKER}/dry-run/source-graph", {"graph": graph})
+    assert_true(mr_result.get("ok"), f"moonraker source graph save failed: {mr_result}")
+    result = post_json(f"{WEB}/source-graph", {"graph": graph})
     assert_true(result.get("ok"), f"source graph save failed: {result}")
 
 
@@ -564,6 +570,26 @@ def test_ghost_head_refuses_swap() -> None:
                 f"ghost swap should be rejected: {err}")
 
 
+def test_source_graph_edge_required_for_ace_swap() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"] = [
+        edge for edge in graph["edges"]
+        if not str(edge.get("source") or "").startswith("ace:")
+    ]
+    push_graph(graph)
+    err = run_script("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0", expect_status=400)
+    assert_true("source graph" in str(err).lower(),
+                f"ACE swap should require source graph edge: {err}")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -574,6 +600,7 @@ def main() -> int:
         test_wrong_feed_auto_channel_rejected,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
+        test_source_graph_edge_required_for_ace_swap,
     ]
     for test in tests:
         test()

@@ -411,10 +411,6 @@ def _set_head_empty(state: dict[str, Any], head: int) -> None:
 
 
 def _check_load_route(state: dict[str, Any], head: int, ace: int, slot: int) -> None:
-    route = state["ace"].get("route", {}) or {}
-    route_error = route.get("error")
-    if route_error:
-        raise ValueError(f"route error: {route_error}")
     aces = state["ace"].get("aces", []) or []
     if ace < 0 or ace >= len(aces):
         raise ValueError(f"ACE {ace} is not available")
@@ -423,26 +419,47 @@ def _check_load_route(state: dict[str, Any], head: int, ace: int, slot: int) -> 
     if head < 0 or head >= 4:
         raise ValueError(f"HEAD {head} is outside 0..3")
 
-    head_modes = route.get("head_modes", {}) or {}
-    if head_modes.get(str(head)) != "ace":
-        raise ValueError(f"HEAD {head} is not configured as ACE")
-
-    ace_targets = route.get("ace_targets", {}) or {}
-    if str(ace) in ace_targets:
-        target = ace_targets.get(str(ace))
-        if target is None:
-            raise ValueError(f"ACE {ace} is not assigned to any ACE toolhead")
-        if int(target) != head:
-            raise ValueError(f"ACE {ace} is assigned to HEAD {target}, not HEAD {head}")
+    graph = _read_source_graph()
+    if _source_graph_allows_ace(graph, head, ace, slot):
         return
+    raise ValueError(
+        f"source graph has no enabled edge ace:{ace}:{slot} -> head:{head}")
 
-    mode = route.get("mode", "single_head")
-    if mode == "single_head":
-        target = route.get("primary_head")
-        if target is None or int(target) != head:
-            raise ValueError(f"HEAD {head} is not the configured ACE toolhead")
-    else:
-        raise ValueError(f"route mode {mode} requires explicit ACE target")
+
+def _read_source_graph() -> dict[str, Any]:
+    if not SOURCE_GRAPH_PATH.exists():
+        raise ValueError(f"source graph not found at {SOURCE_GRAPH_PATH}")
+    try:
+        graph = json.loads(SOURCE_GRAPH_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"failed to read source graph: {exc}")
+    if not isinstance(graph, dict):
+        raise ValueError("source graph must be an object")
+    if graph.get("version") != 1:
+        raise ValueError(f"unsupported source graph version {graph.get('version')!r}")
+    return graph
+
+
+def _source_graph_allows_ace(
+    graph: dict[str, Any], head: int, ace: int, slot: int
+) -> bool:
+    sources = graph.get("sources") or {}
+    heads = graph.get("heads") or {}
+    source_id = f"ace:{ace}:{slot}"
+    head_id = f"head:{head}"
+    source = sources.get(source_id) or {}
+    if source.get("kind") != "ace_slot":
+        return False
+    if int(source.get("ace", -1)) != ace or int(source.get("slot", -1)) != slot:
+        return False
+    if head_id not in heads:
+        return False
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("enabled", True) is False:
+            continue
+        if edge.get("source") == source_id and edge.get("head") == head_id:
+            return True
+    return False
 
 
 def _parse_args(line: str) -> tuple[str, dict[str, str]]:
@@ -792,3 +809,15 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
             if p.is_file():
                 p.unlink()
     return {"ok": True, "state": state}
+
+
+@app.post("/dry-run/source-graph")
+async def source_graph(payload: dict[str, Any]) -> dict[str, Any]:
+    graph = payload.get("graph") if isinstance(payload, dict) else None
+    if not isinstance(graph, dict):
+        raise HTTPException(status_code=400, detail="graph must be an object")
+    SOURCE_GRAPH_PATH.write_text(
+        json.dumps(graph, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"ok": True, "path": str(SOURCE_GRAPH_PATH)}

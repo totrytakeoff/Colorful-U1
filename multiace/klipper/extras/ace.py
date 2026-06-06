@@ -118,6 +118,15 @@ class MultiAce:
         self._ace_present = set()
 
         self.ace_device_count = config.getint('ace_device_count', 1, minval=1, maxval=8)
+        self._source_graph_path = config.get(
+            'source_graph_path',
+            '/home/lava/printer_data/config/extended/multiace/source_graph.json')
+        self._source_graph = {}
+        self._source_graph_hash = None
+        self._source_graph_error = None
+        self._source_graph_edges = set()
+        self._source_graph_native_edges = set()
+        self._read_source_graph()
         self._ace_route_error = None
         self._head_modes = []
         default_head_modes = ['ace', 'native', 'native', 'native']
@@ -612,6 +621,10 @@ class MultiAce:
             'MULTIACE_REFRESH_OVERRIDES',
             self.cmd_MULTIACE_REFRESH_OVERRIDES,
             desc='[multiACE] Re-read slot_overrides.json and push to display')
+        self.gcode.register_command(
+            'MULTIACE_REFRESH_SOURCE_GRAPH',
+            self.cmd_MULTIACE_REFRESH_SOURCE_GRAPH,
+            desc='[multiACE] Re-read source_graph.json routing')
 
         for _name in (
                 'DISCOVER', 'INFO', 'STATUS', 'TEMP', 'FEEDINFO',
@@ -761,6 +774,119 @@ class MultiAce:
             targets[ace] = head
         return targets
 
+    def _read_source_graph(self):
+        self._source_graph = {}
+        self._source_graph_hash = None
+        self._source_graph_error = None
+        self._source_graph_edges = set()
+        self._source_graph_native_edges = set()
+        path = self._source_graph_path
+        if not path:
+            self._source_graph_error = 'source_graph_path is empty'
+            return
+        if not os.path.isfile(path):
+            self._source_graph_error = (
+                'source graph not found at %s' % path)
+            logging.info('[multiACE] %s' % self._source_graph_error)
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = f.read()
+            graph = json.loads(raw)
+        except Exception as e:
+            self._source_graph_error = (
+                'failed to read source graph %s: %s' % (path, e))
+            logging.info('[multiACE] %s' % self._source_graph_error)
+            return
+
+        errors = []
+        if not isinstance(graph, dict):
+            errors.append('source graph must be an object')
+            graph = {}
+        heads = graph.get('heads')
+        sources = graph.get('sources')
+        edges = graph.get('edges')
+        if graph.get('version') != 1:
+            errors.append('unsupported source graph version %r'
+                          % graph.get('version'))
+        if not isinstance(heads, dict):
+            errors.append('heads must be an object')
+            heads = {}
+        if not isinstance(sources, dict):
+            errors.append('sources must be an object')
+            sources = {}
+        if not isinstance(edges, list):
+            errors.append('edges must be a list')
+            edges = []
+
+        edge_seen = set()
+        for i, edge in enumerate(edges):
+            if not isinstance(edge, dict):
+                errors.append('edge[%d] must be an object' % i)
+                continue
+            if edge.get('enabled', True) is False:
+                continue
+            source_id = edge.get('source')
+            head_id = edge.get('head')
+            if source_id not in sources:
+                errors.append('edge[%d] unknown source %r' % (i, source_id))
+                continue
+            if head_id not in heads:
+                errors.append('edge[%d] unknown head %r' % (i, head_id))
+                continue
+            if (source_id, head_id) in edge_seen:
+                errors.append('duplicate edge %s -> %s'
+                              % (source_id, head_id))
+                continue
+            edge_seen.add((source_id, head_id))
+            try:
+                head = int(str(head_id).split(':', 1)[1])
+            except Exception:
+                errors.append('edge[%d] invalid head id %r' % (i, head_id))
+                continue
+            source = sources.get(source_id) or {}
+            kind = source.get('kind')
+            if kind == 'ace_slot':
+                try:
+                    ace = int(source.get('ace'))
+                    slot = int(source.get('slot'))
+                except Exception:
+                    errors.append('%s missing integer ace/slot' % source_id)
+                    continue
+                self._source_graph_edges.add((head, ace, slot))
+            elif kind == 'native_feeder':
+                self._source_graph_native_edges.add(head)
+
+        if errors:
+            self._source_graph_error = '; '.join(errors)
+            logging.info('[multiACE] source graph invalid: %s'
+                         % self._source_graph_error)
+            return
+        self._source_graph = graph
+        self._source_graph_hash = (
+            'sha256:' + hashlib.sha256(
+                json.dumps(graph, sort_keys=True, separators=(',', ':')).encode(
+                    'utf-8')).hexdigest())
+        logging.info(
+            '[multiACE] source graph loaded: %s edges=%d native_edges=%d hash=%s'
+            % (path, len(self._source_graph_edges),
+               len(self._source_graph_native_edges), self._source_graph_hash))
+
+    def _source_graph_loaded(self):
+        return bool(self._source_graph) and self._source_graph_error is None
+
+    cmd_MULTIACE_REFRESH_SOURCE_GRAPH_help = (
+        '[multiACE] Re-read source_graph.json routing')
+    def cmd_MULTIACE_REFRESH_SOURCE_GRAPH(self, gcmd):
+        self._read_source_graph()
+        if self._source_graph_error:
+            raise gcmd.error(
+                '[multiACE] source graph refresh failed: %s'
+                % self._source_graph_error)
+        self.log_always(
+            '[multiACE] source graph refreshed: hash=%s ace_edges=%d'
+            % (self._source_graph_hash, len(self._source_graph_edges)))
+
     def _ace_target_head(self, ace_index):
         if self._ace_route_mode == 'native_only':
             return None
@@ -778,6 +904,43 @@ class MultiAce:
         return None
 
     def _check_routed_head(self, gcmd, head, action, ace_index=None):
+        self._read_source_graph()
+        if self._source_graph_error:
+            raise gcmd.error('[multiACE] %s refused: source graph error: %s'
+                             % (action, self._source_graph_error))
+        if self._source_graph_loaded():
+            if ace_index is not None:
+                slot = None
+                try:
+                    slot = gcmd.get_int('SLOT')
+                except Exception:
+                    slot = None
+                if slot is None:
+                    raise gcmd.error(
+                        '[multiACE] %s refused: explicit SLOT required for '
+                        'source graph route check' % action)
+                if (head, ace_index, slot) in self._source_graph_edges:
+                    return
+                raise gcmd.error(
+                    '[multiACE] %s refused: source graph has no enabled edge '
+                    'ace:%d:%d -> head:%d' %
+                    (action, ace_index, slot, head))
+            source = self._head_source.get(head)
+            if source is not None:
+                try:
+                    edge = (head, int(source.get('ace_index')),
+                            int(source.get('slot')))
+                except Exception:
+                    edge = None
+                if edge in self._source_graph_edges:
+                    return
+                raise gcmd.error(
+                    '[multiACE] %s refused: current head_source for HEAD=%d '
+                    'is not allowed by source graph' % (action, head))
+            raise gcmd.error(
+                '[multiACE] %s refused: HEAD=%d has no ACE head_source to '
+                'unload under source graph routing' % (action, head))
+
         if self._ace_route_error:
             raise gcmd.error('[multiACE] %s refused: %s' % (
                 action, self._ace_route_error))
@@ -822,6 +985,16 @@ class MultiAce:
                 str(head): self._head_modes[head] for head in range(4)
             },
             'error': self._ace_route_error,
+            'source_graph': {
+                'path': self._source_graph_path,
+                'hash': self._source_graph_hash,
+                'error': self._source_graph_error,
+                'ace_edges': [
+                    {'head': h, 'ace': a, 'slot': s}
+                    for h, a, s in sorted(self._source_graph_edges)
+                ],
+                'native_heads': sorted(self._source_graph_native_edges),
+            },
         }
 
     def _disp(self, idx):
