@@ -228,6 +228,23 @@ def target_for(report: dict, tool: int) -> dict:
     return entries_by_tool(report)[tool].get("target") or {}
 
 
+def assert_target_matches(target: dict, expected: dict) -> None:
+    for key, value in expected.items():
+        assert_true(target.get(key) == value,
+                    f"target field {key!r} mismatch: expected {value!r}, got {target}")
+    assert_true(target.get("source"), f"target missing source id: {target}")
+    assert_true(target.get("key") == "%s->head:%d" % (
+        target.get("source"), int(target.get("head"))),
+        f"target key should be source edge id: {target}")
+    edge = target.get("edge") or {}
+    assert_true(edge.get("source") == target.get("source"),
+                f"target edge source mismatch: {target}")
+    assert_true(edge.get("head") == "head:%d" % int(target.get("head")),
+                f"target edge head mismatch: {target}")
+    assert_true(target.get("execution_profile"),
+                f"target missing execution profile: {target}")
+
+
 def commands_for(report: dict, tool: int) -> list[str]:
     return entries_by_tool(report)[tool].get("commands") or []
 
@@ -342,11 +359,9 @@ def test_mixed_native_ace_print() -> None:
     assert_true(len(entries_by_tool(report)) == 2, "mixed case should map two tools")
     t0 = target_for(report, 0)
     t1 = target_for(report, 1)
-    assert_true(t0 == {"kind": "native", "head": 1, "source": "native:1"},
-                f"T0 should map to native T1, got {t0}")
-    assert_true(t1 == {
-        "kind": "ace", "head": 0, "source": "ace:0:1", "ace": 0, "slot": 1},
-                f"T1 should map to ACE0 slot1 -> T0, got {t1}")
+    assert_target_matches(t0, {"kind": "native", "head": 1, "source": "native:1"})
+    assert_target_matches(t1, {
+        "kind": "ace", "head": 0, "source": "ace:0:1", "ace": 0, "slot": 1})
     assert_true(commands_for(report, 0) == ["T1"],
                 f"T0 command preview mismatch: {commands_for(report, 0)}")
     assert_true(commands_for(report, 1) == ["T0", "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1"],
@@ -407,12 +422,12 @@ def test_native_only_print() -> None:
     )
     assert_source_map_shape(report)
     assert_route_plan_shape(report)
-    assert_true(target_for(report, 0) == {
-        "kind": "native", "head": 0, "source": "native:0"},
-                f"T0 native-only mapping mismatch: {target_for(report, 0)}")
-    assert_true(target_for(report, 1) == {
-        "kind": "native", "head": 1, "source": "native:1"},
-                f"T1 native-only mapping mismatch: {target_for(report, 1)}")
+    assert_target_matches(
+        target_for(report, 0),
+        {"kind": "native", "head": 0, "source": "native:0"})
+    assert_target_matches(
+        target_for(report, 1),
+        {"kind": "native", "head": 1, "source": "native:1"})
     stats = (report.get("source_map") or {}).get("swap_stats") or {}
     assert_true(stats.get("active_ace_swaps") == 0,
                 f"native-only should not estimate ACE swaps: {stats}")
@@ -450,12 +465,12 @@ def test_single_ace_head_print() -> None:
     )
     assert_source_map_shape(report)
     assert_route_plan_shape(report)
-    assert_true(target_for(report, 0) == {
-        "kind": "ace", "head": 0, "source": "ace:0:0", "ace": 0, "slot": 0},
-                f"T0 single ACE mapping mismatch: {target_for(report, 0)}")
-    assert_true(target_for(report, 1) == {
-        "kind": "ace", "head": 0, "source": "ace:0:1", "ace": 0, "slot": 1},
-                f"T1 single ACE mapping mismatch: {target_for(report, 1)}")
+    assert_target_matches(
+        target_for(report, 0),
+        {"kind": "ace", "head": 0, "source": "ace:0:0", "ace": 0, "slot": 0})
+    assert_target_matches(
+        target_for(report, 1),
+        {"kind": "ace", "head": 0, "source": "ace:0:1", "ace": 0, "slot": 1})
     stats = (report.get("source_map") or {}).get("swap_stats") or {}
     assert_true(stats.get("active_ace_swaps") == 2,
                 f"single ACE should estimate two active swaps: {stats}")
@@ -491,13 +506,13 @@ def test_unmapped_tool_is_not_feasible() -> None:
     assert_true(not plan.get("feasible"), f"unmapped plan should be infeasible: {plan}")
 
 
-def test_duplicate_manual_mapping_rejected() -> None:
+def test_manual_mapping_can_reuse_source_edge() -> None:
     reset_default()
     report = multipart_upload(
-        "duplicate_manual.gcode",
+        "reuse_source_edge_manual.gcode",
         gcode(
-            "PLA;PETG",
-            "#dc2828;#1e78dc",
+            "PLA;PLA",
+            "#dc2828;#dc2828",
             """
             T0
             ; Change Tool 0 -> Tool 1
@@ -506,15 +521,18 @@ def test_duplicate_manual_mapping_rejected() -> None:
             """,
         ),
     )
-    native_target = {"kind": "native", "head": 1, "source": "native:1"}
-    err = start_print(
+    native_target = target_for(report, 0)
+    assert_target_matches(
+        native_target,
+        {"kind": "native", "head": 1, "source": "native:1"})
+    started = start_print(
         report,
         tool_targets={"0": native_target, "1": native_target},
-        expect_status=409,
     )
-    detail = str(err.get("detail") or err)
-    assert_true("reuses the same target" in detail,
-                f"duplicate manual mapping error mismatch: {err}")
+    content = uploaded_content(wait_job(started["job_id"])["filename"])
+    assert_true("T1" in content, "manual reused native source should select T1")
+    assert_true("ACE_SWAP_HEAD" not in content,
+                "manual reused native source should not emit ACE swaps")
 
 
 def test_wrong_feed_auto_channel_rejected() -> None:
@@ -647,7 +665,7 @@ def main() -> int:
         test_native_only_print,
         test_single_ace_head_print,
         test_unmapped_tool_is_not_feasible,
-        test_duplicate_manual_mapping_rejected,
+        test_manual_mapping_can_reuse_source_edge,
         test_wrong_feed_auto_channel_rejected,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,

@@ -979,6 +979,9 @@ def _target_to_dict(target: dict | None) -> dict | None:
         "kind": target.get("kind"),
         "head": target.get("head"),
     }
+    for key in ("key", "source", "head_id", "edge", "execution_profile"):
+        if target.get(key):
+            out[key] = target.get(key)
     if target.get("source"):
         out["source"] = target.get("source")
     if target.get("kind") == "ace":
@@ -1035,30 +1038,54 @@ def _candidate_score(want_mat: str, want_color: str,
     return None
 
 def _candidate_target_key(target: dict) -> str:
+    if target.get("key"):
+        return str(target.get("key"))
+    source = target.get("source")
+    head_id = target.get("head_id")
+    if source and head_id:
+        return "%s->%s" % (source, head_id)
     if target.get("kind") == "native":
         return "native:%d" % int(target.get("head"))
     return "ace:%d:%d:%d" % (
         int(target.get("head")), int(target.get("ace")), int(target.get("slot")))
 
 def _target_from_loadout_item(item: dict) -> dict:
-    if item.get("kind") == "native":
-        out = {"kind": "native", "head": int(item.get("head"))}
-        if item.get("source"):
-            out["source"] = item.get("source")
-        return out
     out = {
-        "kind": "ace",
+        "kind": item.get("kind"),
+        "source": item.get("source"),
+        "key": item.get("key"),
         "head": int(item.get("head")),
+        "head_id": item.get("head_id") or "head:%d" % int(item.get("head")),
+        "edge": item.get("edge") or {
+            "source": item.get("source"),
+            "head": item.get("head_id") or "head:%d" % int(item.get("head")),
+        },
+        "execution_profile": item.get("execution_profile") or "",
+    }
+    if item.get("kind") == "native":
+        return out
+    out.update({
+        "kind": "ace",
         "ace": int(item.get("ace")),
         "slot": int(item.get("slot")),
-    }
-    if item.get("source"):
-        out["source"] = item.get("source")
+    })
     return out
 
 def _target_key_from_request(target: Any) -> str | None:
     if not isinstance(target, dict):
         return None
+    if target.get("key"):
+        return str(target.get("key"))
+    edge = target.get("edge")
+    if isinstance(edge, dict) and edge.get("source") and edge.get("head"):
+        return "%s->%s" % (edge.get("source"), edge.get("head"))
+    if target.get("source") and target.get("head_id"):
+        return "%s->%s" % (target.get("source"), target.get("head_id"))
+    if target.get("source") and target.get("head") is not None:
+        try:
+            return "%s->head:%d" % (target.get("source"), int(target.get("head")))
+        except (TypeError, ValueError):
+            return None
     kind = str(target.get("kind") or "").lower()
     try:
         if kind == "native":
@@ -1514,10 +1541,8 @@ def _validate_manual_tool_targets(parsed: dict, requested: Any,
         if item.get("ready")
     }
     out: dict[str, dict] = {}
-    used_keys: set[str] = set()
     missing = []
     invalid = []
-    duplicate = []
     for t in sorted(used_tools):
         raw = requested.get(str(t), requested.get(t))
         if raw is None:
@@ -1528,10 +1553,6 @@ def _validate_manual_tool_targets(parsed: dict, requested: Any,
         if item is None:
             invalid.append("T%d" % t)
             continue
-        if key in used_keys:
-            duplicate.append("T%d" % t)
-            continue
-        used_keys.add(key)
         out[str(t)] = _target_from_loadout_item(item)
     if missing:
         raise HTTPException(
@@ -1541,11 +1562,6 @@ def _validate_manual_tool_targets(parsed: dict, requested: Any,
         raise HTTPException(
             status_code=409,
             detail="manual mapping target unavailable for " + ", ".join(invalid))
-    if duplicate:
-        raise HTTPException(
-            status_code=409,
-            detail="manual mapping reuses the same target for "
-            + ", ".join(duplicate))
     return out
 
 def _used_tools_for_preflight(used: set[int], slicer_colors: dict,
@@ -1571,24 +1587,13 @@ def _build_mixed_resolver(parsed: dict, slicer_colors: dict,
     for item in _live_loadout_from_parsed(parsed):
         if item.get("ready") is False:
             continue
-        if item.get("kind") == "native":
-            candidates.append({
-                "kind": "native",
-                "source": item.get("source"),
-                "head": int(item.get("head")),
-                "material": item.get("material") or "",
-                "color": item.get("color") or "",
-            })
-        elif item.get("kind") == "ace":
-            candidates.append({
-                "kind": "ace",
-                "source": item.get("source"),
-                "head": int(item.get("head")),
-                "ace": int(item.get("ace")),
-                "slot": int(item.get("slot")),
-                "material": item.get("material") or "",
-                "color": item.get("color") or "",
-            })
+        target = _target_from_loadout_item(item)
+        target.update({
+            "material": item.get("material") or "",
+            "color": item.get("color") or "",
+            "priority": ((item.get("edge") or {}).get("priority", 100)),
+        })
+        candidates.append(target)
 
     resolver_candidates = []
     for c in candidates:
@@ -1613,20 +1618,17 @@ def _build_mixed_resolver(parsed: dict, slicer_colors: dict,
                 continue
             rank, dist, tier = score
             key = (rank, dist, 0 if c.get("kind") == "native" else 1,
-                   c.get("head", 99), c.get("ace", 99),
+                   c.get("priority", 100), c.get("head", 99), c.get("ace", 99),
                    c.get("slot", 99), order, t)
             scored.append((key, t, dict(c), tier, float(dist)))
 
     assigned: dict[int, dict] = {}
-    used_candidate_keys: set[str] = set()
     for _key, t, c, tier, dist in sorted(scored, key=lambda row: row[0]):
-        ckey = _candidate_target_key(c)
-        if t in assigned or ckey in used_candidate_keys:
+        if t in assigned:
             continue
         c["tier"] = tier
         c["distance"] = dist
         assigned[t] = c
-        used_candidate_keys.add(ckey)
 
     mapping: list[dict] = []
     tool_targets: dict[str, dict] = {}

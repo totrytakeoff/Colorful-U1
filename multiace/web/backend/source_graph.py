@@ -455,20 +455,26 @@ def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
         row = {
             "kind": "native" if kind == "native_feeder" else "ace",
             "source": source_id,
-            "key": source_id,
+            "edge": {
+                "source": source_id,
+                "head": head_id,
+                "priority": edge.get("priority", 100),
+                "constraints": deepcopy(edge.get("constraints") or {}),
+            },
+            "key": "%s->%s" % (source_id, head_id),
             "head": head_idx,
+            "head_id": head_id,
             "material": source.get("material") or "",
             "color": color,
             "name": color_name_fn(color) if (color_name_fn and color) else "",
             "ready": bool(source.get("ready")),
             "state": source.get("state") or "",
+            "execution_profile": source.get("execution_profile") or "",
         }
         if kind == "ace_slot":
             row.update({
                 "ace": int(source.get("ace")),
                 "slot": int(source.get("slot")),
-                "key": "ace:%d:%d:%d" % (
-                    head_idx, int(source.get("ace")), int(source.get("slot"))),
             })
         out.append(row)
     out.sort(key=lambda x: (
