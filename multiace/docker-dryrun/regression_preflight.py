@@ -589,6 +589,11 @@ def test_source_action_profile_preview() -> None:
                 f"native load should use native profile: {native_load}")
     assert_true(native_step.get("profile_action") == "load",
                 f"native load action mismatch: {native_load}")
+    native_event = native_load.get("event") or {}
+    assert_true(native_event.get("event_type") == "source_action",
+                f"native load should return source_action event: {native_load}")
+    assert_true((native_event.get("commands") or []) == [native_load.get("command")],
+                f"native load event commands mismatch: {native_load}")
 
     native_unload = post_json(f"{WEB}/source-action/preview", {
         "source": "native:1",
@@ -608,6 +613,26 @@ def test_source_action_profile_preview() -> None:
     assert_true(
         ace_swap.get("command") == "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
         f"ACE swap preview mismatch: {ace_swap}")
+
+    batch = post_json(f"{WEB}/source-actions/preview", {
+        "actions": [
+            {"source": "native:1", "head": "head:1", "action": "unload"},
+            {"source": "native:1", "head": "head:1", "action": "load"},
+            {"source": "ace:0:1", "head": "head:0", "action": "swap"},
+        ],
+    })
+    assert_true(batch.get("commands") == [
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=1 UNLOAD=1",
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=1 LOAD=1",
+        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+    ], f"source action batch command mismatch: {batch}")
+    route_plan = batch.get("route_plan") or {}
+    assert_true(route_plan.get("version") == 2,
+                f"source action batch should return route plan v2: {batch}")
+    events = route_plan.get("events") or []
+    assert_true([e.get("event_type") for e in events] == [
+        "source_action", "source_action", "source_action"],
+        f"source action batch event types mismatch: {batch}")
 
 
 def test_stale_head_source_cleared_on_print_start() -> None:

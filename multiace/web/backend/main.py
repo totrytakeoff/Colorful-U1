@@ -609,6 +609,9 @@ class SourceActionPreview(BaseModel):
     head: str | int
     action: str
 
+class SourceActionPreviewBatch(BaseModel):
+    actions: list[SourceActionPreview]
+
 EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
 EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
 OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
@@ -1656,6 +1659,27 @@ def _route_plan_event(
         "source_changed": bool(source_changed),
         "steps": steps,
         "commands": commands,
+        "target": target,
+    }
+
+def _source_action_event(
+        *,
+        index: int,
+        action: str,
+        target: dict,
+        step: dict,
+) -> dict:
+    entry = _route_plan_target_entry(target)
+    return {
+        "index": index,
+        "event_type": "source_action",
+        "action": action,
+        "source": entry.get("source"),
+        "head": entry.get("head"),
+        "edge": entry.get("edge"),
+        "execution_profile": entry.get("execution_profile"),
+        "steps": [step],
+        "commands": [step.get("command")] if step.get("command") else [],
         "target": target,
     }
 
@@ -2971,6 +2995,12 @@ async def preview_source_action(payload: SourceActionPreview) -> dict:
         raise HTTPException(
             status_code=409,
             detail=f"profile action {action!r} is not available")
+    event = _source_action_event(
+        index=0,
+        action=action,
+        target=target,
+        step=step,
+    )
     return {
         "source_graph": {
             "hash": meta.get("hash"),
@@ -2981,7 +3011,68 @@ async def preview_source_action(payload: SourceActionPreview) -> dict:
         },
         "target": target,
         "step": step,
+        "event": event,
         "command": step.get("command"),
+    }
+
+@app.post("/api/source-actions/preview")
+async def preview_source_actions(payload: SourceActionPreviewBatch) -> dict:
+    """Build a profile-driven source action route-plan fragment."""
+    if not payload.actions:
+        raise HTTPException(status_code=400, detail="actions must not be empty")
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    profiles = graph.get("profiles") or {}
+    events = []
+    commands = []
+    targets = []
+    for index, item in enumerate(payload.actions):
+        action = str(item.action or "").strip().lower()
+        if action not in ("load", "unload", "swap"):
+            raise HTTPException(
+                status_code=400,
+                detail="action must be load, unload or swap")
+        target = _target_from_graph_source_edge(graph, item.source, item.head)
+        if target is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"enabled source edge not found for action {index}")
+        step = _profile_step(target=target, profiles=profiles, action=action)
+        if step is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"profile action {action!r} is not available for action {index}")
+        event = _source_action_event(
+            index=index,
+            action=action,
+            target=target,
+            step=step,
+        )
+        events.append(event)
+        commands.extend(event.get("commands") or [])
+        targets.append(target)
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "events": events,
+        "commands": commands,
+    }
+    return {
+        "source_graph": route_plan["source_graph"],
+        "targets": targets,
+        "events": events,
+        "commands": commands,
+        "route_plan": route_plan,
     }
 
 @app.get("/api/aces")
