@@ -644,6 +644,7 @@ def test_route_plan_only_rewrite() -> None:
                 "slicer_tool": 0,
                 "source": "native:1",
                 "head": "head:1",
+                "commands": ["T1", "M117 ROUTE_EVENT_T0"],
                 "target": {
                     "kind": "native", "head": 1, "source": "native:1",
                 },
@@ -654,6 +655,11 @@ def test_route_plan_only_rewrite() -> None:
                 "slicer_tool": 1,
                 "source": "ace:0:1",
                 "head": "head:0",
+                "commands": [
+                    "T0",
+                    "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+                    "M117 ROUTE_EVENT_T1",
+                ],
                 "target": {
                     "kind": "ace", "head": 0, "source": "ace:0:1",
                     "ace": 0, "slot": 1,
@@ -675,6 +681,8 @@ def test_route_plan_only_rewrite() -> None:
     assert_true("T1" in out, f"route-plan rewrite missing native T1: {out}")
     assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in out,
                 f"route-plan rewrite missing ACE swap: {out}")
+    assert_true("M117 ROUTE_EVENT_T1" in out,
+                f"route-plan rewrite should consume event commands: {out}")
     assert_true(active == 1, f"route-plan rewrite active swap mismatch: {active}")
 
 

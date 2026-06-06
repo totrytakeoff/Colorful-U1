@@ -124,6 +124,82 @@ def _normalize_route_plan_targets(route_plan=None):
             raw_targets[str(t)] = target
     return _normalize_tool_targets(raw_targets)
 
+def _route_plan_events(route_plan=None):
+    if not route_plan:
+        return []
+    if isinstance(route_plan, str):
+        try:
+            route_plan = json.loads(route_plan)
+        except ValueError:
+            return []
+    if not isinstance(route_plan, dict):
+        return []
+    events = route_plan.get('events') or []
+    if not isinstance(events, list):
+        return []
+    out = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        try:
+            int(event.get('slicer_tool'))
+        except (TypeError, ValueError):
+            continue
+        out.append(event)
+    return out
+
+def _route_plan_event_cursor(route_plan=None):
+    by_tool = {}
+    for event in _route_plan_events(route_plan):
+        t = int(event.get('slicer_tool'))
+        by_tool.setdefault(t, []).append(event)
+    return {'by_tool': by_tool, 'offsets': {}}
+
+def _commands_from_route_event(event):
+    if not isinstance(event, dict):
+        return []
+    commands = event.get('commands') or []
+    if not isinstance(commands, list):
+        return []
+    out = []
+    for cmd in commands:
+        if cmd is None:
+            continue
+        s = str(cmd).strip()
+        if s:
+            out.append(s)
+    return out
+
+def _route_event_for_tool(cursor, t_index):
+    if not cursor:
+        return None
+    try:
+        t = int(t_index)
+    except (TypeError, ValueError):
+        return None
+    rows = cursor.get('by_tool', {}).get(t) or []
+    if not rows:
+        return None
+    offsets = cursor.setdefault('offsets', {})
+    idx = int(offsets.get(t, 0) or 0)
+    if idx >= len(rows):
+        idx = len(rows) - 1
+    offsets[t] = idx + 1
+    return rows[idx]
+
+def _commands_for_tool_event(t_index, cursor, ace_targets=None, tool_targets=None):
+    event = _route_event_for_tool(cursor, t_index)
+    commands = _commands_from_route_event(event)
+    if commands:
+        return commands
+    target = _target_for_tool(int(t_index), ace_targets, tool_targets)
+    head = target['head']
+    if target['kind'] != 'ace':
+        return ['T%d' % head]
+    return ['T%d' % head,
+            'ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d'
+            % (head, target['ace'], target['slot'])]
+
 def _target_for_tool(t_index, ace_targets=None, tool_targets=None,
                      route_plan=None):
     route_targets = _normalize_route_plan_targets(route_plan)
@@ -159,6 +235,7 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     route_plan_targets = _normalize_route_plan_targets(route_plan)
     if route_plan_targets:
         tool_targets = route_plan_targets
+    route_cursor = _route_plan_event_cursor(route_plan)
 
     def _fix_m104(m):
         return re.sub(r'T(1[0-5]|[0-9])',
@@ -194,14 +271,8 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
                  _expand_initial, pre, flags=re.MULTILINE)
 
     def _expand_swap(m):
-        target = _target_for_tool(int(m.group(1)), ace_targets, tool_targets)
-        head = target['head']
-        if target['kind'] != 'ace':
-            return 'T%d' % head
-        ace = target['ace']
-        slot = target['slot']
-        return 'T%d\nACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d' % (
-            head, head, ace, slot)
+        return '\n'.join(_commands_for_tool_event(
+            int(m.group(1)), route_cursor, ace_targets, tool_targets))
 
     body = re.sub(r'^T(1[0-5]|[0-9])\s*$',
                   _expand_swap, body, flags=re.MULTILINE)
@@ -1842,6 +1913,7 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     route_plan_targets = _normalize_route_plan_targets(route_plan)
     if route_plan_targets:
         tool_targets = route_plan_targets
+    route_cursor = _route_plan_event_cursor(route_plan)
     bare_hi   = re.compile(r'^T(1[0-5]|[0-9])\s*$')
     bare_lo   = re.compile(r'^T([0-3])\s*$')
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
@@ -1893,6 +1965,28 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
         for b in pending_blanks:
             fout.write(b)
         pending_blanks.clear()
+
+    def emit_route_commands(fout, commands):
+        nonlocal active, skipped
+        for cmd in commands:
+            stripped_cmd = str(cmd).strip()
+            if not stripped_cmd:
+                continue
+            m_cmd = swap_re.match(stripped_cmd)
+            if not m_cmd:
+                fout.write(stripped_cmd + '\n')
+                continue
+            head = int(m_cmd.group(1))
+            ace = int(m_cmd.group(2))
+            slot = int(m_cmd.group(3))
+            key = (ace, slot)
+            if head_loaded.get(head) == key:
+                fout.write('; ' + stripped_cmd + '  ; skipped (already loaded)\n')
+                skipped += 1
+            else:
+                head_loaded[head] = key
+                fout.write(stripped_cmd + '\n')
+                active += 1
 
     with open(in_path, 'r', encoding='utf-8', errors='replace') as fin, \
          open(out_path, 'w', encoding='utf-8') as fout:
@@ -1966,25 +2060,10 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
 
             m = bare_hi.match(stripped)
             if m:
-                target = _target_for_tool(
-                    int(m.group(1)), ace_targets, tool_targets)
-                head = target['head']
-                fout.write('T%d\n' % head)
-                if target['kind'] != 'ace':
-                    last_pr = _emit_progress(progress, seen, total, last_pr)
-                    continue
-                ace = target['ace']
-                slot = target['slot']
-                key = (ace, slot)
-                if head_loaded.get(head) == key:
-                    fout.write('; ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d  ; skipped (already loaded)\n' % (
-                        head, ace, slot))
-                    skipped += 1
-                else:
-                    fout.write('ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d\n' % (
-                        head, ace, slot))
-                    head_loaded[head] = key
-                    active += 1
+                emit_route_commands(
+                    fout,
+                    _commands_for_tool_event(
+                        int(m.group(1)), route_cursor, ace_targets, tool_targets))
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 
