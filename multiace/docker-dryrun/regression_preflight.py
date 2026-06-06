@@ -573,6 +573,43 @@ def test_wrong_feed_auto_channel_rejected() -> None:
                 f"wrong FEED_AUTO channel should be rejected: {err}")
 
 
+def test_source_action_profile_preview() -> None:
+    reset_default()
+    native_load = post_json(f"{WEB}/source-action/preview", {
+        "source": "native:1",
+        "head": "head:1",
+        "action": "load",
+    })
+    assert_true(
+        native_load.get("command")
+        == "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=1 LOAD=1",
+        f"native load preview mismatch: {native_load}")
+    native_step = native_load.get("step") or {}
+    assert_true(native_step.get("profile") == "u1_native_feeder",
+                f"native load should use native profile: {native_load}")
+    assert_true(native_step.get("profile_action") == "load",
+                f"native load action mismatch: {native_load}")
+
+    native_unload = post_json(f"{WEB}/source-action/preview", {
+        "source": "native:1",
+        "head": 1,
+        "action": "unload",
+    })
+    assert_true(
+        native_unload.get("command")
+        == "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=1 UNLOAD=1",
+        f"native unload preview mismatch: {native_unload}")
+
+    ace_swap = post_json(f"{WEB}/source-action/preview", {
+        "source": "ace:0:1",
+        "head": "head:0",
+        "action": "swap",
+    })
+    assert_true(
+        ace_swap.get("command") == "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+        f"ACE swap preview mismatch: {ace_swap}")
+
+
 def test_stale_head_source_cleared_on_print_start() -> None:
     set_scenario({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -720,6 +757,7 @@ def main() -> int:
         test_unmapped_tool_is_not_feasible,
         test_manual_mapping_can_reuse_source_edge,
         test_wrong_feed_auto_channel_rejected,
+        test_source_action_profile_preview,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,

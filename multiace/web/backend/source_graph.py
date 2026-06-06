@@ -139,6 +139,18 @@ def default_graph(ace_count: int = 1) -> dict[str, Any]:
     }
 
 
+def _merge_defaults(value: Any, defaults: Any) -> Any:
+    if isinstance(value, dict) and isinstance(defaults, dict):
+        out = deepcopy(value)
+        for key, default_value in defaults.items():
+            if key in out:
+                out[key] = _merge_defaults(out[key], default_value)
+            else:
+                out[key] = deepcopy(default_value)
+        return out
+    return deepcopy(value)
+
+
 def normalize_graph(graph: dict[str, Any]) -> dict[str, Any]:
     out = deepcopy(graph if isinstance(graph, dict) else {})
     out["version"] = int(out.get("version") or GRAPH_VERSION)
@@ -147,7 +159,10 @@ def normalize_graph(graph: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("edges", [])
     profiles = out.setdefault("profiles", {})
     for profile_id, profile in DEFAULT_PROFILES.items():
-        profiles.setdefault(profile_id, deepcopy(profile))
+        if profile_id in profiles:
+            profiles[profile_id] = _merge_defaults(profiles[profile_id], profile)
+        else:
+            profiles[profile_id] = deepcopy(profile)
     return out
 
 

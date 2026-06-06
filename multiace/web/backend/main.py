@@ -604,6 +604,11 @@ class ConfigUpdate(BaseModel):
 class SourceGraphUpdate(BaseModel):
     graph: dict[str, Any]
 
+class SourceActionPreview(BaseModel):
+    source: str
+    head: str | int
+    action: str
+
 EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
 EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
 OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
@@ -1489,6 +1494,114 @@ def _format_profile_command(template: str | None, values: dict) -> str:
     except Exception:
         return ""
 
+def _head_index_from_id(head: str | int | None) -> int | None:
+    if isinstance(head, int):
+        return head
+    raw = str(head or "").strip()
+    if raw.startswith("head:"):
+        raw = raw.split(":", 1)[1]
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+def _profile_step(
+        *,
+        target: dict,
+        profiles: dict | None,
+        action: str,
+) -> dict | None:
+    profiles = profiles if isinstance(profiles, dict) else {}
+    profile_id = target.get("execution_profile") or ""
+    profile = profiles.get(profile_id) if profile_id else {}
+    action_spec = profile.get(action) if isinstance(profile, dict) else {}
+    if action_spec is None:
+        return None
+    if not isinstance(action_spec, dict):
+        action_spec = {}
+    try:
+        head = int(target.get("head"))
+    except (TypeError, ValueError):
+        return None
+    values = {
+        "head": head,
+        "source": target.get("source") or "",
+        "module": target.get("module") or "",
+        "channel": target.get("channel"),
+        "ace": target.get("ace"),
+        "slot": target.get("slot"),
+    }
+    command = _format_profile_command(action_spec.get("command"), values)
+    if not command:
+        return None
+    step_kind = {
+        "load": "load_source",
+        "unload": "unload_source",
+        "swap": "swap_source",
+    }.get(action, action)
+    step = {
+        "kind": step_kind,
+        "profile": profile_id,
+        "profile_action": action,
+        "source": target.get("source"),
+        "head": f"head:{head}",
+        "command": command,
+    }
+    for key in ("ace", "slot", "module", "channel"):
+        if key in target and target.get(key) is not None:
+            step[key] = target.get(key)
+    return step
+
+def _target_from_graph_source_edge(
+        graph: dict,
+        source_id: str,
+        head_ref: str | int,
+) -> dict | None:
+    head_idx = _head_index_from_id(head_ref)
+    if head_idx is None:
+        return None
+    head_id = f"head:{head_idx}"
+    heads = graph.get("heads") or {}
+    sources = graph.get("sources") or {}
+    source = sources.get(source_id)
+    head = heads.get(head_id)
+    if not isinstance(source, dict) or not isinstance(head, dict):
+        return None
+    edge_obj = None
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or not edge.get("enabled", True):
+            continue
+        if edge.get("source") == source_id and edge.get("head") == head_id:
+            edge_obj = edge
+            break
+    if edge_obj is None:
+        return None
+    kind = source.get("kind")
+    target = {
+        "kind": "native" if kind == "native_feeder" else "ace",
+        "source": source_id,
+        "key": f"{source_id}->{head_id}",
+        "head": head_idx,
+        "head_id": head_id,
+        "edge": {
+            "source": source_id,
+            "head": head_id,
+            "priority": edge_obj.get("priority", 100),
+            "constraints": edge_obj.get("constraints") or {},
+        },
+        "execution_profile": source.get("execution_profile") or "",
+    }
+    if kind == "native_feeder":
+        channel = head.get("native_channel") or {}
+        target["module"] = channel.get("module")
+        target["channel"] = channel.get("channel")
+    elif kind == "ace_slot":
+        target["ace"] = source.get("ace")
+        target["slot"] = source.get("slot")
+    else:
+        return None
+    return target
+
 def _route_plan_steps(target: dict | None, source_changed: bool,
                       profiles: dict | None = None) -> list[dict]:
     target = target or {}
@@ -1506,33 +1619,9 @@ def _route_plan_steps(target: dict | None, source_changed: bool,
         "command": f"T{head}",
     })
     if target.get("kind") == "ace" and source_changed:
-        try:
-            ace = int(target.get("ace"))
-            slot = int(target.get("slot"))
-        except (TypeError, ValueError):
-            return steps
-        profile_id = target.get("execution_profile") or "ace_v1_slot"
-        profile = profiles.get(profile_id) if isinstance(profiles, dict) else {}
-        swap = profile.get("swap") if isinstance(profile, dict) else {}
-        command = _format_profile_command(
-            (swap or {}).get("command"),
-            {
-                "head": head,
-                "ace": ace,
-                "slot": slot,
-                "source": target.get("source") or "",
-            },
-        ) or f"ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}"
-        steps.append({
-            "kind": "swap_source",
-            "profile": profile_id,
-            "profile_action": "swap",
-            "source": target.get("source"),
-            "head": f"head:{head}",
-            "ace": ace,
-            "slot": slot,
-            "command": command,
-        })
+        step = _profile_step(target=target, profiles=profiles, action="swap")
+        if step:
+            steps.append(step)
     return steps
 
 def _route_plan_event(
@@ -2854,6 +2943,46 @@ async def get_source_state() -> dict:
     state = sg.source_state(graph, parsed)
     state["meta"] = meta
     return state
+
+@app.post("/api/source-action/preview")
+async def preview_source_action(payload: SourceActionPreview) -> dict:
+    """Build one profile-driven source action step without moving hardware."""
+    action = str(payload.action or "").strip().lower()
+    if action not in ("load", "unload", "swap"):
+        raise HTTPException(
+            status_code=400,
+            detail="action must be load, unload or swap")
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    target = _target_from_graph_source_edge(graph, payload.source, payload.head)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail="enabled source edge not found")
+    step = _profile_step(
+        target=target,
+        profiles=(graph.get("profiles") or {}),
+        action=action,
+    )
+    if step is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"profile action {action!r} is not available")
+    return {
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "target": target,
+        "step": step,
+        "command": step.get("command"),
+    }
 
 @app.get("/api/aces")
 async def list_aces() -> dict:
