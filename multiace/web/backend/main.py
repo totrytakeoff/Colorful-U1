@@ -979,8 +979,10 @@ def _target_to_dict(target: dict | None) -> dict | None:
         "kind": target.get("kind"),
         "head": target.get("head"),
     }
-    for key in ("key", "source", "head_id", "edge", "execution_profile"):
-        if target.get(key):
+    for key in (
+            "key", "source", "head_id", "edge", "execution_profile",
+            "module", "channel"):
+        if key in target and target.get(key) is not None:
             out[key] = target.get(key)
     if target.get("source"):
         out["source"] = target.get("source")
@@ -1063,6 +1065,8 @@ def _target_from_loadout_item(item: dict) -> dict:
         "execution_profile": item.get("execution_profile") or "",
     }
     if item.get("kind") == "native":
+        out["module"] = item.get("module")
+        out["channel"] = item.get("channel")
         return out
     out.update({
         "kind": "ace",
@@ -1477,10 +1481,20 @@ def _route_plan_target_entry(target: dict | None) -> dict:
         "target": target,
     }
 
-def _route_plan_steps(target: dict | None, source_changed: bool) -> list[dict]:
+def _format_profile_command(template: str | None, values: dict) -> str:
+    if not template:
+        return ""
+    try:
+        return str(template).format(**values)
+    except Exception:
+        return ""
+
+def _route_plan_steps(target: dict | None, source_changed: bool,
+                      profiles: dict | None = None) -> list[dict]:
     target = target or {}
     if not target:
         return []
+    profiles = profiles if isinstance(profiles, dict) else {}
     steps = []
     try:
         head = int(target.get("head"))
@@ -1497,13 +1511,27 @@ def _route_plan_steps(target: dict | None, source_changed: bool) -> list[dict]:
             slot = int(target.get("slot"))
         except (TypeError, ValueError):
             return steps
+        profile_id = target.get("execution_profile") or "ace_v1_slot"
+        profile = profiles.get(profile_id) if isinstance(profiles, dict) else {}
+        swap = profile.get("swap") if isinstance(profile, dict) else {}
+        command = _format_profile_command(
+            (swap or {}).get("command"),
+            {
+                "head": head,
+                "ace": ace,
+                "slot": slot,
+                "source": target.get("source") or "",
+            },
+        ) or f"ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}"
         steps.append({
             "kind": "swap_source",
+            "profile": profile_id,
+            "profile_action": "swap",
             "source": target.get("source"),
             "head": f"head:{head}",
             "ace": ace,
             "slot": slot,
-            "command": f"ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}",
+            "command": command,
         })
     return steps
 
@@ -1513,6 +1541,7 @@ def _route_plan_event(
         slicer_tool: int,
         target: dict | None,
         source_changed: bool,
+        profiles: dict | None = None,
 ) -> dict:
     target = target or {}
     entry = _route_plan_target_entry(target)
@@ -1524,7 +1553,7 @@ def _route_plan_event(
         action = "select"
     else:
         action = "select_loaded"
-    steps = _route_plan_steps(target, source_changed)
+    steps = _route_plan_steps(target, source_changed, profiles)
     commands = [step.get("command") for step in steps if step.get("command")]
     return {
         "index": index,
@@ -1549,9 +1578,11 @@ def _build_route_plan(
         tool_targets: dict[str, dict],
         used_tools: set[int],
         events: list[int] | tuple[int, ...] | None,
+        profiles: dict | None = None,
         stats: dict | None = None,
         created_at: float | None = None,
 ) -> dict:
+    profiles = profiles if isinstance(profiles, dict) else {}
     tool_map = {}
     for t in sorted(used_tools):
         target = tool_targets.get(str(t), tool_targets.get(t))
@@ -1578,6 +1609,7 @@ def _build_route_plan(
             slicer_tool=t,
             target=target,
             source_changed=changed,
+            profiles=profiles,
         ))
 
     if not route_events:
@@ -1588,6 +1620,7 @@ def _build_route_plan(
                 slicer_tool=t,
                 target=target,
                 source_changed=True,
+                profiles=profiles,
             ))
 
     return {
@@ -2086,7 +2119,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         used_tools=used_tools,
         events=events,
     )
-    _graph, graph_meta = _load_source_graph(parsed)
+    graph, graph_meta = _load_source_graph(parsed)
     route_plan = _build_route_plan(
         token=token,
         filename=safe_name,
@@ -2094,6 +2127,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         tool_targets=tool_targets,
         used_tools=used_tools,
         events=events,
+        profiles=(graph.get("profiles") or {}),
         stats=source_map.get("swap_stats") or {},
         created_at=source_map.get("created_at"),
     )
@@ -2488,7 +2522,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             used_tools=used_tools,
             events=_load_preflight_events(req.token),
         )
-        _graph, graph_meta = _load_source_graph(parsed)
+        graph, graph_meta = _load_source_graph(parsed)
         route_plan = _build_route_plan(
             token=req.token,
             filename=safe_name,
@@ -2496,6 +2530,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             tool_targets=manual_targets,
             used_tools=used_tools,
             events=_load_preflight_events(req.token),
+            profiles=(graph.get("profiles") or {}),
             stats=source_map.get("swap_stats") or {},
             created_at=source_map.get("created_at"),
         )

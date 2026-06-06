@@ -274,6 +274,13 @@ def assert_route_plan_shape(report: dict) -> None:
                     f"route event missing source_changed: {event}")
         steps = event.get("steps") or []
         assert_true(steps, f"route event missing structured steps: {event}")
+        for step in steps:
+            assert_true(step.get("kind"), f"route step missing kind: {event}")
+        swap_steps = [s for s in steps if s.get("kind") == "swap_source"]
+        for step in swap_steps:
+            assert_true(step.get("profile"), f"swap step missing profile: {step}")
+            assert_true(step.get("profile_action") == "swap",
+                        f"swap step missing profile action: {step}")
         step_commands = [
             step.get("command")
             for step in steps

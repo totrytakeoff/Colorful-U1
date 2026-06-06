@@ -471,6 +471,11 @@ def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
             "state": source.get("state") or "",
             "execution_profile": source.get("execution_profile") or "",
         }
+        if kind == "native_feeder":
+            row.update({
+                "module": (head.get("native_channel") or {}).get("module"),
+                "channel": (head.get("native_channel") or {}).get("channel"),
+            })
         if kind == "ace_slot":
             row.update({
                 "ace": int(source.get("ace")),
