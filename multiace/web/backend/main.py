@@ -1459,50 +1459,154 @@ def _load_preflight_route_plan(token: str) -> dict:
     source_map = _load_preflight_source_map(token)
     return _route_plan_from_source_map(source_map) if source_map else {}
 
+def _route_plan_target_entry(target: dict | None) -> dict:
+    target = target or {}
+    head = target.get("head")
+    head_id = target.get("head_id")
+    if not head_id and head is not None:
+        head_id = f"head:{head}"
+    edge = target.get("edge") if isinstance(target.get("edge"), dict) else {}
+    return {
+        "source": target.get("source"),
+        "head": head_id,
+        "edge": edge or {
+            "source": target.get("source"),
+            "head": head_id,
+        },
+        "execution_profile": target.get("execution_profile") or "",
+        "target": target,
+    }
+
+def _route_plan_event(
+        *,
+        index: int,
+        slicer_tool: int,
+        target: dict | None,
+        source_changed: bool,
+) -> dict:
+    target = target or {}
+    entry = _route_plan_target_entry(target)
+    commands = _target_command_preview(target)
+    if not target:
+        action = "unmapped"
+    elif target.get("kind") == "ace":
+        action = "swap" if source_changed else "select_loaded"
+    elif source_changed:
+        action = "select"
+    else:
+        action = "select_loaded"
+    return {
+        "index": index,
+        "event_type": "tool_select",
+        "slicer_tool": slicer_tool,
+        "source": entry.get("source"),
+        "head": entry.get("head"),
+        "edge": entry.get("edge"),
+        "execution_profile": entry.get("execution_profile"),
+        "action": action,
+        "source_changed": bool(source_changed),
+        "commands": commands,
+        "target": target,
+    }
+
+def _build_route_plan(
+        *,
+        token: str,
+        filename: str,
+        graph_meta: dict,
+        tool_targets: dict[str, dict],
+        used_tools: set[int],
+        events: list[int] | tuple[int, ...] | None,
+        stats: dict | None = None,
+        created_at: float | None = None,
+) -> dict:
+    tool_map = {}
+    for t in sorted(used_tools):
+        target = tool_targets.get(str(t), tool_targets.get(t))
+        tool_map[str(t)] = _route_plan_target_entry(target)
+
+    route_events = []
+    head_current: dict[str, str | None] = {}
+    event_stream = list(events or [])
+    for idx, raw_t in enumerate(event_stream):
+        try:
+            t = int(raw_t)
+        except (TypeError, ValueError):
+            continue
+        target = tool_targets.get(str(t), tool_targets.get(t))
+        entry = _route_plan_target_entry(target)
+        head = entry.get("head")
+        source = entry.get("source")
+        changed = True
+        if head:
+            changed = head_current.get(str(head)) != source
+            head_current[str(head)] = source
+        route_events.append(_route_plan_event(
+            index=idx,
+            slicer_tool=t,
+            target=target,
+            source_changed=changed,
+        ))
+
+    if not route_events:
+        for idx, t in enumerate(sorted(used_tools)):
+            target = tool_targets.get(str(t), tool_targets.get(t))
+            route_events.append(_route_plan_event(
+                index=idx,
+                slicer_tool=t,
+                target=target,
+                source_changed=True,
+            ))
+
+    return {
+        "version": 2,
+        "token": token,
+        "filename": filename,
+        "created_at": created_at or time.time(),
+        "source_graph_hash": graph_meta.get("hash"),
+        "source_graph": {
+            "hash": graph_meta.get("hash"),
+            "source": graph_meta.get("source"),
+            "path": graph_meta.get("path"),
+            "errors": graph_meta.get("errors", []),
+            "warnings": graph_meta.get("warnings", []),
+        },
+        "used_tools": sorted(used_tools),
+        "tool_map": tool_map,
+        "events": route_events,
+        "stats": stats or _build_swap_stats(event_stream, tool_targets),
+    }
+
 def _route_plan_from_source_map(source_map: dict) -> dict:
     graph_meta = source_map.get("source_graph") or {}
-    events = []
-    for idx, entry in enumerate(source_map.get("entries") or []):
-        target = entry.get("target") or {}
-        source = target.get("source")
-        head = target.get("head")
-        commands = entry.get("commands") or _target_command_preview(target)
-        action = "select"
-        if target.get("kind") == "ace":
-            action = "swap"
-        elif target.get("kind") == "native" and len(commands) > 1:
-            action = "load"
-        events.append({
-            "index": idx,
-            "slicer_tool": entry.get("slicer_tool"),
-            "source": source,
-            "head": None if head is None else f"head:{head}",
-            "action": action,
-            "commands": commands,
-            "target": target,
-        })
-    tool_map = {}
+    tool_targets = {}
+    used_tools = set()
     for entry in source_map.get("entries") or []:
         target = entry.get("target") or {}
         tool = entry.get("slicer_tool")
         if tool is None:
             continue
-        head = target.get("head")
-        tool_map[str(tool)] = {
-            "source": target.get("source"),
-            "head": None if head is None else f"head:{head}",
-            "target": target,
-        }
-    return {
-        "version": 1,
-        "token": source_map.get("token"),
-        "filename": source_map.get("filename"),
-        "created_at": source_map.get("created_at"),
-        "source_graph_hash": graph_meta.get("hash"),
-        "tool_map": tool_map,
-        "events": events,
-        "stats": source_map.get("swap_stats") or {},
-    }
+        try:
+            t = int(tool)
+        except (TypeError, ValueError):
+            continue
+        used_tools.add(t)
+        tool_targets[str(t)] = target
+    sample_events = [
+        int(e.get("slicer_tool"))
+        for e in ((source_map.get("swap_stats") or {}).get("events_sample") or [])
+        if isinstance(e, dict) and e.get("slicer_tool") is not None
+    ]
+    return _build_route_plan(
+        token=source_map.get("token"),
+        filename=source_map.get("filename"),
+        graph_meta=graph_meta,
+        tool_targets=tool_targets,
+        used_tools=used_tools,
+        events=sample_events or sorted(used_tools),
+        stats=source_map.get("swap_stats") or {},
+        created_at=source_map.get("created_at"),
+    )
 
 def _route_plan_targets(route_plan: dict) -> dict[str, dict]:
     out: dict[str, dict] = {}
@@ -1950,7 +2054,17 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         used_tools=used_tools,
         events=events,
     )
-    route_plan = _route_plan_from_source_map(source_map)
+    _graph, graph_meta = _load_source_graph(parsed)
+    route_plan = _build_route_plan(
+        token=token,
+        filename=safe_name,
+        graph_meta=graph_meta,
+        tool_targets=tool_targets,
+        used_tools=used_tools,
+        events=events,
+        stats=source_map.get("swap_stats") or {},
+        created_at=source_map.get("created_at"),
+    )
     (_PREFLIGHT_DIR / (token + ".targets")).write_text(
         json.dumps(tool_targets, indent=2),
         encoding="utf-8")
@@ -2342,7 +2456,17 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             used_tools=used_tools,
             events=_load_preflight_events(req.token),
         )
-        route_plan = _route_plan_from_source_map(source_map)
+        _graph, graph_meta = _load_source_graph(parsed)
+        route_plan = _build_route_plan(
+            token=req.token,
+            filename=safe_name,
+            graph_meta=graph_meta,
+            tool_targets=manual_targets,
+            used_tools=used_tools,
+            events=_load_preflight_events(req.token),
+            stats=source_map.get("swap_stats") or {},
+            created_at=source_map.get("created_at"),
+        )
         _save_preflight_source_map(source_map)
         _save_preflight_route_plan(route_plan)
 

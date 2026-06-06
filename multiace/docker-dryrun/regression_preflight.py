@@ -253,14 +253,25 @@ def assert_route_plan_shape(report: dict) -> None:
     route_plan = report.get("route_plan") or {}
     source_map = report.get("source_map") or {}
     graph_meta = source_map.get("source_graph") or {}
+    assert_true(route_plan.get("version") == 2,
+                f"route plan should use v2 schema: {route_plan}")
     assert_true(route_plan.get("source_graph_hash") == graph_meta.get("hash"),
                 f"route plan graph hash mismatch: {route_plan}")
     events = route_plan.get("events") or []
     assert_true(events, f"route plan missing events: {route_plan}")
     for event in events:
+        assert_true(event.get("event_type") == "tool_select",
+                    f"route event missing event type: {event}")
         assert_true(event.get("source"), f"route event missing source: {event}")
         assert_true(str(event.get("head") or "").startswith("head:"),
                     f"route event missing graph head id: {event}")
+        edge = event.get("edge") or {}
+        assert_true(edge.get("source") == event.get("source"),
+                    f"route event edge source mismatch: {event}")
+        assert_true(edge.get("head") == event.get("head"),
+                    f"route event edge head mismatch: {event}")
+        assert_true("source_changed" in event,
+                    f"route event missing source_changed: {event}")
         assert_true(event.get("commands"), f"route event missing commands: {event}")
 
 
@@ -625,14 +636,22 @@ def test_source_graph_edge_required_for_ace_swap() -> None:
 def test_route_plan_only_rewrite() -> None:
     pp = load_postprocessor()
     route_plan = {
-        "version": 1,
-        "tool_map": {
-            "0": {
+        "version": 2,
+        "events": [
+            {
+                "index": 0,
+                "event_type": "tool_select",
+                "slicer_tool": 0,
                 "source": "native:1",
                 "head": "head:1",
-                "target": {"kind": "native", "head": 1, "source": "native:1"},
+                "target": {
+                    "kind": "native", "head": 1, "source": "native:1",
+                },
             },
-            "1": {
+            {
+                "index": 1,
+                "event_type": "tool_select",
+                "slicer_tool": 1,
                 "source": "ace:0:1",
                 "head": "head:0",
                 "target": {
@@ -640,7 +659,7 @@ def test_route_plan_only_rewrite() -> None:
                     "ace": 0, "slot": 1,
                 },
             },
-        },
+        ],
     }
     src = gcode(
         "PLA;PETG",
