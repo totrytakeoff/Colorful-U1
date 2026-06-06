@@ -2817,6 +2817,36 @@ async def preflight_route_plan(token: str) -> dict:
         raise HTTPException(status_code=404, detail="route plan not found")
     return route_plan
 
+@app.get("/api/preflight/route-plan/validate")
+async def preflight_route_plan_validate(token: str) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    route_plan = _load_preflight_route_plan(token)
+    if not route_plan:
+        raise HTTPException(status_code=404, detail="route plan not found")
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    errors = _validate_route_plan_for_graph(route_plan, graph, meta)
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "route_plan": {
+            "version": route_plan.get("version"),
+            "source_graph_hash": route_plan.get("source_graph_hash"),
+            "events": len(route_plan.get("events") or []),
+        },
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+    }
+
 _cfg_scalar_cache: dict = {"mtime": 0.0, "values": {}}
 
 def _read_cfg_scalars() -> dict:

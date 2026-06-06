@@ -427,6 +427,11 @@ def test_mixed_native_ace_print() -> None:
     saved_plan = request("GET", f"{WEB}/preflight/route-plan?token={report['token']}")
     assert_true(saved_plan.get("events") == (report.get("route_plan") or {}).get("events"),
                 "saved route plan differs from preflight response")
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    assert_true(validation.get("ok"), f"saved route plan should validate: {validation}")
     started = start_print(report)
     status = wait_job(started["job_id"])
     assert_true(
@@ -755,6 +760,14 @@ def test_route_plan_rejects_graph_hash_change() -> None:
         "priority": 999,
     })
     push_graph(graph)
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    assert_true(not validation.get("ok"),
+                f"route plan validate should fail after graph change: {validation}")
+    assert_true("hash mismatch" in "; ".join(validation.get("errors") or []).lower(),
+                f"route plan validate error mismatch: {validation}")
     started = post_json(f"{WEB}/preflight/print", {
         "token": report["token"],
         "mode": "slicer",
