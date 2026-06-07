@@ -1427,6 +1427,52 @@ def test_route_plan_validate_rejects_incomplete_tool_contract() -> None:
                 f"missing event error mismatch: {validation}")
 
 
+def test_route_plan_validate_rejects_tampered_profile_command() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {"head": 0, "ace": 0, "slot": 1, "material": "PETG", "color": "1E78DC"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    push_graph(graph)
+    preview = post_json(f"{WEB}/source-transition/preview", {
+        "source": "native:1",
+        "head": "head:0",
+    })
+    route_plan = preview.get("route_plan") or {}
+    tampered = json.loads(json.dumps(route_plan))
+    event = (tampered.get("events") or [])[0]
+    steps = event.get("steps") or []
+    for step in steps:
+        if step.get("kind") == "load_source":
+            step["channel"] = 1
+            step["command"] = "FEED_AUTO MODULE=left CHANNEL=1 EXTRUDER=0 LOAD=1"
+    event["commands"] = [
+        step.get("command") for step in steps if step.get("command")
+    ]
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": tampered,
+    })
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"tampered route plan should be rejected: {validation}")
+    assert_true("command does not match profile" in errors
+                or "channel mismatch" in errors,
+                f"tampered command error mismatch: {validation}")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -1451,6 +1497,7 @@ def main() -> int:
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,
         test_route_plan_validate_rejects_incomplete_tool_contract,
+        test_route_plan_validate_rejects_tampered_profile_command,
     ]
     for test in tests:
         test()

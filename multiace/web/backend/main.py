@@ -2121,6 +2121,34 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                         errors.append(
                             "route event[%d] step[%d] profile action %r missing command"
                             % (idx, step_idx, action))
+                    elif step_source and head_id:
+                        expected_target = _target_from_graph_source_edge(
+                            graph, step_source, head_id)
+                        expected_step = None
+                        if expected_target:
+                            expected_step = _profile_step(
+                                target=expected_target,
+                                profiles=profiles,
+                                action=action,
+                            )
+                        if not expected_step:
+                            errors.append(
+                                "route event[%d] step[%d] cannot derive profile command"
+                                % (idx, step_idx))
+                        else:
+                            if profile_id != expected_step.get("profile"):
+                                errors.append(
+                                    "route event[%d] step[%d] profile mismatch"
+                                    % (idx, step_idx))
+                            if command != expected_step.get("command"):
+                                errors.append(
+                                    "route event[%d] step[%d] command does not match profile"
+                                    % (idx, step_idx))
+                            for key in ("ace", "slot", "module", "channel"):
+                                if key in expected_step and step.get(key) != expected_step.get(key):
+                                    errors.append(
+                                        "route event[%d] step[%d] %s mismatch"
+                                        % (idx, step_idx, key))
             if kind in ("load_source", "unload_source"):
                 source = sources.get(step_source) if step_source in sources else {}
                 if source.get("kind") == "native_feeder":
