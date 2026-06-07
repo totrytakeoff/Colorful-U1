@@ -33,6 +33,9 @@
   structured `events[].steps` 和镜像 `commands`。
 - 打印发送前会重新校验 route plan 与当前 source graph hash、edge、profile
   action 和命令字段是否一致。
+- 打印发送前会把 route plan 的 `initial_state` 与实时 `source_state`
+  对齐校验；若受影响 head 的当前 source 或 confidence 已变化，则拒绝继续
+  使用旧计划，要求重新 preflight。
 - 新增 `GET /api/preflight/route-plan/validate?token=...` 和
   `POST /api/route-plan/validate`。
 - 新增 source action 预览：
@@ -466,6 +469,9 @@ source kind 的必填字段：
 - native source 不允许在没有明确 channel 的情况下生成 load/unload 命令。
 - 保存 graph 时只保存配置状态，不写入 `current_source`。真实装载状态必须来自
   `source_state` 或 Klipper `save_variables`。
+- 打印 route plan 的 `initial_state` 只作为计划快照；实际发送前必须重新读取
+  实时 `source_state`。受影响 head 的 `current_source` 或
+  `source_confidence` 与快照不一致时，必须重新生成 route plan。
 
 ### 典型拓扑表达
 

@@ -2171,6 +2171,99 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
             errors.append("route plan missing tool_select event for T%d" % t)
     return errors
 
+def _route_plan_affected_heads(route_plan: dict) -> set[str]:
+    heads: set[str] = set()
+    if not isinstance(route_plan, dict):
+        return heads
+    for item in (route_plan.get("tool_map") or {}).values():
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target")
+        if not isinstance(target, dict):
+            continue
+        head_id = target.get("head_id")
+        if not head_id and target.get("head") is not None:
+            head_id = "head:%s" % target.get("head")
+        if head_id:
+            heads.add(str(head_id))
+    for event in route_plan.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        head_id = event.get("head")
+        if head_id:
+            heads.add(str(head_id))
+        for step in event.get("steps") or []:
+            if isinstance(step, dict) and step.get("head"):
+                heads.add(str(step.get("head")))
+    return heads
+
+def _validate_route_plan_runtime_state(route_plan: dict,
+                                       current_state: dict) -> list[str]:
+    """Reject stale route plans before moving or uploading print G-code."""
+    errors: list[str] = []
+    if not isinstance(route_plan, dict):
+        return ["route plan must be an object"]
+    used_tools = route_plan.get("used_tools") or []
+    has_tool_map = bool(route_plan.get("tool_map"))
+    has_tool_select = any(
+        isinstance(event, dict) and event.get("event_type") == "tool_select"
+        for event in route_plan.get("events") or []
+    )
+    if not (used_tools or has_tool_map or has_tool_select):
+        return []
+    initial_state = route_plan.get("initial_state")
+    if not isinstance(initial_state, dict) or not initial_state:
+        return ["route plan initial_state missing; rerun preflight"]
+    if not isinstance(current_state, dict):
+        return ["current source state missing"]
+    plan_hash = initial_state.get("source_graph_hash")
+    current_hash = current_state.get("source_graph_hash")
+    if plan_hash and current_hash and plan_hash != current_hash:
+        errors.append(
+            "route plan runtime graph hash mismatch: initial=%s current=%s"
+            % (plan_hash, current_hash))
+    planned_heads = initial_state.get("heads") or {}
+    current_heads = current_state.get("heads") or {}
+    if not isinstance(planned_heads, dict):
+        return ["route plan initial_state.heads must be an object"]
+    if not isinstance(current_heads, dict):
+        return ["current source state heads must be an object"]
+    # "stale" means the source record exists but the head sensor is empty. The
+    # print start path can safely clean that up, so allow it only when the live
+    # state still exactly matches the preflight snapshot.
+    actionable = {"known", "empty", "stale"}
+    for head_id in sorted(_route_plan_affected_heads(route_plan)):
+        planned = planned_heads.get(head_id)
+        live = current_heads.get(head_id)
+        if not isinstance(planned, dict):
+            errors.append(
+                "route plan initial_state missing affected %s; rerun preflight"
+                % head_id)
+            continue
+        if not isinstance(live, dict):
+            errors.append("current source state missing affected %s" % head_id)
+            continue
+        planned_conf = str(planned.get("source_confidence") or "")
+        live_conf = str(live.get("source_confidence") or "")
+        if planned_conf not in actionable:
+            errors.append(
+                "route plan initial_state[%s] is %s; recover head state and rerun preflight"
+                % (head_id, planned_conf or "unknown"))
+        if live_conf not in actionable:
+            errors.append(
+                "current source state[%s] is %s; recover head state before print"
+                % (head_id, live_conf or "unknown"))
+        if planned.get("current_source") != live.get("current_source"):
+            errors.append(
+                "route plan initial_state[%s] stale: initial=%r current=%r"
+                % (head_id, planned.get("current_source"),
+                   live.get("current_source")))
+        if planned_conf in actionable and live_conf in actionable and planned_conf != live_conf:
+            errors.append(
+                "route plan initial_state[%s] confidence changed: initial=%s current=%s"
+                % (head_id, planned_conf, live_conf))
+    return errors
+
 def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
     colors: dict[int, str] = {}
     materials: dict[int, str] = {}
@@ -3027,6 +3120,9 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                 "route plan missing; run source graph preflight again")
         graph, graph_meta = _load_source_graph(parsed)
         route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
+        route_errors.extend(
+            _validate_route_plan_runtime_state(
+                route_plan, sg.source_state(graph, parsed)))
         if route_errors:
             raise RuntimeError(
                 "route plan validation failed: " + "; ".join(route_errors[:8]))
@@ -3246,6 +3342,8 @@ async def preflight_route_plan_validate(token: str) -> dict:
         raise HTTPException(status_code=502, detail=f"moonraker: {e}")
     graph, meta = _load_source_graph(parsed)
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
+    current_state = sg.source_state(graph, parsed)
+    errors.extend(_validate_route_plan_runtime_state(route_plan, current_state))
     return {
         "ok": not errors,
         "errors": errors,
@@ -3261,6 +3359,7 @@ async def preflight_route_plan_validate(token: str) -> dict:
             "errors": meta.get("errors", []),
             "warnings": meta.get("warnings", []),
         },
+        "current_state": current_state,
     }
 
 @app.post("/api/route-plan/validate")
@@ -3272,6 +3371,8 @@ async def route_plan_validate(payload: RoutePlanValidateRequest) -> dict:
     graph, meta = _load_source_graph(parsed)
     route_plan = payload.route_plan
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
+    current_state = sg.source_state(graph, parsed)
+    errors.extend(_validate_route_plan_runtime_state(route_plan, current_state))
     return {
         "ok": not errors,
         "errors": errors,
@@ -3293,6 +3394,7 @@ async def route_plan_validate(payload: RoutePlanValidateRequest) -> dict:
             "errors": meta.get("errors", []),
             "warnings": meta.get("warnings", []),
         },
+        "current_state": current_state,
     }
 
 _cfg_scalar_cache: dict = {"mtime": 0.0, "values": {}}

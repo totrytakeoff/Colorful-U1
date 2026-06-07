@@ -1228,6 +1228,51 @@ def test_route_plan_rejects_graph_hash_change() -> None:
     wait_job_error(started["job_id"], "hash mismatch")
 
 
+def test_route_plan_rejects_stale_runtime_state() -> None:
+    set_scenario({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "native_heads": [],
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    })
+    report = multipart_upload(
+        "route_stale_state.gcode",
+        gcode(
+            "PETG",
+            "#1e78dc",
+            """
+            T0
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    assert_true(validation.get("ok"),
+                f"fresh route plan should validate: {validation}")
+
+    run_script("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0")
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"stale runtime state should be rejected: {validation}")
+    assert_true("stale" in errors and "head:0" in errors,
+                f"stale runtime state error mismatch: {validation}")
+    started = post_json(f"{WEB}/preflight/print", {
+        "token": report["token"],
+        "mode": "slicer",
+    })
+    wait_job_error(started["job_id"], "stale")
+
+
 def test_route_plan_only_rewrite() -> None:
     pp = load_postprocessor()
     route_plan = {
@@ -1493,6 +1538,7 @@ def main() -> int:
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,
         test_route_plan_rejects_graph_hash_change,
+        test_route_plan_rejects_stale_runtime_state,
         test_route_plan_only_rewrite,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,
