@@ -150,10 +150,11 @@ def _route_plan_events(route_plan=None):
 
 def _route_plan_event_cursor(route_plan=None):
     by_tool = {}
-    for event in _route_plan_events(route_plan):
+    events = _route_plan_events(route_plan)
+    for event in events:
         t = int(event.get('slicer_tool'))
         by_tool.setdefault(t, []).append(event)
-    return {'by_tool': by_tool, 'offsets': {}}
+    return {'by_tool': by_tool, 'offsets': {}, 'strict': bool(events)}
 
 def _commands_from_route_event(event):
     if not isinstance(event, dict):
@@ -197,7 +198,7 @@ def _route_event_for_tool(cursor, t_index):
     offsets = cursor.setdefault('offsets', {})
     idx = int(offsets.get(t, 0) or 0)
     if idx >= len(rows):
-        idx = len(rows) - 1
+        return None
     offsets[t] = idx + 1
     return rows[idx]
 
@@ -206,6 +207,10 @@ def _commands_for_tool_event(t_index, cursor, ace_targets=None, tool_targets=Non
     commands = _commands_from_route_event(event)
     if commands:
         return commands
+    if cursor and cursor.get('strict'):
+        raise ValueError(
+            'route plan missing tool_select event commands for T%d'
+            % int(t_index))
     target = _target_for_tool(int(t_index), ace_targets, tool_targets)
     head = target['head']
     if target['kind'] != 'ace':
@@ -274,6 +279,7 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
         pre, body = gcode[:m.start()], gcode[m.start():]
 
     def _expand_initial(m):
+        _route_event_for_tool(route_cursor, int(m.group(1)))
         target = _target_for_tool(int(m.group(1)), ace_targets, tool_targets)
         head = target['head']
         if target['kind'] != 'ace':
@@ -2034,6 +2040,7 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
                     flush_pending_unmatched(fout)
                 m = bare_hi.match(stripped)
                 if m:
+                    _route_event_for_tool(route_cursor, int(m.group(1)))
                     target = _target_for_tool(
                         int(m.group(1)), ace_targets, tool_targets)
                     head = target['head']

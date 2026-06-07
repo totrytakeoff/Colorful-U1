@@ -1195,6 +1195,45 @@ def test_route_plan_only_rewrite() -> None:
     assert_true(active == 1, f"route-plan rewrite active swap mismatch: {active}")
 
 
+def test_route_plan_only_rewrite_rejects_missing_event() -> None:
+    pp = load_postprocessor()
+    route_plan = {
+        "version": 2,
+        "events": [
+            {
+                "index": 0,
+                "event_type": "tool_select",
+                "slicer_tool": 0,
+                "source": "native:1",
+                "head": "head:1",
+                "steps": [
+                    {"kind": "select_head", "head": "head:1", "command": "T1"},
+                ],
+                "target": {
+                    "kind": "native", "head": 1, "source": "native:1",
+                },
+            },
+        ],
+    }
+    src = gcode(
+        "PLA;PETG",
+        "#dc2828;#1e78dc",
+        """
+        T0
+        ; Change Tool 0 -> Tool 1
+        T1
+        G1 X10 Y10 E1
+        """,
+    )
+    try:
+        pp.rewrite(src, route_plan=route_plan)
+    except ValueError as exc:
+        assert_true("route plan missing tool_select" in str(exc),
+                    f"unexpected missing-event error: {exc}")
+    else:
+        raise AssertionError("route-plan rewrite should reject missing T1 event")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -1215,6 +1254,7 @@ def main() -> int:
         test_source_graph_edge_required_for_ace_swap,
         test_route_plan_rejects_graph_hash_change,
         test_route_plan_only_rewrite,
+        test_route_plan_only_rewrite_rejects_missing_event,
     ]
     for test in tests:
         test()
