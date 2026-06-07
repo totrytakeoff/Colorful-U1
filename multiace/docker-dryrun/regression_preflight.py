@@ -402,6 +402,18 @@ def assert_route_plan_shape(report: dict) -> None:
     phases = execution.get("phases") or []
     assert_true(len(phases) == len(route_plan.get("events") or []),
                 f"route plan execution phase count mismatch: {route_plan}")
+    preload = execution.get("preload_analysis") or {}
+    assert_true(preload.get("version") == 1,
+                f"route plan execution missing preload analysis: {route_plan}")
+    assert_true(preload.get("enabled") is False,
+                f"route plan preload analysis should be disabled: {route_plan}")
+    assert_true(isinstance(preload.get("candidates"), list),
+                f"route plan preload analysis missing candidates: {route_plan}")
+    assert_true(isinstance(preload.get("blocked"), list),
+                f"route plan preload analysis missing blocked list: {route_plan}")
+    summary = preload.get("summary") or {}
+    assert_true(summary.get("scheduled_count") == 0,
+                f"route plan should not schedule preload yet: {route_plan}")
     heads = initial_state.get("heads") or {}
     assert_true(set(heads.keys()) >= {"head:0", "head:1", "head:2", "head:3"},
                 f"route plan initial state missing heads: {route_plan}")
@@ -635,6 +647,13 @@ def test_native_only_print() -> None:
     stats = (report.get("source_map") or {}).get("swap_stats") or {}
     assert_true(stats.get("active_ace_swaps") == 0,
                 f"native-only should not estimate ACE swaps: {stats}")
+    preload = ((report.get("route_plan") or {}).get("execution") or {}).get(
+        "preload_analysis") or {}
+    summary = preload.get("summary") or {}
+    assert_true(summary.get("candidate_count") == 0,
+                f"already-loaded native-only print should have no preload candidates: {preload}")
+    assert_true(summary.get("scheduled_count") == 0,
+                f"native-only print should not schedule preload: {preload}")
     started = start_print(report)
     content = uploaded_content(wait_job(started["job_id"])["filename"])
     assert_true("ACE_SWAP_HEAD" not in content,
@@ -678,6 +697,16 @@ def test_single_ace_head_print() -> None:
     stats = (report.get("source_map") or {}).get("swap_stats") or {}
     assert_true(stats.get("active_ace_swaps") == 2,
                 f"single ACE should estimate two active swaps: {stats}")
+    preload = ((report.get("route_plan") or {}).get("execution") or {}).get(
+        "preload_analysis") or {}
+    summary = preload.get("summary") or {}
+    assert_true(summary.get("candidate_count") >= 1,
+                f"single ACE should expose preload candidates: {preload}")
+    assert_true(summary.get("scheduled_count") == 0,
+                f"single ACE should not schedule preload yet: {preload}")
+    assert_true(all(item.get("status") == "candidate_not_scheduled"
+                    for item in (preload.get("candidates") or [])),
+                f"single ACE preload candidates should be analysis-only: {preload}")
     started = start_print(report)
     content = uploaded_content(wait_job(started["job_id"])["filename"])
     assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0" in content,

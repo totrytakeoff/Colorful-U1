@@ -706,6 +706,40 @@ route plan 必须是可审计、可复现的打印任务计划。它不能只记
     "constraints": {
       "sequential_hardware_actions": true,
       "allows_preload_phases": false
+    },
+    "preload_analysis": {
+      "version": 1,
+      "enabled": false,
+      "candidates": [
+        {
+          "event_index": 1,
+          "phase_index": 1,
+          "slicer_tool": 1,
+          "source": "ace:0:1",
+          "head": "head:3",
+          "action": "swap",
+          "reason": "candidate",
+          "status": "candidate_not_scheduled",
+          "blocked_by": "preload_scheduler_disabled"
+        }
+      ],
+      "blocked": [
+        {
+          "event_index": 2,
+          "phase_index": 2,
+          "slicer_tool": 2,
+          "source": "native:1",
+          "head": "head:1",
+          "action": "load",
+          "reason": "profile_cannot_preload",
+          "status": "blocked"
+        }
+      ],
+      "summary": {
+        "candidate_count": 1,
+        "blocked_count": 1,
+        "scheduled_count": 0
+      }
     }
   },
   "events": [
@@ -753,6 +787,9 @@ route plan 校验规则：
   `mode=sequential`，只记录顺序硬件动作和资源 lock，不改变 rewrite 行为。
 - 当前 `execution.constraints.allows_preload_phases=false`；提前换料阶段未落地前，
   validator 必须拒绝与事件不一致的 execution 摘要，不能信任 UI 手写 phase。
+- `execution.preload_analysis` 只做静态候选分析：`candidate_not_scheduled` 表示
+  source/profile/edge 具备提前换料能力，但当前调度器仍禁用；`blocked` 记录当前
+  不能提前换料的原因。该字段不能生成额外 G-code。
 - `preload` event 只能由调度器生成，不能由用户手动 target 直接生成。
 - 任何 `confidence = unknown/failed` 的 head 参与 event 时，必须阻止打印发送，
   除非 route plan 明确包含人工恢复后的确认状态。

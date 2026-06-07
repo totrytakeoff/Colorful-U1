@@ -2410,13 +2410,76 @@ def _route_plan_execution_summary(route_plan: dict, graph: dict) -> dict:
             for key, value in phase.items()
             if value not in (None, [], {})
         })
-    return {
+    execution = {
         "version": 1,
         "mode": "sequential",
         "phases": phases,
         "constraints": {
             "sequential_hardware_actions": True,
             "allows_preload_phases": False,
+        },
+    }
+    execution["preload_analysis"] = _route_plan_preload_analysis(
+        route_plan, graph, phases)
+    return execution
+
+def _route_event_target(event: dict) -> dict:
+    target = event.get("target")
+    return target if isinstance(target, dict) else {}
+
+def _route_target_can_preload(target: dict, graph: dict) -> tuple[bool, str]:
+    source_id = target.get("source")
+    source = (graph.get("sources") or {}).get(source_id) or {}
+    profile_id = target.get("execution_profile") or source.get("execution_profile")
+    profile = (graph.get("profiles") or {}).get(profile_id) or {}
+    capabilities = profile.get("capabilities") if isinstance(profile, dict) else {}
+    edge = target.get("edge") if isinstance(target.get("edge"), dict) else {}
+    constraints = edge.get("constraints") if isinstance(edge.get("constraints"), dict) else {}
+    if not isinstance(capabilities, dict) or not capabilities.get("can_preload"):
+        return False, "profile_cannot_preload"
+    if constraints and constraints.get("allows_preload_while_other_head_prints") is False:
+        return False, "edge_blocks_preload"
+    return True, "candidate"
+
+def _route_plan_preload_analysis(route_plan: dict, graph: dict,
+                                 phases: list[dict]) -> dict:
+    candidates = []
+    blocked = []
+    events = route_plan.get("events") or []
+    for idx, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        if not event.get("source_changed"):
+            continue
+        target = _route_event_target(event)
+        if not target:
+            continue
+        can_preload, reason = _route_target_can_preload(target, graph)
+        item = {
+            "event_index": event.get("index", idx),
+            "phase_index": idx if idx < len(phases) else None,
+            "slicer_tool": event.get("slicer_tool"),
+            "source": event.get("source"),
+            "head": event.get("head"),
+            "action": event.get("action"),
+            "reason": reason,
+        }
+        if can_preload:
+            item["status"] = "candidate_not_scheduled"
+            item["blocked_by"] = "preload_scheduler_disabled"
+            candidates.append(item)
+        else:
+            item["status"] = "blocked"
+            blocked.append(item)
+    return {
+        "version": 1,
+        "enabled": False,
+        "candidates": candidates,
+        "blocked": blocked,
+        "summary": {
+            "candidate_count": len(candidates),
+            "blocked_count": len(blocked),
+            "scheduled_count": 0,
         },
     }
 
