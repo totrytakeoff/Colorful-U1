@@ -1014,6 +1014,102 @@ def test_route_plan_rewrite_native_to_native_transition() -> None:
                 f"rewritten upload missing native -> native order: {content}")
 
 
+def test_route_plan_rewrite_repeated_tool_sequence() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {"head": 1, "material": "PLA", "color": "#dc2828"},
+            {"head": 2, "material": "ABS", "color": "#28c878"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    graph["edges"].append({
+        "source": "native:2",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 30,
+    })
+    graph["edges"].append({
+        "source": "ace:0:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 50,
+        "constraints": {
+            "requires_empty_head_before_load": True,
+            "allows_preload_while_other_head_prints": True,
+        },
+    })
+    push_graph(graph)
+    report = multipart_upload(
+        "source_transition_repeated_tools.gcode",
+        gcode(
+            "PLA;PETG;ABS",
+            "#dc2828;#1e78dc;#28c878",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            ; Change Tool 1 -> Tool 0
+            T0
+            G1 X20 Y10 E1
+            ; Change Tool 0 -> Tool 2
+            T2
+            G1 X30 Y10 E1
+            """,
+        ),
+    )
+    started = start_print(
+        report,
+        tool_targets={
+            "0": {"kind": "native", "head": 0, "source": "native:1"},
+            "1": {
+                "kind": "ace", "head": 0, "source": "ace:0:1",
+                "ace": 0, "slot": 1,
+            },
+            "2": {"kind": "native", "head": 0, "source": "native:2"},
+        },
+    )
+    status = wait_job(started["job_id"])
+    route_events = (status.get("route_plan") or {}).get("events") or []
+    assert_true([e.get("slicer_tool") for e in route_events] == [0, 1, 0, 2],
+                f"repeated route event stream mismatch: {route_events}")
+    assert_true(_event_commands_for(status, 1) == [
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
+        "T0",
+        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+    ], f"native -> ACE repeated transition mismatch: {route_events[1]}")
+    assert_true(_event_commands_for(status, 2) == [
+        "ACE_UNLOAD_HEAD HEAD=0",
+        "T0",
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
+    ], f"ACE -> native repeated transition mismatch: {route_events[2]}")
+    assert_true(_event_commands_for(status, 3) == [
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
+        "T0",
+        "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1",
+    ], f"native -> native repeated transition mismatch: {route_events[3]}")
+    content = uploaded_content(status["filename"])
+    assert_true(_content_contains_in_order(content, [
+        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+        "ACE_UNLOAD_HEAD HEAD=0",
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
+        "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1",
+    ]), f"rewritten upload missing repeated transition order: {content}")
+
+
 def test_stale_head_source_cleared_on_print_start() -> None:
     set_scenario({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -1287,6 +1383,7 @@ def main() -> int:
         test_route_plan_rewrite_native_to_ace_transition,
         test_route_plan_rewrite_ace_to_ace_transition,
         test_route_plan_rewrite_native_to_native_transition,
+        test_route_plan_rewrite_repeated_tool_sequence,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,

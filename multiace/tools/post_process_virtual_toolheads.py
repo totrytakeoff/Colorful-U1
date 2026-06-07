@@ -1706,9 +1706,6 @@ def inject_auto_load(gcode):
          SM_PRINT_PREEXTRUDE_FILAMENT, which is why it is fallback 2,
          not 1.
 
-      3. Right BEFORE the first ACE_SWAP_HEAD HEAD= line. Catches
-         single-color prints where rewrite() generated swaps.
-
     cmd_ACE_SWAP_HEAD's empty-head detection (ace.py) makes this work
     for fresh / unloaded heads - the unload phase is skipped when the
     sensor reports no filament and head_source is None, so the swap
@@ -1717,8 +1714,9 @@ def inject_auto_load(gcode):
     loaded heads get unloaded + reloaded.
 
     Initial mapping per head is discovered only from explicit
-    ACE_SWAP_HEAD HEAD/ACE/SLOT commands. Bare T<n> commands are not
-    enough to infer the ACE slot and are left alone.
+    "; multiACE initial-load" markers emitted before the first print-body
+    toolchange. Runtime ACE_SWAP_HEAD commands are not enough to infer
+    the initial slot and are left alone.
 
     Returns (gcode_with_injection, count_of_heads_loaded).
     """
@@ -1773,31 +1771,6 @@ def inject_auto_load(gcode):
             if not m:
                 continue
             initial[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
-
-    for i in range(body_start, len(lines)):
-        line = lines[i]
-        ls = line.strip()
-        m_t = re.match(r'^T([0-3])\s*$', ls)
-        if m_t:
-            head = int(m_t.group(1))
-            if head not in initial:
-
-                j = i + 1
-                while j < len(lines) and not lines[j].strip():
-                    j += 1
-                ace_m = None
-                if j < len(lines):
-                    ace_m = re.match(
-                        r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$',
-                        lines[j].strip())
-                if ace_m and int(ace_m.group(1)) == head:
-                    initial[head] = (int(ace_m.group(2)), int(ace_m.group(3)))
-            continue
-        m = re.match(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$', ls)
-        if m:
-            head = int(m.group(1))
-            if head not in initial:
-                initial[head] = (int(m.group(2)), int(m.group(3)))
 
     if inject_idx is None or not initial:
         return gcode, 0
@@ -2133,10 +2106,9 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
       A. Find the injection anchor (highest priority across the four
          anchor types) and the byte ranges of any pre-existing auto-
          load block(s) to strip.
-      B. Re-scan from the anchor onwards (skipping stripped ranges) to
-         build initial[head] = (ace, slot) only from explicit
-         ACE_SWAP_HEAD HEAD/ACE/SLOT commands. Bare T<head> is not
-         enough to infer the ACE slot.
+      B. Build initial[head] = (ace, slot) only from explicit
+         "; multiACE initial-load" markers before the anchor. Runtime
+         ACE_SWAP_HEAD commands are not enough to infer initial loadout.
       C. Write the output, injecting the auto-load block right before
          the anchor line and dropping any old-block lines.
 
@@ -2214,47 +2186,17 @@ def inject_auto_load_to_file(in_path, out_path, progress=None):
             in_block_set.add(j)
 
     initial: dict[int, tuple[int, int]] = {}
-    pending_t_head: int | None = None
-
     if anchor_line_no is not None:
         with open(in_path, 'r', encoding='utf-8', errors='replace') as fin:
             for line_no, line in enumerate(fin):
-                if line_no < anchor_line_no and line_no not in in_block_set:
-                    m_i = initial_re.match(line.strip())
-                    if m_i:
-                        initial[int(m_i.group(1))] = (
-                            int(m_i.group(2)), int(m_i.group(3)))
-                    continue
-                if line_no < anchor_line_no:
-                    continue
+                if line_no >= anchor_line_no:
+                    break
                 if line_no in in_block_set:
                     continue
-                stripped = line.strip()
-
-                if pending_t_head is not None:
-                    if stripped == '':
-                        continue
-                    m_s = swap_re.match(stripped)
-                    if m_s and int(m_s.group(1)) == pending_t_head:
-                        if pending_t_head not in initial:
-                            initial[pending_t_head] = (int(m_s.group(2)),
-                                                       int(m_s.group(3)))
-                        pending_t_head = None
-                        continue
-                    pending_t_head = None
-
-                m_t = bare_t_re.match(stripped)
-                if m_t:
-                    head = int(m_t.group(1))
-                    if head not in initial:
-                        pending_t_head = head
-                    continue
-
-                m_s = swap_re.match(stripped)
-                if m_s:
-                    head = int(m_s.group(1))
-                    if head not in initial:
-                        initial[head] = (int(m_s.group(2)), int(m_s.group(3)))
+                m_i = initial_re.match(line.strip())
+                if m_i:
+                    initial[int(m_i.group(1))] = (
+                        int(m_i.group(2)), int(m_i.group(3)))
 
     inject_block: list[str] = []
     if initial:
