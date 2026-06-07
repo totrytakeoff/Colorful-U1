@@ -220,7 +220,7 @@ def _commands_for_tool_event(t_index, cursor, ace_targets=None, tool_targets=Non
             % (head, target['ace'], target['slot'])]
 
 def _target_for_tool(t_index, ace_targets=None, tool_targets=None,
-                     route_plan=None):
+                     route_plan=None, strict=False):
     route_targets = _normalize_route_plan_targets(route_plan)
     t = int(t_index)
     if t in route_targets:
@@ -228,6 +228,8 @@ def _target_for_tool(t_index, ace_targets=None, tool_targets=None,
     tool_targets = _normalize_tool_targets(tool_targets)
     if t in tool_targets:
         return tool_targets[t]
+    if strict:
+        raise ValueError('route plan missing target for T%d' % t)
     head, ace, slot = _route_virtual_tool(t, ace_targets)
     return {'kind': 'ace', 'head': head, 'ace': ace, 'slot': slot}
 
@@ -255,11 +257,13 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     if route_plan_targets:
         tool_targets = route_plan_targets
     route_cursor = _route_plan_event_cursor(route_plan)
+    route_strict = bool(route_cursor.get('strict'))
 
     def _fix_m104(m):
         return re.sub(r'T(1[0-5]|[0-9])',
                       lambda t: 'T%d' % _target_for_tool(
-                          int(t.group(1)), ace_targets, tool_targets)['head'],
+                          int(t.group(1)), ace_targets, tool_targets,
+                          strict=route_strict)['head'],
                       m.group(0))
     gcode = re.sub(r'^M10[49][^\n]*',
                    _fix_m104, gcode, flags=re.MULTILINE)
@@ -267,7 +271,9 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     gcode = re.sub(
         r'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=(1[0-5]|[0-9])',
         lambda m: 'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=%d'
-        % _target_for_tool(int(m.group(1)), ace_targets, tool_targets)['head'],
+        % _target_for_tool(
+            int(m.group(1)), ace_targets, tool_targets,
+            strict=route_strict)['head'],
         gcode)
 
     split_re = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+',
@@ -279,8 +285,13 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
         pre, body = gcode[:m.start()], gcode[m.start():]
 
     def _expand_initial(m):
-        _route_event_for_tool(route_cursor, int(m.group(1)))
-        target = _target_for_tool(int(m.group(1)), ace_targets, tool_targets)
+        if route_strict and _route_event_for_tool(route_cursor, int(m.group(1))) is None:
+            raise ValueError(
+                'route plan missing initial tool_select event for T%d'
+                % int(m.group(1)))
+        target = _target_for_tool(
+            int(m.group(1)), ace_targets, tool_targets,
+            strict=route_strict)
         head = target['head']
         if target['kind'] != 'ace':
             return 'T%d' % head
@@ -1934,6 +1945,7 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     if route_plan_targets:
         tool_targets = route_plan_targets
     route_cursor = _route_plan_event_cursor(route_plan)
+    route_strict = bool(route_cursor.get('strict'))
     bare_hi   = re.compile(r'^T(1[0-5]|[0-9])\s*$')
     bare_lo   = re.compile(r'^T([0-3])\s*$')
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
@@ -1941,7 +1953,8 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     def fix_m104(line):
         return re.sub(r'T(1[0-5]|[0-9])',
                       lambda t: 'T%d' % _target_for_tool(
-                          int(t.group(1)), ace_targets, tool_targets)['head'],
+                          int(t.group(1)), ace_targets, tool_targets,
+                          strict=route_strict)['head'],
                       line)
 
     in_body = False
@@ -2026,7 +2039,8 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
                 if pending_head is not None:
                     flush_pending_unmatched(fout)
                 target = _target_for_tool(
-                    int(m_pre.group(2)), ace_targets, tool_targets)
+                    int(m_pre.group(2)), ace_targets, tool_targets,
+                    strict=route_strict)
                 head = target['head']
                 fout.write('%s%d%s\n' % (m_pre.group(1), head, m_pre.group(3)))
                 last_pr = _emit_progress(progress, seen, total, last_pr)
@@ -2040,9 +2054,14 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
                     flush_pending_unmatched(fout)
                 m = bare_hi.match(stripped)
                 if m:
-                    _route_event_for_tool(route_cursor, int(m.group(1)))
+                    if route_strict and _route_event_for_tool(
+                            route_cursor, int(m.group(1))) is None:
+                        raise ValueError(
+                            'route plan missing initial tool_select event for T%d'
+                            % int(m.group(1)))
                     target = _target_for_tool(
-                        int(m.group(1)), ace_targets, tool_targets)
+                        int(m.group(1)), ace_targets, tool_targets,
+                        strict=route_strict)
                     head = target['head']
                     fout.write('T%d\n' % head)
                     if target['kind'] == 'ace':

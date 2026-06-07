@@ -1234,6 +1234,44 @@ def test_route_plan_only_rewrite_rejects_missing_event() -> None:
         raise AssertionError("route-plan rewrite should reject missing T1 event")
 
 
+def test_route_plan_only_rewrite_rejects_missing_target() -> None:
+    pp = load_postprocessor()
+    route_plan = {
+        "version": 2,
+        "events": [
+            {
+                "index": 0,
+                "event_type": "tool_select",
+                "slicer_tool": 0,
+                "source": "native:1",
+                "head": "head:1",
+                "steps": [
+                    {"kind": "select_head", "head": "head:1", "command": "T1"},
+                ],
+                "target": {
+                    "kind": "native", "head": 1, "source": "native:1",
+                },
+            },
+        ],
+    }
+    src = gcode(
+        "PLA;PETG",
+        "#dc2828;#1e78dc",
+        """
+        M104 S210 T1
+        T0
+        G1 X10 Y10 E1
+        """,
+    )
+    try:
+        pp.rewrite(src, route_plan=route_plan)
+    except ValueError as exc:
+        assert_true("route plan missing target for T1" in str(exc),
+                    f"unexpected missing-target error: {exc}")
+    else:
+        raise AssertionError("route-plan rewrite should reject missing T1 target")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -1255,6 +1293,7 @@ def main() -> int:
         test_route_plan_rejects_graph_hash_change,
         test_route_plan_only_rewrite,
         test_route_plan_only_rewrite_rejects_missing_event,
+        test_route_plan_only_rewrite_rejects_missing_target,
     ]
     for test in tests:
         test()
