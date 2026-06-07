@@ -1711,27 +1711,33 @@ def _source_transition_event(
         target: dict,
         initial_state: dict,
         graph: dict,
+        current_source: str | None = None,
 ) -> dict:
     profiles = graph.get("profiles") or {}
     head_id = target.get("head_id") or target.get("head")
     if not str(head_id).startswith("head:"):
         head_id = "head:%s" % target.get("head")
-    current_source = (
-        ((initial_state.get("heads") or {}).get(head_id) or {})
-        .get("current_source")
-    )
+    if current_source is None:
+        current_source = (
+            ((initial_state.get("heads") or {}).get(head_id) or {})
+            .get("current_source")
+        )
     steps = []
+    current_target = None
     if current_source and current_source != target.get("source"):
-        current_target = _target_from_graph_source_edge(
-            graph, current_source, head_id)
+        current_target = _target_from_graph_source_edge(graph, current_source, head_id)
+        target_kind = target.get("kind")
+        current_kind = (current_target or {}).get("kind")
+        swap_handles_previous = target_kind == "ace" and current_kind == "ace"
         if current_target:
-            unload = _profile_step(
-                target=current_target,
-                profiles=profiles,
-                action="unload",
-            )
-            if unload:
-                steps.append(unload)
+            if not swap_handles_previous:
+                unload = _profile_step(
+                    target=current_target,
+                    profiles=profiles,
+                    action="unload",
+                )
+                if unload:
+                    steps.append(unload)
     try:
         head = int(target.get("head"))
     except (TypeError, ValueError):
@@ -1779,6 +1785,7 @@ def _build_route_plan(
         events: list[int] | tuple[int, ...] | None,
         profiles: dict | None = None,
         initial_state: dict | None = None,
+        graph: dict | None = None,
         stats: dict | None = None,
         created_at: float | None = None,
 ) -> dict:
@@ -1790,6 +1797,9 @@ def _build_route_plan(
 
     route_events = []
     head_current: dict[str, str | None] = {}
+    for head_id, state in ((initial_state or {}).get("heads") or {}).items():
+        if isinstance(state, dict):
+            head_current[str(head_id)] = state.get("current_source")
     event_stream = list(events or [])
     for idx, raw_t in enumerate(event_stream):
         try:
@@ -1803,25 +1813,55 @@ def _build_route_plan(
         changed = True
         if head:
             changed = head_current.get(str(head)) != source
+        if graph and target:
+            event = _source_transition_event(
+                index=idx,
+                target=target,
+                initial_state=initial_state or {},
+                graph=graph,
+                current_source=head_current.get(str(head)) if head else None,
+            )
+            event["event_type"] = "tool_select"
+            event["slicer_tool"] = t
+        else:
+            event = _route_plan_event(
+                index=idx,
+                slicer_tool=t,
+                target=target,
+                source_changed=changed,
+                profiles=profiles,
+            )
+        route_events.append(event)
+        if head:
             head_current[str(head)] = source
-        route_events.append(_route_plan_event(
-            index=idx,
-            slicer_tool=t,
-            target=target,
-            source_changed=changed,
-            profiles=profiles,
-        ))
 
     if not route_events:
         for idx, t in enumerate(sorted(used_tools)):
             target = tool_targets.get(str(t), tool_targets.get(t))
-            route_events.append(_route_plan_event(
-                index=idx,
-                slicer_tool=t,
-                target=target,
-                source_changed=True,
-                profiles=profiles,
-            ))
+            entry = _route_plan_target_entry(target)
+            head = entry.get("head")
+            source = entry.get("source")
+            if graph and target:
+                event = _source_transition_event(
+                    index=idx,
+                    target=target,
+                    initial_state=initial_state or {},
+                    graph=graph,
+                    current_source=head_current.get(str(head)) if head else None,
+                )
+                event["event_type"] = "tool_select"
+                event["slicer_tool"] = t
+            else:
+                event = _route_plan_event(
+                    index=idx,
+                    slicer_tool=t,
+                    target=target,
+                    source_changed=True,
+                    profiles=profiles,
+                )
+            route_events.append(event)
+            if head:
+                head_current[str(head)] = source
 
     return {
         "version": 2,
@@ -2572,6 +2612,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         events=events,
         profiles=(graph.get("profiles") or {}),
         initial_state=sg.source_state(graph, parsed),
+        graph=graph,
         stats=source_map.get("swap_stats") or {},
         created_at=source_map.get("created_at"),
     )
@@ -2998,6 +3039,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             events=_load_preflight_events(req.token),
             profiles=(graph.get("profiles") or {}),
             initial_state=sg.source_state(graph, parsed),
+            graph=graph,
             stats=source_map.get("swap_stats") or {},
             created_at=source_map.get("created_at"),
         )

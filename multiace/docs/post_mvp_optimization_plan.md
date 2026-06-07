@@ -9,7 +9,8 @@
 - 当前项目重点从“证明能正确混合打印”转入“稳定化、效率优化、工作流集成”。
 - 2026-06-06：高级路由能力已开始后端架构重构。source graph、route plan v2、
   source action preview、source transition preview 已通过 Docker dry-run；
-  前端重构和正式打印执行路径尚未接入。
+  source transition 已接入正式 preflight/rewrite 的 dry-run 闭环，前端重构和
+  实机验证尚未完成。
 - 2026-06-06 实机发现 Web 可直接发送非 U1 的 P1S/Bambu 风格 G-code 并触发
   `Must home Z axis first`。校验规则和实机发送策略见
   [实机 G-code 校验与 Web 发送策略](real_printer_gcode_validation_strategy.md)。
@@ -285,13 +286,15 @@ purge/prime: 35s
   可以从 execution profile 生成 load/unload/swap 命令预览。
 - `POST /api/source-transition/preview` 可以根据当前 source state 生成
   `unload_source -> select_head -> load_source/swap_source` transition 片段。
+- 正式 preflight route plan 已复用 source transition planner，rewrite 后最终
+  G-code 能包含同一 head 多 source 的 unload/load transition 命令。
 - dry-run 已覆盖 `native:1 -> head:0`，确认跨头 native source 使用的是
   source 自己的送料通道，而不是目标 head 的默认通道。
 
 未完成：
 
 - 前端 Dashboard 还没有按 source graph 重构。
-- transition preview 尚未接入真实打印 rewrite。
+- source transition 尚未实机验证。
 - post-processor 仍保留旧 `tool_targets` / `ace_targets` fallback。
 - 任意 ACE slot 到任意 head、native + ACE 同 head 混合打印、提前换料调度
   尚未实机验证。

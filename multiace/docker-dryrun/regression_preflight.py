@@ -758,6 +758,68 @@ def test_source_transition_preview_unloads_previous_source() -> None:
         f"transition step order mismatch: {preview}")
 
 
+def test_route_plan_rewrite_includes_source_transition() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "native_heads": [
+            {"head": 1, "material": "PLA", "color": "#dc2828"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {"head": 0, "ace": 0, "slot": 1, "material": "PETG", "color": "1E78DC"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    push_graph(graph)
+    report = multipart_upload(
+        "source_transition_print.gcode",
+        gcode(
+            "PETG;PLA",
+            "#1e78dc;#dc2828",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    ace_target = {
+        "kind": "ace", "head": 0, "source": "ace:0:1",
+        "ace": 0, "slot": 1,
+    }
+    native_target = {
+        "kind": "native", "head": 0, "source": "native:1",
+    }
+    started = start_print(
+        report,
+        tool_targets={"0": ace_target, "1": native_target},
+    )
+    status = wait_job(started["job_id"])
+    route_events = (status.get("route_plan") or {}).get("events") or []
+    transition = route_events[-1]
+    assert_true(transition.get("previous_source") == "ace:0:1",
+                f"print route plan should record previous source: {transition}")
+    assert_true([s.get("kind") for s in transition.get("steps") or []] == [
+        "unload_source", "select_head", "load_source"],
+        f"print route plan transition order mismatch: {transition}")
+    content = uploaded_content(status["filename"])
+    assert_true("ACE_UNLOAD_HEAD HEAD=0" in content,
+                f"rewritten upload missing source unload: {content}")
+    assert_true("FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1" in content,
+                f"rewritten upload missing native source load: {content}")
+
+
 def test_stale_head_source_cleared_on_print_start() -> None:
     set_scenario({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -950,6 +1012,7 @@ def main() -> int:
         test_wrong_feed_auto_channel_rejected,
         test_source_action_profile_preview,
         test_source_transition_preview_unloads_previous_source,
+        test_route_plan_rewrite_includes_source_transition,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,
