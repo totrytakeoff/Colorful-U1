@@ -2502,6 +2502,36 @@ def _used_tool_indices(pp, gcode: str) -> set[int]:
             used = set()
     return used
 
+_BARE_TOOL_RE = re.compile(r"^\s*T(\d{1,2})\s*(?:;.*)?$")
+
+def _route_tool_events(gcode: str, used_tools: set[int] | None = None) -> list[int]:
+    """Return ordered slicer tool selections for route planning.
+
+    Route planning needs the initial tool selection as well as later
+    changes.  The older swap estimator only looked at "; Change Tool"
+    comments, which misses the first loaded source and breaks same-head
+    source transitions.
+    """
+    events: list[int] = []
+    used = set(int(t) for t in (used_tools or set()))
+    for raw in gcode.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(";"):
+            continue
+        m = _BARE_TOOL_RE.match(line)
+        if not m:
+            continue
+        try:
+            tool = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        if used and tool not in used:
+            continue
+        if events and events[-1] == tool:
+            continue
+        events.append(tool)
+    return events
+
 @app.post("/api/preflight")
 async def preflight(file: UploadFile = File(...)) -> dict:
     raw_name = file.filename or ""
@@ -2589,9 +2619,14 @@ async def preflight(file: UploadFile = File(...)) -> dict:
     result = {}
     if not resolver.get("errors"):
         result = pp.plan_loadout(plan_proxy, num_aces=num_aces) or {}
-    events = [int(t) for t in (result.get("events") or [])]
-    if not events:
-        events = sorted(used_tools)
+    swap_events = [int(t) for t in (result.get("events") or [])]
+    route_events = _route_tool_events(plan_proxy, used_tools)
+    if not route_events:
+        route_events = swap_events
+    if not route_events:
+        route_events = sorted(used_tools)
+    if not swap_events:
+        swap_events = route_events
     source_map = _build_preflight_source_map(
         token=token,
         filename=safe_name,
@@ -2600,7 +2635,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         tool_targets=tool_targets,
         parsed=parsed,
         used_tools=used_tools,
-        events=events,
+        events=swap_events,
     )
     graph, graph_meta = _load_source_graph(parsed)
     route_plan = _build_route_plan(
@@ -2609,7 +2644,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         graph_meta=graph_meta,
         tool_targets=tool_targets,
         used_tools=used_tools,
-        events=events,
+        events=route_events,
         profiles=(graph.get("profiles") or {}),
         initial_state=sg.source_state(graph, parsed),
         graph=graph,
@@ -2619,7 +2654,7 @@ async def preflight(file: UploadFile = File(...)) -> dict:
     (_PREFLIGHT_DIR / (token + ".targets")).write_text(
         json.dumps(tool_targets, indent=2),
         encoding="utf-8")
-    _save_preflight_events(token, events)
+    _save_preflight_events(token, route_events)
     _save_preflight_source_map(source_map)
     _save_preflight_route_plan(route_plan)
     (_PREFLIGHT_DIR / (token + ".used")).write_text(

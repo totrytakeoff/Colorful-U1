@@ -820,6 +820,200 @@ def test_route_plan_rewrite_includes_source_transition() -> None:
                 f"rewritten upload missing native source load: {content}")
 
 
+def _event_commands_for(status: dict, index: int) -> list[str]:
+    route_events = (status.get("route_plan") or {}).get("events") or []
+    assert_true(len(route_events) > index,
+                f"missing route event {index}: {route_events}")
+    event = route_events[index]
+    commands = event.get("commands") or []
+    assert_true(commands,
+                f"route event {index} missing commands: {event}")
+    return commands
+
+
+def _content_contains_in_order(content: str, needles: list[str]) -> bool:
+    pos = -1
+    for needle in needles:
+        found = content.find(needle, pos + 1)
+        if found < 0:
+            return False
+        pos = found
+    return True
+
+
+def test_route_plan_rewrite_native_to_ace_transition() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {"head": 1, "material": "PLA", "color": "#dc2828"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    graph["edges"].append({
+        "source": "ace:0:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 50,
+        "constraints": {
+            "requires_empty_head_before_load": True,
+            "allows_preload_while_other_head_prints": True,
+        },
+    })
+    push_graph(graph)
+    report = multipart_upload(
+        "source_transition_native_to_ace.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    started = start_print(
+        report,
+        tool_targets={
+            "0": {"kind": "native", "head": 0, "source": "native:1"},
+            "1": {
+                "kind": "ace", "head": 0, "source": "ace:0:1",
+                "ace": 0, "slot": 1,
+            },
+        },
+    )
+    status = wait_job(started["job_id"])
+    commands = _event_commands_for(status, 1)
+    assert_true(commands == [
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
+        "T0",
+        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+    ], f"native -> ACE transition commands mismatch: {commands}")
+    content = uploaded_content(status["filename"])
+    assert_true(_content_contains_in_order(content, commands),
+                f"rewritten upload missing native -> ACE order: {content}")
+
+
+def test_route_plan_rewrite_ace_to_ace_transition() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {"head": 0, "ace": 0, "slot": 0, "material": "PLA", "color": "DC2828"},
+        ],
+    }
+    set_scenario(scenario)
+    report = multipart_upload(
+        "source_transition_ace_to_ace.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    started = start_print(
+        report,
+        tool_targets={
+            "0": {
+                "kind": "ace", "head": 0, "source": "ace:0:0",
+                "ace": 0, "slot": 0,
+            },
+            "1": {
+                "kind": "ace", "head": 0, "source": "ace:0:1",
+                "ace": 0, "slot": 1,
+            },
+        },
+    )
+    status = wait_job(started["job_id"])
+    commands = _event_commands_for(status, 1)
+    assert_true(commands == [
+        "T0",
+        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+    ], f"ACE -> ACE transition should be handled by ACE_SWAP_HEAD: {commands}")
+    content = uploaded_content(status["filename"])
+    assert_true("ACE_UNLOAD_HEAD HEAD=0" not in content,
+                f"ACE -> ACE rewrite should not emit separate ACE unload: {content}")
+    assert_true(_content_contains_in_order(content, commands),
+                f"rewritten upload missing ACE -> ACE order: {content}")
+
+
+def test_route_plan_rewrite_native_to_native_transition() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {"head": 1, "material": "PLA", "color": "#dc2828"},
+            {"head": 2, "material": "PETG", "color": "#1e78dc"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    graph["edges"].append({
+        "source": "native:2",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 30,
+    })
+    push_graph(graph)
+    report = multipart_upload(
+        "source_transition_native_to_native.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    started = start_print(
+        report,
+        tool_targets={
+            "0": {"kind": "native", "head": 0, "source": "native:1"},
+            "1": {"kind": "native", "head": 0, "source": "native:2"},
+        },
+    )
+    status = wait_job(started["job_id"])
+    commands = _event_commands_for(status, 1)
+    assert_true(commands == [
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
+        "T0",
+        "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1",
+    ], f"native -> native transition commands mismatch: {commands}")
+    content = uploaded_content(status["filename"])
+    assert_true(_content_contains_in_order(content, commands),
+                f"rewritten upload missing native -> native order: {content}")
+
+
 def test_stale_head_source_cleared_on_print_start() -> None:
     set_scenario({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -1013,6 +1207,9 @@ def main() -> int:
         test_source_action_profile_preview,
         test_source_transition_preview_unloads_previous_source,
         test_route_plan_rewrite_includes_source_transition,
+        test_route_plan_rewrite_native_to_ace_transition,
+        test_route_plan_rewrite_ace_to_ace_transition,
+        test_route_plan_rewrite_native_to_native_transition,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
         test_source_graph_edge_required_for_ace_swap,
