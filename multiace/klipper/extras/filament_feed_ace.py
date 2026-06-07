@@ -235,23 +235,36 @@ class FeedPort:
 
     def get_filament_detected(self):
         if self.ace is not None:
-            head_modes = getattr(self.ace, '_head_modes', [])
-            if (self.index >= len(head_modes)
-                    or head_modes[self.index] != 'ace'):
-                return self._filament_detected
-            slot = self.index
+            source = None
             try:
                 source = self.ace._head_source.get(self.index)
-                if source is not None:
-                    slot = int(source.get('slot', self.index))
             except Exception:
-                slot = self.index
-            if slot < 0 or slot >= len(self.ace.gate_status):
+                source = None
+            if source is None:
+                return self._filament_detected
+            try:
+                ace_idx = int(source.get(
+                    'ace_index', getattr(self.ace, '_active_device_index', 0)))
+                slot = int(source.get('slot'))
+            except Exception:
+                logging.info(
+                    "[multiACE] feed port route invalid: head=%d source=%s",
+                    self.index, source)
+                return False
+            if slot < 0:
                 logging.info(
                     "[multiACE] feed port route invalid: head=%d slot=%s",
                     self.index, slot)
                 return False
-            return self.ace.gate_status[slot] == 1
+            try:
+                info = self.ace._info_per_ace.get(
+                    ace_idx, self.ace._make_default_info(ace_idx))
+                gate = info.get('gate_status', [])
+                return slot < len(gate) and gate[slot] == 1
+            except Exception:
+                if ace_idx == getattr(self.ace, '_active_device_index', 0):
+                    return slot < len(self.ace.gate_status) and self.ace.gate_status[slot] == 1
+                return False
         else:
             return self._filament_detected
 
@@ -783,6 +796,16 @@ class FilamentFeed:
         if self.ace is None:
             return False
         head_idx = self.filament_ch[ch]
+        try:
+            source = self.ace._head_source.get(head_idx)
+            if source is not None:
+                ace_idx = int(source.get('ace_index'))
+                slot_idx = int(source.get('slot'))
+                if (head_idx, ace_idx, slot_idx) in getattr(
+                        self.ace, '_source_graph_edges', set()):
+                    return True
+        except Exception:
+            pass
         head_modes = getattr(self.ace, '_head_modes', [])
         return (0 <= head_idx < len(head_modes)
                 and head_modes[head_idx] == 'ace')

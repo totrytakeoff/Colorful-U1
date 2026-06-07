@@ -809,6 +809,13 @@ def _validate_gcode_script(script: str) -> None:
                 raise HTTPException(
                     status_code=e.status_code,
                     detail=f"line {lineno}: {e.detail}")
+        if macro == "FEED_AUTO":
+            try:
+                _validate_feed_auto_args(gcode_args)
+            except HTTPException as e:
+                raise HTTPException(
+                    status_code=e.status_code,
+                    detail=f"line {lineno}: {e.detail}")
         if macro not in EXPLICIT_ROUTE_MACROS:
             continue
         keys = set(gcode_args.keys())
@@ -1358,7 +1365,6 @@ def _build_preflight_source_map(
         events: list[int] | tuple[int, ...] | None = None,
 ) -> dict:
     graph, graph_meta = _load_source_graph(parsed)
-    route = parsed.get("route", {}) or {}
     events_list = list(events or [])
     entries = []
     for t in sorted(used_tools):
@@ -1384,13 +1390,6 @@ def _build_preflight_source_map(
             "path": graph_meta.get("path"),
             "errors": graph_meta.get("errors", []),
             "warnings": graph_meta.get("warnings", []),
-        },
-        "route": {
-            "mode": route.get("mode"),
-            "primary_head": route.get("primary_head"),
-            "ace_targets": route.get("ace_targets", {}),
-            "head_modes": route.get("head_modes", {}),
-            "error": route.get("error"),
         },
         "used_tools": sorted(used_tools),
         "tool_targets": tool_targets,
@@ -1475,8 +1474,7 @@ def _load_preflight_route_plan(token: str) -> dict:
             data = {}
         if isinstance(data, dict):
             return data
-    source_map = _load_preflight_source_map(token)
-    return _route_plan_from_source_map(source_map) if source_map else {}
+    return {}
 
 def _route_plan_target_entry(target: dict | None) -> dict:
     target = target or {}
@@ -1887,37 +1885,6 @@ def _build_route_plan(
     route_plan["execution"] = _route_plan_execution_summary(
         route_plan, graph or {})
     return route_plan
-
-def _route_plan_from_source_map(source_map: dict) -> dict:
-    graph_meta = source_map.get("source_graph") or {}
-    tool_targets = {}
-    used_tools = set()
-    for entry in source_map.get("entries") or []:
-        target = entry.get("target") or {}
-        tool = entry.get("slicer_tool")
-        if tool is None:
-            continue
-        try:
-            t = int(tool)
-        except (TypeError, ValueError):
-            continue
-        used_tools.add(t)
-        tool_targets[str(t)] = target
-    sample_events = [
-        int(e.get("slicer_tool"))
-        for e in ((source_map.get("swap_stats") or {}).get("events_sample") or [])
-        if isinstance(e, dict) and e.get("slicer_tool") is not None
-    ]
-    return _build_route_plan(
-        token=source_map.get("token"),
-        filename=source_map.get("filename"),
-        graph_meta=graph_meta,
-        tool_targets=tool_targets,
-        used_tools=used_tools,
-        events=sample_events or sorted(used_tools),
-        stats=source_map.get("swap_stats") or {},
-        created_at=source_map.get("created_at"),
-    )
 
 def _route_plan_targets(route_plan: dict) -> dict[str, dict]:
     out: dict[str, dict] = {}
@@ -2739,29 +2706,6 @@ def _mapping_from_info(info: dict) -> list[dict]:
         })
     return out
 
-def _remap_mapping(base_mapping: list[dict], remap_t_to_t: dict[int, int]) -> list[dict]:
-    """Apply a T-index → T-index remap on top of an existing slicer-T →
-    physical-slot mapping. The remap is the format that
-    compute_optimal_remap()/apply_layer_remap() emit: keys are
-    post-live-lookup T-indices (= ace*4+slot), values are the
-    optimized T-indices the rewritten gcode will use. We translate
-    each base entry's slot back through that to land on the
-    physical ACE/slot the new gcode will actually target."""
-    out = []
-    for m in base_mapping:
-        if m["slot"] is None:
-            out.append(m)
-            continue
-        live_t = m["slot"]["ace"] * 4 + m["slot"]["slot"]
-        new_t = remap_t_to_t.get(live_t, live_t)
-        new_slot = dict(m["slot"])
-        new_slot["ace"]  = new_t // 4
-        new_slot["slot"] = new_t % 4
-        new_m = dict(m)
-        new_m["slot"] = new_slot
-        out.append(new_m)
-    return out
-
 def _real_swap_count(events, mapping):
     by_t = {m["t"]: (m.get("target") or m.get("slot"))
             for m in mapping if (m.get("target") or m.get("slot"))}
@@ -2785,31 +2729,6 @@ def _real_swap_count(events, mapping):
     return swaps
 
 
-def _layout_from_head_assignment(c2h, slicer_colors, slicer_types):
-    """Turn {color: head} into a mapping list with (ace, slot=head)
-    per color. ACE within each head = first-come-first-served (sorted
-    by T-index)."""
-    head_ace = {h: 0 for h in range(4)}
-    rows = []
-    for c in sorted(c2h.keys(), key=lambda x: (c2h[x], x)):
-        h = c2h[c]
-        ace = head_ace[h]
-        head_ace[h] += 1
-        rows.append((ace, h, c, {
-            "t":         c,
-            "slot": {
-                "ace":      ace,
-                "slot":     h,
-                "material": (slicer_types.get(c) or "") or "",
-                "color":    (slicer_colors.get(c) or "").lower(),
-            },
-            "tier":      "planned",
-            "loose_mat": False,
-        }))
-    rows.sort(key=lambda r: (r[0], r[1], r[2]))
-    return [r[3] for r in rows]
-
-
 def _disabled_plan() -> dict:
     return {
         "feasible":     False,
@@ -2820,71 +2739,14 @@ def _disabled_plan() -> dict:
     }
 
 
-def _build_plan(pp, plan_name, body, result, mapping,
-                slicer_colors=None, slicer_types=None, num_aces=4):
-    slicer_colors = slicer_colors or {}
-    slicer_types  = slicer_types  or {}
+def _build_slicer_plan(result, mapping):
     events = result.get("events") or []
     tool_changes = int(result.get("total_changes") or 0)
-
-    if plan_name == "slicer":
-        return {
-            "feasible":     True,
-            "swaps":        _real_swap_count(events, mapping),
-            "tool_changes": tool_changes,
-            "mapping":      mapping,
-        }
-
-    if plan_name == "optimize":
-        try:
-            c2h, swaps = pp.compute_swap_aware_layout(
-                events, num_aces=num_aces)
-        except Exception:
-            c2h, swaps = None, None
-        if c2h is None:
-            return {
-                "feasible":     False,
-                "swaps":        0,
-                "tool_changes": tool_changes,
-                "mapping":      [],
-                "reason":       "no feasible head assignment",
-            }
-        return {
-            "feasible":     True,
-            "swaps":        swaps,
-            "tool_changes": tool_changes,
-            "mapping":      _layout_from_head_assignment(
-                c2h, slicer_colors, slicer_types),
-        }
-
-    layer_info = result.get("layer_info") or {}
-    layer_color_sets_raw = layer_info.get("layer_color_sets") or []
-    layer_color_sets = [set(s) for s in layer_color_sets_raw]
-    try:
-        c2h, swaps = pp.compute_swap_aware_layout(
-            events, num_aces=num_aces,
-            layer_color_sets=layer_color_sets if layer_color_sets else None)
-    except Exception:
-        c2h, swaps = None, None
-    if c2h is None:
-        reason = "no layer-feasible head assignment"
-        max_per = layer_info.get("max_per_layer", 0)
-        if max_per > 4:
-            reason = ">4 colors in some layer"
-        return {
-            "feasible":     False,
-            "swaps":        0,
-            "tool_changes": tool_changes,
-            "mapping":      [],
-            "reason":       reason,
-        }
     return {
         "feasible":     True,
-        "swaps":        swaps,
+        "swaps":        _real_swap_count(events, mapping),
         "tool_changes": tool_changes,
-        "mapping":      _layout_from_head_assignment(
-            c2h, slicer_colors, slicer_types),
-        "reason":       "",
+        "mapping":      mapping,
     }
 
 _TOOLCHANGE_RE = re.compile(
@@ -3202,10 +3064,7 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
 
         mapping = resolver.get("mapping", [])
         del plan_proxy
-        out["plans"]["slicer"] = _build_plan(
-            pp, "slicer", None, result, mapping,
-            slicer_colors=slicer_colors, slicer_types=slicer_types,
-            num_aces=num_aces)
+        out["plans"]["slicer"] = _build_slicer_plan(result, mapping)
         out["plans"]["optimize"] = _disabled_plan()
         out["plans"]["layer"] = _disabled_plan()
         del result
@@ -3303,21 +3162,6 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
 
         _set_stage(state, "analyze", 0.0)
 
-        with open(src, "r", encoding="utf-8", errors="replace") as f:
-
-            head_lines: list[str] = []
-            tail_lines: deque[str] = deque(maxlen=2000)
-            for i, line in enumerate(f):
-                if i < 300:
-                    head_lines.append(line)
-                else:
-                    tail_lines.append(line)
-        meta_buf = "".join(head_lines) + "".join(tail_lines)
-        slicer_colors = pp.parse_color_names(meta_buf)
-        slicer_types  = pp.parse_filament_types(meta_buf)
-        num_aces      = pp.infer_num_aces(meta_buf)
-        del meta_buf, head_lines, tail_lines
-
         used: set[int] = set()
         with open(src, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -3331,10 +3175,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                     encoding="utf-8", errors="replace")))
             except Exception:
                 used = set()
-        if used:
-            slicer_colors = {t: c for t, c in slicer_colors.items() if t in used}
-            slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
-        elif route_targets:
+        if not used and route_targets:
             used = {int(t) for t in route_targets.keys()}
 
         parsed = _parse_state(await _query_state())
@@ -3342,8 +3183,6 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         if failed:
             raise RuntimeError(
                 "; ".join(_load_failed_message(t) for t in failed))
-        live_slots = _live_slots_from_parsed(parsed)
-        num_aces = max(num_aces, max((s["ace"] for s in live_slots), default=0) + 1)
         if mode == "slicer":
             if route_targets:
                 missing_targets = sorted(
@@ -3352,7 +3191,6 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                     raise RuntimeError(
                         "route plan mapping is incomplete for "
                         + ", ".join("T%d" % t for t in missing_targets))
-                remap = {}
             else:
                 raise RuntimeError(
                     "route plan missing; run route-plan preview again")
@@ -3360,37 +3198,11 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             raise RuntimeError(
                 "optimize/layer print modes are disabled for the "
                 "single-toolhead ACE MVP; use slicer mode")
-            _set_stage(state, mode, 1.0)
-            sa_result = await asyncio.to_thread(
-                pp.plan_loadout_from_file, str(src), num_aces) or {}
-            sa_events = sa_result.get("events") or []
-            sa_layer_sets = None
-            if mode == "layer":
-                lcs = (sa_result.get("layer_info") or {}).get("layer_color_sets") or []
-                sa_layer_sets = [set(s) for s in lcs] if lcs else None
-            c2h, _sa_swaps = pp.compute_swap_aware_layout(
-                sa_events, num_aces=num_aces,
-                layer_color_sets=sa_layer_sets)
-            if c2h is None:
-                raise RuntimeError("no feasible head assignment for "
-                                   "%s mode" % mode)
-            head_ace_counter = {h: 0 for h in range(4)}
-            remap = {}
-            for c in sorted(c2h.keys(), key=lambda x: (c2h[x], x)):
-                h = c2h[c]
-                remap[c] = head_ace_counter[h] * 4 + h
-                head_ace_counter[h] += 1
 
-        _set_stage(state, "apply_remap", 5.0)
-        await asyncio.to_thread(
-            pp.apply_remap_to_file,
-            str(src), str(tmp_a), remap,
-            _stage_progress(state, 5.0, 25.0),
-        )
-        cur = tmp_a
-        nxt = tmp_b
+        cur = src
+        nxt = tmp_a
 
-        _set_stage(state, "rewrite", 45.0)
+        _set_stage(state, "rewrite", 5.0)
         if not route_plan:
             raise RuntimeError(
                 "route plan missing; run source graph preflight again")
@@ -3405,16 +3217,16 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         await asyncio.to_thread(
             pp.rewrite_to_file,
             str(cur), str(nxt),
-            _stage_progress(state, 45.0, 30.0),
+            _stage_progress(state, 5.0, 60.0),
             route_plan=route_plan,
         )
         cur, nxt = nxt, cur
 
-        _set_stage(state, "inject_auto_load", 75.0)
+        _set_stage(state, "inject_auto_load", 70.0)
         await asyncio.to_thread(
             pp.inject_auto_load_to_file,
             str(cur), str(nxt),
-            _stage_progress(state, 75.0, 10.0),
+            _stage_progress(state, 70.0, 10.0),
         )
         cur, nxt = nxt, cur
 

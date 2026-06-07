@@ -875,6 +875,25 @@ class MultiAce:
     def _source_graph_loaded(self):
         return bool(self._source_graph) and self._source_graph_error is None
 
+    def _head_source_allowed_by_graph(self, head, source):
+        if not self._source_graph_loaded() or source is None:
+            return False
+        try:
+            edge = (int(head), int(source.get('ace_index')),
+                    int(source.get('slot')))
+        except Exception:
+            return False
+        return edge in self._source_graph_edges
+
+    def _head_has_ace_source_graph_edge(self, head):
+        if not self._source_graph_loaded():
+            return False
+        try:
+            h = int(head)
+        except Exception:
+            return False
+        return any(edge_head == h for edge_head, _ace, _slot in self._source_graph_edges)
+
     cmd_MULTIACE_REFRESH_SOURCE_GRAPH_help = (
         '[multiACE] Re-read source_graph.json routing')
     def cmd_MULTIACE_REFRESH_SOURCE_GRAPH(self, gcmd):
@@ -1521,19 +1540,28 @@ class MultiAce:
     def _on_print_start(self, *args):
         if self._ace_mode == 'multi':
 
+            self._read_source_graph()
             self._ghost_heads = set()
             stale_heads = []
             ghost_heads = []
             for head in range(4):
-                if (head >= len(self._head_modes)
-                        or self._head_modes[head] != 'ace'):
+                src = self._head_source.get(head)
+                if self._source_graph_loaded():
+                    participates = (
+                        self._head_source_allowed_by_graph(head, src)
+                        if src is not None
+                        else self._head_has_ace_source_graph_edge(head))
+                else:
+                    participates = (
+                        head < len(self._head_modes)
+                        and self._head_modes[head] == 'ace')
+                if not participates:
                     continue
                 sensor = self.printer.lookup_object(
                     'filament_motion_sensor e%d_filament' % head, None)
                 if sensor is None:
                     continue
                 detected = sensor.get_status(0)['filament_detected']
-                src = self._head_source.get(head)
                 if detected and src is None:
                     ghost_heads.append(head)
                 elif (not detected) and src is not None:

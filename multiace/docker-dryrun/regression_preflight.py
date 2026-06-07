@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -529,6 +530,14 @@ def run_script(script: str, expect_status: int = 200) -> dict:
     )
 
 
+def run_plugin_gcode(script: str, expect_status: int = 200) -> dict:
+    return post_json(
+        f"{WEB}/plugin-api/gcode",
+        {"script": script},
+        expect_status=expect_status,
+    )
+
+
 def moonraker_state() -> dict:
     return request("GET", f"{MOONRAKER}/printer/objects/query")["result"]["status"]
 
@@ -776,6 +785,69 @@ def test_preflight_print_rejects_tool_targets_override() -> None:
                 f"legacy print override should be rejected: {err}")
 
 
+def test_preflight_print_rejects_legacy_modes() -> None:
+    reset_default()
+    report = multipart_upload(
+        "legacy_modes_rejected.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    for mode in ("optimize", "layer"):
+        err = post_json(f"{WEB}/preflight/print", {
+            "token": report["token"],
+            "mode": mode,
+        }, expect_status=400)
+        assert_true("disabled" in str(err) and "slicer mode" in str(err),
+                    f"legacy {mode} print mode should be rejected: {err}")
+
+
+def test_print_rejects_missing_route_plan_file() -> None:
+    reset_default()
+    report = multipart_upload(
+        "missing_route_plan_file.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    route_plan_path = f"/tmp/multiace-preflight/{report['token']}.route_plan.json"
+    check = subprocess.run(
+        ["docker", "exec", "docker-dryrun-multiace-web-1",
+         "test", "-f", route_plan_path],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert_true(check.returncode == 0,
+                f"test setup missing route plan file in web container: "
+                f"{route_plan_path} stderr={check.stderr}")
+    subprocess.run(
+        ["docker", "exec", "docker-dryrun-multiace-web-1",
+         "rm", "-f", route_plan_path],
+        check=True,
+    )
+    err = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    }, expect_status=404)
+    assert_true("route plan missing" in str(err),
+                f"missing route plan file should be rejected: {err}")
+
+
 def test_direct_upload_and_print_disabled() -> None:
     reset_default()
     err = multipart_upload(
@@ -954,6 +1026,19 @@ def test_wrong_feed_auto_channel_rejected() -> None:
                      expect_status=400)
     assert_true("route mismatch" in str(err),
                 f"wrong FEED_AUTO channel should be rejected: {err}")
+
+
+def test_plugin_gcode_rejects_wrong_feed_auto_channel() -> None:
+    set_scenario({
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+    })
+    err = run_plugin_gcode(
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
+        expect_status=400,
+    )
+    assert_true("module/channel does not match" in str(err),
+                f"plugin gcode should reject wrong FEED_AUTO channel: {err}")
 
 
 def test_source_action_profile_preview() -> None:
@@ -1482,6 +1567,38 @@ def test_ghost_head_refuses_swap() -> None:
                 f"ghost swap should be rejected: {err}")
 
 
+def test_print_start_ghost_uses_source_graph_not_head_mode() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {"head": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "ace:0:0",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 50,
+    })
+    push_graph(graph)
+    before = moonraker_state()
+    assert_true(before["ace"]["head_source"]["0"] is None,
+                f"test setup should have no head_source: {before['ace']['head_source']}")
+    assert_true(before["filament_feed left"]["extruder0"]["filament_detected"],
+                "test setup should have filament detected at graph ACE head")
+
+    run_script("PRINT_START")
+    after = moonraker_state()
+    assert_true(after["ace"].get("ghost_heads") == [0],
+                f"source graph ACE head should become ghost despite native mode: {after['ace'].get('ghost_heads')}")
+
+
 def test_source_graph_edge_required_for_ace_swap() -> None:
     scenario = {
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -1729,6 +1846,50 @@ def test_route_plan_only_rewrite_rejects_missing_target() -> None:
         raise AssertionError("route-plan rewrite should reject missing T1 target")
 
 
+def test_route_plan_streaming_rewrite_rejects_missing_event() -> None:
+    pp = load_postprocessor()
+    route_plan = {
+        "version": 2,
+        "events": [
+            {
+                "index": 0,
+                "event_type": "tool_select",
+                "slicer_tool": 0,
+                "source": "native:1",
+                "head": "head:1",
+                "steps": [
+                    {"kind": "select_head", "head": "head:1", "command": "T1"},
+                ],
+                "target": {
+                    "kind": "native", "head": 1, "source": "native:1",
+                },
+            },
+        ],
+    }
+    src = gcode(
+        "PLA;PETG",
+        "#dc2828;#1e78dc",
+        """
+        T0
+        ; Change Tool 0 -> Tool 1
+        T1
+        G1 X10 Y10 E1
+        """,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / "in.gcode"
+        out_path = Path(td) / "out.gcode"
+        in_path.write_text(src, encoding="utf-8")
+        try:
+            pp.rewrite_to_file(str(in_path), str(out_path), route_plan=route_plan)
+        except ValueError as exc:
+            assert_true("route plan missing tool_select" in str(exc),
+                        f"unexpected streaming missing-event error: {exc}")
+        else:
+            raise AssertionError(
+                "route-plan streaming rewrite should reject missing T1 event")
+
+
 def test_route_plan_validate_rejects_incomplete_tool_contract() -> None:
     reset_default()
     graph = source_graph_for({
@@ -1900,6 +2061,8 @@ def main() -> int:
         test_single_ace_head_print,
         test_route_plan_preview_and_print_api,
         test_preflight_print_rejects_tool_targets_override,
+        test_preflight_print_rejects_legacy_modes,
+        test_print_rejects_missing_route_plan_file,
         test_direct_upload_and_print_disabled,
         test_unmapped_tool_is_not_feasible,
         test_invalid_bambu_p1s_gcode_blocked,
@@ -1907,6 +2070,7 @@ def main() -> int:
         test_route_plan_validate_allows_same_source_same_head_reuse,
         test_route_plan_validate_rejects_single_ace_multi_head_resource,
         test_wrong_feed_auto_channel_rejected,
+        test_plugin_gcode_rejects_wrong_feed_auto_channel,
         test_source_action_profile_preview,
         test_source_transition_preview_unloads_previous_source,
         test_route_plan_rewrite_includes_source_transition,
@@ -1916,12 +2080,14 @@ def main() -> int:
         test_route_plan_rewrite_repeated_tool_sequence,
         test_stale_head_source_cleared_on_print_start,
         test_ghost_head_refuses_swap,
+        test_print_start_ghost_uses_source_graph_not_head_mode,
         test_source_graph_edge_required_for_ace_swap,
         test_route_plan_rejects_graph_hash_change,
         test_route_plan_rejects_stale_runtime_state,
         test_route_plan_only_rewrite,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,
+        test_route_plan_streaming_rewrite_rejects_missing_event,
         test_route_plan_validate_rejects_incomplete_tool_contract,
         test_route_plan_validate_rejects_tampered_profile_command,
         test_route_plan_validate_rejects_tampered_resources,

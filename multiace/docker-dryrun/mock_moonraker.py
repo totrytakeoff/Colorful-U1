@@ -462,6 +462,20 @@ def _source_graph_allows_ace(
     return False
 
 
+def _source_graph_has_ace_head(graph: dict[str, Any], head: int) -> bool:
+    sources = graph.get("sources") or {}
+    head_id = f"head:{head}"
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("enabled", True) is False:
+            continue
+        if edge.get("head") != head_id:
+            continue
+        source = sources.get(edge.get("source")) or {}
+        if source.get("kind") == "ace_slot":
+            return True
+    return False
+
+
 def _parse_args(line: str) -> tuple[str, dict[str, str]]:
     parts = line.strip().split()
     if not parts:
@@ -510,16 +524,27 @@ def _apply_script(script: str) -> None:
                 _set_head_empty(state, h)
             state["ace"]["ghost_heads"] = []
         elif cmd == "PRINT_START":
-            route = state["ace"].get("route", {}) or {}
-            head_modes = route.get("head_modes", {}) or {}
+            graph = _read_source_graph()
             ghost_heads = []
             for h in range(4):
-                if head_modes.get(str(h)) != "ace":
+                src = state["ace"]["head_source"].get(str(h))
+                if src is not None:
+                    try:
+                        participates = _source_graph_allows_ace(
+                            graph,
+                            h,
+                            int(src.get("ace_index")),
+                            int(src.get("slot")),
+                        )
+                    except Exception:
+                        participates = False
+                else:
+                    participates = _source_graph_has_ace_head(graph, h)
+                if not participates:
                     continue
                 module, key = _head_key(h)
                 feed = state[module][key]
                 detected = bool(feed.get("filament_detected"))
-                src = state["ace"]["head_source"].get(str(h))
                 if detected and src is None:
                     ghost_heads.append(h)
                 elif (not detected) and src is not None:
