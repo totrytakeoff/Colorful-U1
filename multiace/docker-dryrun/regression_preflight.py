@@ -49,7 +49,8 @@ def post_json(url: str, payload: dict[str, Any], expect_status: int = 200) -> di
     )
 
 
-def multipart_upload(name: str, gcode: str, expect_status: int = 200) -> dict:
+def multipart_upload(name: str, gcode: str, expect_status: int = 200,
+                     endpoint: str = "preflight") -> dict:
     boundary = "----colorful-u1-dryrun"
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / name
@@ -61,7 +62,7 @@ def multipart_upload(name: str, gcode: str, expect_status: int = 200) -> dict:
         ).encode("utf-8") + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
     return request(
         "POST",
-        f"{WEB}/preflight",
+        f"{WEB}/{endpoint}",
         body,
         {"Content-Type": f"multipart/form-data; boundary={boundary}"},
         expect_status=expect_status,
@@ -460,12 +461,15 @@ def assert_route_plan_shape(report: dict) -> None:
 
 def start_print(report: dict, tool_targets: dict | None = None,
                 expect_status: int = 200) -> dict:
+    if tool_targets is not None:
+        post_json(f"{WEB}/route-plan/remap", {
+            "token": report["token"],
+            "tool_targets": tool_targets,
+        })
     payload = {
         "token": report["token"],
-        "mode": "slicer",
-        "tool_targets": report.get("tool_targets") if tool_targets is None else tool_targets,
     }
-    return post_json(f"{WEB}/preflight/print", payload, expect_status=expect_status)
+    return post_json(f"{WEB}/route-plan/print", payload, expect_status=expect_status)
 
 
 def wait_job(job_id: str) -> dict:
@@ -713,6 +717,63 @@ def test_single_ace_head_print() -> None:
                 "single ACE upload missing slot0 swap")
     assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
                 "single ACE upload missing slot1 swap")
+
+
+def test_route_plan_preview_and_print_api() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_plan_preview_api.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="route-plan/preview",
+    )
+    assert_source_map_shape(report)
+    assert_route_plan_shape(report)
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    assert_true(validation.get("ok"),
+                f"route-plan preview API should persist valid plan: {validation}")
+    started = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    })
+    content = uploaded_content(wait_job(started["job_id"])["filename"])
+    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+                "route-plan print API upload missing ACE swap")
+
+
+def test_preflight_print_rejects_tool_targets_override() -> None:
+    reset_default()
+    report = multipart_upload(
+        "legacy_print_override_rejected.gcode",
+        gcode(
+            "PLA;PLA",
+            "#dc2828;#dc2828",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    native_target = target_for(report, 0)
+    err = post_json(f"{WEB}/preflight/print", {
+        "token": report["token"],
+        "mode": "slicer",
+        "tool_targets": {"0": native_target, "1": native_target},
+    }, expect_status=400)
+    assert_true("tool_targets override" in str(err),
+                f"legacy print override should be rejected: {err}")
 
 
 def test_unmapped_tool_is_not_feasible() -> None:
@@ -1817,6 +1878,8 @@ def main() -> int:
         test_mixed_native_ace_print,
         test_native_only_print,
         test_single_ace_head_print,
+        test_route_plan_preview_and_print_api,
+        test_preflight_print_rejects_tool_targets_override,
         test_unmapped_tool_is_not_feasible,
         test_invalid_bambu_p1s_gcode_blocked,
         test_manual_mapping_can_reuse_source_edge,

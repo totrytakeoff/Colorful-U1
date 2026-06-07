@@ -3035,8 +3035,7 @@ def _route_tool_events(gcode: str, used_tools: set[int] | None = None) -> list[i
         events.append(tool)
     return events
 
-@app.post("/api/preflight")
-async def preflight(file: UploadFile = File(...)) -> dict:
+async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
     raw_name = file.filename or ""
     safe_name = os.path.basename(raw_name)
     if not safe_name or safe_name in (".", "..") or "/" in safe_name or "\\" in safe_name:
@@ -3154,9 +3153,6 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         stats=source_map.get("swap_stats") or {},
         created_at=source_map.get("created_at"),
     )
-    (_PREFLIGHT_DIR / (token + ".targets")).write_text(
-        json.dumps(tool_targets, indent=2),
-        encoding="utf-8")
     _save_preflight_events(token, route_events)
     _save_preflight_source_map(source_map)
     _save_preflight_route_plan(route_plan)
@@ -3225,6 +3221,14 @@ async def preflight(file: UploadFile = File(...)) -> dict:
         out["plans"]["layer"] = _disabled_plan()
     return out
 
+@app.post("/api/preflight")
+async def preflight(file: UploadFile = File(...)) -> dict:
+    return await _create_route_plan_preview_from_upload(file)
+
+@app.post("/api/route-plan/preview")
+async def route_plan_preview(file: UploadFile = File(...)) -> dict:
+    return await _create_route_plan_preview_from_upload(file)
+
 _PREFLIGHT_JOBS: dict[str, dict] = {}
 _PREFLIGHT_JOBS_LOCK = asyncio.Lock()
 _PREFLIGHT_JOB_TTL = 600.0
@@ -3276,42 +3280,12 @@ def _prune_old_jobs() -> None:
                 except Exception: pass
         del _PREFLIGHT_JOBS[j]
 
-def _preflight_targets_path(token: str) -> Path:
-    return _PREFLIGHT_DIR / (token + ".targets")
-
-def _load_preflight_targets(token: str) -> dict:
-    p = _preflight_targets_path(token)
-    if not p.is_file():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-def _ace_targets_from_tool_targets(tool_targets: dict) -> dict[int, int]:
-    ace_targets: dict[int, int] = {}
-    for target in (tool_targets or {}).values():
-        if not isinstance(target, dict) or target.get("kind") != "ace":
-            continue
-        try:
-            ace = int(target.get("ace"))
-            head = int(target.get("head"))
-        except (TypeError, ValueError):
-            continue
-        if ace in ace_targets and ace_targets[ace] != head:
-            raise RuntimeError(
-                "source graph maps ACE %d to multiple heads in one print plan" % ace)
-        ace_targets[ace] = head
-    return ace_targets
-
 async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                                   safe_name: str,
                                   set_prefs: bool = False) -> None:
     state = _PREFLIGHT_JOBS[job_id]
     pp = _load_post_processor()
     src = _PREFLIGHT_DIR / (token + ".gcode")
-    tool_targets = _load_preflight_targets(token)
     source_map = _load_preflight_source_map(token)
     route_plan = _load_preflight_route_plan(token)
     route_targets = _route_plan_targets(route_plan)
@@ -3362,8 +3336,6 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
         elif route_targets:
             used = {int(t) for t in route_targets.keys()}
-        elif tool_targets:
-            used = {int(t) for t in tool_targets.keys()}
 
         parsed = _parse_state(await _query_state())
         failed = _load_failed_toolheads(parsed)
@@ -3381,17 +3353,9 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                         "route plan mapping is incomplete for "
                         + ", ".join("T%d" % t for t in missing_targets))
                 remap = {}
-            elif tool_targets:
-                missing_targets = sorted(
-                    t for t in used if str(t) not in tool_targets)
-                if missing_targets:
-                    raise RuntimeError(
-                        "preflight target mapping is incomplete for "
-                        + ", ".join("T%d" % t for t in missing_targets))
-                remap = {}
             else:
                 raise RuntimeError(
-                    "preflight target mapping missing; run source graph preflight again")
+                    "route plan missing; run route-plan preview again")
         else:
             raise RuntimeError(
                 "optimize/layer print modes are disabled for the "
@@ -3516,23 +3480,111 @@ class _PreflightPrint(BaseModel):
     set_prefs: bool = False
     tool_targets: dict[str, Any] | None = None
 
-@app.post("/api/preflight/print")
-async def preflight_print(req: _PreflightPrint) -> dict:
-    if req.mode not in ("slicer", "optimize", "layer"):
+class RoutePlanPrintRequest(BaseModel):
+    token: str
+    set_prefs: bool = False
+
+class RoutePlanRemapRequest(BaseModel):
+    token: str
+    tool_targets: dict[str, Any]
+
+async def _apply_route_plan_tool_targets(token: str,
+                                         requested: dict[str, Any]) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    gpath = _PREFLIGHT_DIR / (token + ".gcode")
+    npath = _PREFLIGHT_DIR / (token + ".name")
+    upath = _PREFLIGHT_DIR / (token + ".used")
+    if not gpath.is_file():
+        raise HTTPException(status_code=404,
+                            detail="route plan token expired or unknown")
+    try:
+        used_raw = json.loads(upath.read_text(encoding="utf-8"))
+        used_tools = {int(t) for t in used_raw}
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="used-tool metadata missing; run route-plan preview again")
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    failed = _load_failed_toolheads(parsed)
+    if failed:
+        raise HTTPException(
+            status_code=409,
+            detail="; ".join(_load_failed_message(t) for t in failed),
+        )
+    manual_targets = _validate_manual_tool_targets(
+        parsed, requested, used_tools)
+    safe_name = (npath.read_text(encoding="utf-8").strip()
+                 if npath.is_file() else (token + ".gcode"))
+    existing_map = _load_preflight_source_map(token)
+    slicer_colors, slicer_types = _source_map_slicer_meta(existing_map)
+    route_events = _load_preflight_events(token)
+    source_map = _build_preflight_source_map(
+        token=token,
+        filename=safe_name,
+        slicer_colors=slicer_colors,
+        slicer_types=slicer_types,
+        tool_targets=manual_targets,
+        parsed=parsed,
+        used_tools=used_tools,
+        events=route_events,
+    )
+    graph, graph_meta = _load_source_graph(parsed)
+    route_plan = _build_route_plan(
+        token=token,
+        filename=safe_name,
+        graph_meta=graph_meta,
+        tool_targets=manual_targets,
+        used_tools=used_tools,
+        events=route_events,
+        profiles=(graph.get("profiles") or {}),
+        initial_state=sg.source_state(graph, parsed),
+        graph=graph,
+        stats=source_map.get("swap_stats") or {},
+        created_at=source_map.get("created_at"),
+    )
+    route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
+    route_errors.extend(
+        _validate_route_plan_runtime_state(
+            route_plan, sg.source_state(graph, parsed)))
+    if route_errors:
+        raise HTTPException(
+            status_code=409,
+            detail="route plan validation failed: " + "; ".join(route_errors[:8]))
+    _save_preflight_source_map(source_map)
+    _save_preflight_route_plan(route_plan)
+    return {
+        "ok": True,
+        "token": token,
+        "filename": safe_name,
+        "source_map": source_map,
+        "route_plan": route_plan,
+        "tool_targets": manual_targets,
+    }
+
+async def _start_route_plan_print(token: str, *, set_prefs: bool = False,
+                                  mode: str = "slicer") -> dict:
+    if mode not in ("slicer", "optimize", "layer"):
         raise HTTPException(status_code=400, detail="invalid mode")
-    if req.mode != "slicer":
+    if mode != "slicer":
         raise HTTPException(
             status_code=400,
             detail=("optimize/layer print modes are disabled for the "
                     "single-toolhead ACE MVP; use slicer mode"))
-    if not re.fullmatch(r"[0-9a-f]{32}", req.token or ""):
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
         raise HTTPException(status_code=400, detail="invalid token")
-    gpath = _PREFLIGHT_DIR / (req.token + ".gcode")
-    npath = _PREFLIGHT_DIR / (req.token + ".name")
-    upath = _PREFLIGHT_DIR / (req.token + ".used")
+    gpath = _PREFLIGHT_DIR / (token + ".gcode")
+    npath = _PREFLIGHT_DIR / (token + ".name")
     if not gpath.is_file():
         raise HTTPException(status_code=404,
-                            detail="preflight token expired or unknown")
+                            detail="route plan token expired or unknown")
+    if not _load_preflight_route_plan(token):
+        raise HTTPException(
+            status_code=404,
+            detail="route plan missing; run route-plan preview again")
     try:
         parsed = _parse_state(await _query_state())
     except httpx.HTTPError as e:
@@ -3544,49 +3596,7 @@ async def preflight_print(req: _PreflightPrint) -> dict:
             detail="; ".join(_load_failed_message(t) for t in failed),
         )
     safe_name = (npath.read_text(encoding="utf-8").strip()
-                 if npath.is_file() else (req.token + ".gcode"))
-    if req.tool_targets is not None:
-        try:
-            used_raw = json.loads(upath.read_text(encoding="utf-8"))
-            used_tools = {int(t) for t in used_raw}
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="preflight used-tool metadata missing; run preflight again")
-        manual_targets = _validate_manual_tool_targets(
-            parsed, req.tool_targets, used_tools)
-        _preflight_targets_path(req.token).write_text(
-            json.dumps(manual_targets, indent=2),
-            encoding="utf-8")
-        existing_map = _load_preflight_source_map(req.token)
-        slicer_colors, slicer_types = _source_map_slicer_meta(existing_map)
-        source_map = _build_preflight_source_map(
-            token=req.token,
-            filename=safe_name,
-            slicer_colors=slicer_colors,
-            slicer_types=slicer_types,
-            tool_targets=manual_targets,
-            parsed=parsed,
-            used_tools=used_tools,
-            events=_load_preflight_events(req.token),
-        )
-        graph, graph_meta = _load_source_graph(parsed)
-        route_plan = _build_route_plan(
-            token=req.token,
-            filename=safe_name,
-            graph_meta=graph_meta,
-            tool_targets=manual_targets,
-            used_tools=used_tools,
-            events=_load_preflight_events(req.token),
-            profiles=(graph.get("profiles") or {}),
-            initial_state=sg.source_state(graph, parsed),
-            graph=graph,
-            stats=source_map.get("swap_stats") or {},
-            created_at=source_map.get("created_at"),
-        )
-        _save_preflight_source_map(source_map)
-        _save_preflight_route_plan(route_plan)
-
+                 if npath.is_file() else (token + ".gcode"))
     _prune_old_jobs()
     import uuid as _uuid
     job_id = _uuid.uuid4().hex
@@ -3596,14 +3606,33 @@ async def preflight_print(req: _PreflightPrint) -> dict:
         "done":     False,
         "error":    None,
         "filename": safe_name,
-        "mode":     req.mode,
+        "mode":     mode,
         "ts":       time.time(),
-        "source_map": _load_preflight_source_map(req.token),
-        "route_plan": _load_preflight_route_plan(req.token),
+        "source_map": _load_preflight_source_map(token),
+        "route_plan": _load_preflight_route_plan(token),
     }
     asyncio.create_task(_run_preflight_pipeline(
-        job_id, req.token, req.mode, safe_name, req.set_prefs))
-    return {"job_id": job_id, "filename": safe_name, "mode": req.mode}
+        job_id, token, mode, safe_name, set_prefs))
+    return {"job_id": job_id, "filename": safe_name, "mode": mode}
+
+@app.post("/api/preflight/print")
+async def preflight_print(req: _PreflightPrint) -> dict:
+    if req.tool_targets is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=("tool_targets override is no longer accepted; update the "
+                    "source graph and run route-plan preview again"))
+    return await _start_route_plan_print(
+        req.token, set_prefs=req.set_prefs, mode=req.mode)
+
+@app.post("/api/route-plan/print")
+async def route_plan_print(req: RoutePlanPrintRequest) -> dict:
+    return await _start_route_plan_print(
+        req.token, set_prefs=req.set_prefs, mode="slicer")
+
+@app.post("/api/route-plan/remap")
+async def route_plan_remap(req: RoutePlanRemapRequest) -> dict:
+    return await _apply_route_plan_tool_targets(req.token, req.tool_targets)
 
 @app.get("/api/preflight/print/status")
 async def preflight_print_status(job_id: str) -> dict:
