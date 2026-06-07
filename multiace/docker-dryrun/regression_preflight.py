@@ -1368,6 +1368,65 @@ def test_route_plan_only_rewrite_rejects_missing_target() -> None:
         raise AssertionError("route-plan rewrite should reject missing T1 target")
 
 
+def test_route_plan_validate_rejects_incomplete_tool_contract() -> None:
+    reset_default()
+    graph = source_graph_for({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "native_heads": [
+            {"head": 1, "material": "PLA", "color": "#dc2828"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    })
+    push_graph(graph)
+    meta = request("GET", f"{WEB}/source-graph").get("meta") or {}
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "used_tools": [0, 1],
+        "tool_map": {
+            "0": {
+                "source": "native:1",
+                "head": "head:1",
+                "target": {
+                    "kind": "native", "head": 1, "head_id": "head:1",
+                    "source": "native:1",
+                },
+            },
+        },
+        "events": [
+            {
+                "index": 0,
+                "event_type": "tool_select",
+                "slicer_tool": 0,
+                "source": "native:1",
+                "head": "head:1",
+                "execution_profile": "u1_native_feeder",
+                "steps": [
+                    {"kind": "select_head", "head": "head:1", "command": "T1"},
+                ],
+                "commands": ["T1"],
+                "target": {
+                    "kind": "native", "head": 1, "head_id": "head:1",
+                    "source": "native:1",
+                },
+            },
+        ],
+    }
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": route_plan,
+    })
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"incomplete route plan should be rejected: {validation}")
+    assert_true("missing tool_map target for t1" in errors,
+                f"missing target error mismatch: {validation}")
+    assert_true("missing tool_select event for t1" in errors,
+                f"missing event error mismatch: {validation}")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -1391,6 +1450,7 @@ def main() -> int:
         test_route_plan_only_rewrite,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,
+        test_route_plan_validate_rejects_incomplete_tool_contract,
     ]
     for test in tests:
         test()

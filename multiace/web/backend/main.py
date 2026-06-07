@@ -1980,14 +1980,81 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
             continue
         enabled_edges.add((edge.get("source"), edge.get("head")))
 
+    used_tools: set[int] = set()
+    raw_used_tools = route_plan.get("used_tools") or []
+    if raw_used_tools and not isinstance(raw_used_tools, list):
+        errors.append("route plan used_tools must be a list")
+        raw_used_tools = []
+    for raw_t in raw_used_tools:
+        try:
+            used_tools.add(int(raw_t))
+        except (TypeError, ValueError):
+            errors.append("route plan used_tools contains invalid tool %r" % raw_t)
+
+    tool_map = route_plan.get("tool_map") or {}
+    if tool_map and not isinstance(tool_map, dict):
+        errors.append("route plan tool_map must be an object")
+        tool_map = {}
+    mapped_tools: set[int] = set()
+    for raw_t, item in (tool_map or {}).items():
+        try:
+            t = int(raw_t)
+        except (TypeError, ValueError):
+            errors.append("route plan tool_map contains invalid tool %r" % raw_t)
+            continue
+        mapped_tools.add(t)
+        if not isinstance(item, dict):
+            errors.append("route plan tool_map[%s] must be an object" % raw_t)
+            continue
+        target = item.get("target")
+        if not isinstance(target, dict):
+            errors.append("route plan tool_map[%s] missing target" % raw_t)
+            continue
+        target_source = target.get("source")
+        target_head = target.get("head_id")
+        if not target_head and target.get("head") is not None:
+            target_head = "head:%s" % target.get("head")
+        if not target_source or target_source not in sources:
+            errors.append("route plan tool_map[%s] references unknown source %r"
+                          % (raw_t, target_source))
+        if not target_head or target_head not in heads:
+            errors.append("route plan tool_map[%s] references unknown head %r"
+                          % (raw_t, target_head))
+        if target_source and target_head and (target_source, target_head) not in enabled_edges:
+            errors.append("route plan tool_map[%s] has no enabled edge %s -> %s"
+                          % (raw_t, target_source, target_head))
+    for t in sorted(used_tools):
+        if t not in mapped_tools:
+            errors.append("route plan missing tool_map target for T%d" % t)
+    require_tool_contract = bool(used_tools or mapped_tools)
+
     events = route_plan.get("events") or []
     if not isinstance(events, list) or not events:
         errors.append("route plan events must be a non-empty list")
         events = []
+    event_tools: set[int] = set()
     for idx, event in enumerate(events):
         if not isinstance(event, dict):
             errors.append("route event[%d] must be an object" % idx)
             continue
+        event_type = event.get("event_type")
+        requires_slicer_tool = require_tool_contract or event_type == "tool_select"
+        raw_slicer_tool = event.get("slicer_tool")
+        slicer_tool = None
+        try:
+            if raw_slicer_tool is not None:
+                slicer_tool = int(raw_slicer_tool)
+                event_tools.add(slicer_tool)
+        except (TypeError, ValueError):
+            errors.append("route event[%d] missing slicer_tool" % idx)
+        if requires_slicer_tool and slicer_tool is None:
+            errors.append("route event[%d] missing slicer_tool" % idx)
+        if slicer_tool is not None and mapped_tools and slicer_tool not in mapped_tools:
+            errors.append("route event[%d] has no tool_map target for T%d"
+                          % (idx, slicer_tool))
+        if slicer_tool is not None and used_tools and slicer_tool not in used_tools:
+            errors.append("route event[%d] references unused T%d"
+                          % (idx, slicer_tool))
         source_id = event.get("source")
         head_id = event.get("head")
         if not source_id or source_id not in sources:
@@ -2071,6 +2138,9 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                                       % (idx, step_idx))
         if commands != (event.get("commands") or []):
             errors.append("route event[%d] commands do not mirror steps" % idx)
+    for t in sorted(used_tools):
+        if t not in event_tools:
+            errors.append("route plan missing tool_select event for T%d" % t)
     return errors
 
 def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
