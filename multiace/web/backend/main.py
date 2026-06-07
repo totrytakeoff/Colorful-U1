@@ -1863,7 +1863,7 @@ def _build_route_plan(
             if head:
                 head_current[str(head)] = source
 
-    return {
+    route_plan = {
         "version": 2,
         "token": token,
         "filename": filename,
@@ -1882,6 +1882,9 @@ def _build_route_plan(
         "events": route_events,
         "stats": stats or _build_swap_stats(event_stream, tool_targets),
     }
+    route_plan["resources"] = _route_plan_resource_summary(
+        route_plan, graph or {})
+    return route_plan
 
 def _route_plan_from_source_map(source_map: dict) -> dict:
     graph_meta = source_map.get("source_graph") or {}
@@ -2207,13 +2210,11 @@ def _route_target_resource_entries(route_plan: dict) -> list[tuple[str, str, dic
                     ("event[%d].step[%d]" % (idx, step_idx), "step", step))
     return entries
 
-def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
-    """Validate resource ownership constraints that are not profile-specific."""
-    errors: list[str] = []
-    if not isinstance(route_plan, dict):
-        return errors
+def _route_plan_resource_usage(route_plan: dict, graph: dict) -> dict:
     source_heads: dict[str, set[str]] = {}
     ace_heads: dict[int, set[str]] = {}
+    ace_sources: dict[int, set[str]] = {}
+    ace_slots: dict[int, set[int]] = {}
     sources = graph.get("sources") or {}
     for _label, _kind, target in _route_target_resource_entries(route_plan):
         source_id = target.get("source")
@@ -2229,6 +2230,61 @@ def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
             except (TypeError, ValueError):
                 continue
             ace_heads.setdefault(ace, set()).add(head_id)
+            ace_sources.setdefault(ace, set()).add(str(source_id))
+            slot_raw = target.get(
+                "slot", source.get("slot") if isinstance(source, dict) else None)
+            try:
+                ace_slots.setdefault(ace, set()).add(int(slot_raw))
+            except (TypeError, ValueError):
+                pass
+    return {
+        "source_heads": source_heads,
+        "ace_heads": ace_heads,
+        "ace_sources": ace_sources,
+        "ace_slots": ace_slots,
+    }
+
+def _route_plan_resource_summary(route_plan: dict, graph: dict) -> dict:
+    usage = _route_plan_resource_usage(route_plan, graph)
+    source_heads = usage.get("source_heads") or {}
+    ace_heads = usage.get("ace_heads") or {}
+    ace_sources = usage.get("ace_sources") or {}
+    ace_slots = usage.get("ace_slots") or {}
+    return {
+        "version": 1,
+        "heads": sorted({
+            head
+            for heads in source_heads.values()
+            for head in heads
+        }),
+        "sources": {
+            source_id: {
+                "heads": sorted(heads),
+            }
+            for source_id, heads in sorted(source_heads.items())
+        },
+        "aces": {
+            str(ace): {
+                "heads": sorted(ace_heads.get(ace) or []),
+                "sources": sorted(ace_sources.get(ace) or []),
+                "slots": sorted(ace_slots.get(ace) or []),
+            }
+            for ace in sorted(ace_heads.keys())
+        },
+        "constraints": {
+            "single_source_single_head": True,
+            "single_ace_single_head_per_plan": True,
+        },
+    }
+
+def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
+    """Validate resource ownership constraints that are not profile-specific."""
+    errors: list[str] = []
+    if not isinstance(route_plan, dict):
+        return errors
+    usage = _route_plan_resource_usage(route_plan, graph)
+    source_heads = usage.get("source_heads") or {}
+    ace_heads = usage.get("ace_heads") or {}
     for source_id, heads in sorted(source_heads.items()):
         if len(heads) > 1:
             errors.append(
@@ -2239,6 +2295,11 @@ def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
             errors.append(
                 "route plan maps ACE %d to multiple heads in one print plan: %s"
                 % (ace, ", ".join(sorted(heads))))
+    resources = route_plan.get("resources")
+    if isinstance(resources, dict):
+        expected = _route_plan_resource_summary(route_plan, graph)
+        if resources != expected:
+            errors.append("route plan resources summary does not match events")
     return errors
 
 def _route_plan_affected_heads(route_plan: dict) -> set[str]:

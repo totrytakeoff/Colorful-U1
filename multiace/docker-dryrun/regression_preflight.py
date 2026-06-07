@@ -375,6 +375,20 @@ def assert_route_plan_shape(report: dict) -> None:
     initial_state = route_plan.get("initial_state") or {}
     assert_true(initial_state.get("source_graph_hash") == route_plan.get("source_graph_hash"),
                 f"route plan initial state graph hash mismatch: {route_plan}")
+    resources = route_plan.get("resources") or {}
+    assert_true(resources.get("version") == 1,
+                f"route plan missing resource summary: {route_plan}")
+    assert_true(isinstance(resources.get("heads"), list),
+                f"route plan resources missing heads: {route_plan}")
+    assert_true(isinstance(resources.get("sources"), dict),
+                f"route plan resources missing sources: {route_plan}")
+    assert_true(isinstance(resources.get("aces"), dict),
+                f"route plan resources missing ACEs: {route_plan}")
+    constraints = resources.get("constraints") or {}
+    assert_true(constraints.get("single_source_single_head") is True,
+                f"route plan resources missing source constraint: {route_plan}")
+    assert_true(constraints.get("single_ace_single_head_per_plan") is True,
+                f"route plan resources missing ACE constraint: {route_plan}")
     heads = initial_state.get("heads") or {}
     assert_true(set(heads.keys()) >= {"head:0", "head:1", "head:2", "head:3"},
                 f"route plan initial state missing heads: {route_plan}")
@@ -1697,6 +1711,34 @@ def test_route_plan_validate_rejects_tampered_profile_command() -> None:
                 f"tampered command error mismatch: {validation}")
 
 
+def test_route_plan_validate_rejects_tampered_resources() -> None:
+    reset_default()
+    report = multipart_upload(
+        "tampered_resources.gcode",
+        gcode(
+            "PETG",
+            "#1e78dc",
+            """
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    route_plan = report.get("route_plan") or {}
+    tampered = json.loads(json.dumps(route_plan))
+    resources = tampered.get("resources") or {}
+    resources["heads"] = ["head:3"]
+    tampered["resources"] = resources
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": tampered,
+    })
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"tampered resources should be rejected: {validation}")
+    assert_true("resources summary does not match" in errors,
+                f"tampered resources error mismatch: {validation}")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -1725,6 +1767,7 @@ def main() -> int:
         test_route_plan_only_rewrite_rejects_missing_target,
         test_route_plan_validate_rejects_incomplete_tool_contract,
         test_route_plan_validate_rejects_tampered_profile_command,
+        test_route_plan_validate_rejects_tampered_resources,
     ]
     for test in tests:
         test()

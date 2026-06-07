@@ -649,6 +649,26 @@ route plan 必须是可审计、可复现的打印任务计划。它不能只记
       }
     }
   },
+  "resources": {
+    "version": 1,
+    "heads": ["head:0"],
+    "sources": {
+      "native:0": {
+        "heads": ["head:0"]
+      }
+    },
+    "aces": {
+      "0": {
+        "heads": ["head:3"],
+        "sources": ["ace:0:1"],
+        "slots": [1]
+      }
+    },
+    "constraints": {
+      "single_source_single_head": true,
+      "single_ace_single_head_per_plan": true
+    }
+  },
   "events": [
     {
       "index": 0,
@@ -688,6 +708,8 @@ route plan 校验规则：
   复用给多个 slicer tool 时，必须仍然落在同一个 head。
 - 当前执行器模型下，同一个 ACE 设备在同一打印 route plan 中只能服务一个
   head；跨 head ACE 调度必须等后续资源锁和提前换料模型落地后再开放。
+- `resources` 是由 route plan 的 tool_map/events/steps 推导出来的资源摘要；
+  如果提交的摘要与事件内容不一致，validator 必须拒绝。
 - `preload` event 只能由调度器生成，不能由用户手动 target 直接生成。
 - 任何 `confidence = unknown/failed` 的 head 参与 event 时，必须阻止打印发送，
   除非 route plan 明确包含人工恢复后的确认状态。
