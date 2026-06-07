@@ -7,6 +7,12 @@
 - 单头单 ACE 4 色打印链路已完成基础验证。
 - native + ACE 多头混合打印已通过实机测试。
 - 当前项目重点从“证明能正确混合打印”转入“稳定化、效率优化、工作流集成”。
+- 2026-06-06：高级路由能力已开始后端架构重构。source graph、route plan v2、
+  source action preview、source transition preview 已通过 Docker dry-run；
+  前端重构和正式打印执行路径尚未接入。
+- 2026-06-06 实机发现 Web 可直接发送非 U1 的 P1S/Bambu 风格 G-code 并触发
+  `Must home Z axis first`。校验规则和实机发送策略见
+  [实机 G-code 校验与 Web 发送策略](real_printer_gcode_validation_strategy.md)。
 
 ## 阶段划分
 
@@ -54,6 +60,9 @@ Phase 4: 切片软件集成
 - 2026-06-06：Docker dry-run 补齐 `stale head_source` / ghost head 行为：
   `PRINT_START` 会清理“传感器空但 source 仍存在”的旧记录，也会标记
   “传感器有料但无 source”的 ghost head 并拒绝后续 swap。
+- 2026-06-06：实机日志确认 Web 发送路径需要新增 G-code 机型/方言校验。
+  非 U1 目标机型、Bambu/P1S 启动段、`G380`/`M620` 等危险命令应在
+  preflight 阶段阻止发送。
 
 ### 必做项
 
@@ -258,6 +267,34 @@ purge/prime: 35s
 ## Phase 3：高级路由能力
 
 目标：扩展硬件路由模型，但仍保持显式配置和可验证 source map。
+
+### 实现进度：2026-06-06
+
+已完成后端基础设施：
+
+- `source_graph.json` 可读写、校验、hash，并能生成保守默认 graph。
+- native source 和 ACE slot source 统一进入 graph。
+- native source 现在携带自己的 `module/channel`，目标 head 只决定
+  `EXTRUDER`，为“一个 head 使用多个 native feeder”打基础。
+- route plan v2 记录 `source_graph_hash`、`initial_state`、`tool_map`、
+  `events[].steps` 和 `commands`。
+- 打印发送前会校验 route plan 与当前 graph hash、enabled edge、profile
+  action 和命令字段。
+- `POST /api/route-plan/validate` 可以校验任意 route plan fragment。
+- `POST /api/source-action/preview` 和 `POST /api/source-actions/preview`
+  可以从 execution profile 生成 load/unload/swap 命令预览。
+- `POST /api/source-transition/preview` 可以根据当前 source state 生成
+  `unload_source -> select_head -> load_source/swap_source` transition 片段。
+- dry-run 已覆盖 `native:1 -> head:0`，确认跨头 native source 使用的是
+  source 自己的送料通道，而不是目标 head 的默认通道。
+
+未完成：
+
+- 前端 Dashboard 还没有按 source graph 重构。
+- transition preview 尚未接入真实打印 rewrite。
+- post-processor 仍保留旧 `tool_targets` / `ace_targets` fallback。
+- 任意 ACE slot 到任意 head、native + ACE 同 head 混合打印、提前换料调度
+  尚未实机验证。
 
 ### 3.1 ACE slot 任意映射
 

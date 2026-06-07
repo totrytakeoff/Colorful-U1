@@ -2347,6 +2347,100 @@ def _build_plan(pp, plan_name, body, result, mapping,
 _TOOLCHANGE_RE = re.compile(
     r"^;\s*Change Tool\s*(\d+)\s*->\s*Tool\s*(\d+)", re.MULTILINE)
 
+_GCODE_MACHINE_BLOCKERS = [
+    re.compile(r";\s*=+\s*machine\s*:\s*(P1S|X1C?|A1(?:\s+mini)?)\b", re.I),
+    re.compile(r"\bBambu\b", re.I),
+]
+_GCODE_DANGEROUS_COMMANDS = {
+    "G380",
+    "M290",
+    "M620",
+    "M620.1",
+    "M620.11",
+    "M621",
+    "M628",
+    "M629",
+    "M710",
+    "M960",
+    "M970",
+    "M974",
+    "M975",
+}
+_GCODE_COMMAND_RE = re.compile(r"^\s*([GMT]\d+(?:\.\d+)?)\b", re.I)
+
+def _validate_web_gcode_safety_text(gcode: str, *, filename: str = "") -> dict:
+    errors: list[dict[str, Any]] = []
+    machine_signature = ""
+    dangerous: list[dict[str, Any]] = []
+    for line_no, raw in enumerate(gcode.splitlines(), start=1):
+        line = raw.strip()
+        if line_no <= 500:
+            for pattern in _GCODE_MACHINE_BLOCKERS:
+                if pattern.search(line):
+                    machine_signature = machine_signature or line[:200]
+                    errors.append({
+                        "kind": "machine_signature",
+                        "line": line_no,
+                        "text": line[:200],
+                        "message": (
+                            "G-code appears to target a non-U1/Bambu-style "
+                            "machine profile"),
+                    })
+                    break
+        command_part = raw.split(";", 1)[0]
+        m = _GCODE_COMMAND_RE.match(command_part)
+        if not m:
+            continue
+        command = m.group(1).upper()
+        if command in _GCODE_DANGEROUS_COMMANDS:
+            item = {
+                "kind": "dangerous_command",
+                "line": line_no,
+                "command": command,
+                "text": line[:200],
+                "message": (
+                    "%s is blocked by the Colorful-U1 Web preflight safety gate"
+                    % command),
+            }
+            dangerous.append(item)
+            errors.append(item)
+    return {
+        "ok": not errors,
+        "filename": filename,
+        "machine_signature": machine_signature,
+        "dangerous_commands": dangerous,
+        "errors": errors,
+    }
+
+def _validate_web_gcode_safety_bytes(data: bytes, *, filename: str = "") -> dict:
+    text = data.decode("utf-8", errors="replace")
+    return _validate_web_gcode_safety_text(text, filename=filename)
+
+def _raise_gcode_safety_error(validation: dict) -> None:
+    if validation.get("ok"):
+        return
+    parts = []
+    for item in (validation.get("errors") or [])[:6]:
+        line = item.get("line")
+        if item.get("command"):
+            parts.append("line %s: %s" % (line, item.get("command")))
+        elif item.get("text"):
+            parts.append("line %s: %s" % (line, item.get("text")))
+    suffix = "; ".join(parts)
+    message = (
+        "G-code rejected by Colorful-U1 Web safety validation. "
+        "Use a Snapmaker U1-compatible slicer profile."
+    )
+    if suffix:
+        message += " Blocked entries: " + suffix
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": message,
+            "validation": validation,
+        },
+    )
+
 def _used_tool_indices(pp, gcode: str) -> set[int]:
     """Return the set of T-indices actually activated by the gcode.
     Slicers declare a colour for every defined extruder in the
@@ -2388,6 +2482,8 @@ async def preflight(file: UploadFile = File(...)) -> dict:
                     f"Bypass: upload directly via Moonraker's normal "
                     f"upload endpoint, or raise the limit via "
                     f"MULTIACE_PREFLIGHT_MAX_MB env."))
+    _raise_gcode_safety_error(
+        _validate_web_gcode_safety_bytes(data, filename=safe_name))
 
     _cleanup_preflight_dir()
     _PREFLIGHT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2781,6 +2877,23 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
             await asyncio.to_thread(
                 _prepend_print_prefs, str(cur), str(nxt))
             cur, nxt = nxt, cur
+
+        final_validation = _validate_web_gcode_safety_text(
+            cur.read_text(encoding="utf-8", errors="replace"),
+            filename=safe_name,
+        )
+        if not final_validation.get("ok"):
+            blocked = []
+            for item in (final_validation.get("errors") or [])[:6]:
+                if item.get("command"):
+                    blocked.append("line %s: %s" % (
+                        item.get("line"), item.get("command")))
+                elif item.get("text"):
+                    blocked.append("line %s: %s" % (
+                        item.get("line"), item.get("text")))
+            raise RuntimeError(
+                "final G-code safety validation failed: "
+                + "; ".join(blocked))
 
         _set_stage(state, "upload", 85.0)
         with open(cur, "rb") as fh:

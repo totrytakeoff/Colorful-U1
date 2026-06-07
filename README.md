@@ -126,10 +126,12 @@ ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
   minimum swap time.
 - ACE swaps are functional but still slow.
 - Purge, wipe and retract strategies are intentionally conservative.
-- ACE slots are still assigned at ACE-device level to an ACE head; arbitrary
-  per-slot routing to different heads is planned but not implemented.
-- A single native head with multiple ordinary native feeders is planned but not
-  implemented.
+- The source-graph backend is now partially implemented: it can express
+  arbitrary source/head edges and preview source transitions, but the Dashboard
+  UI and final print rewrite path have not yet been rebuilt around it.
+- Arbitrary ACE-slot to head routing, one native head using multiple ordinary
+  native feeders, and native + ACE mixed sources on the same head have not yet
+  been validated on real hardware.
 - This branch is tuned for active hardware experimentation, not end-user
   appliance behavior.
 
@@ -142,6 +144,11 @@ Near-term work:
 - make UI warnings distinguish recoverable alerts from hard blockers;
 - add repeatable dry-run regression tests for native-only, ACE-only and mixed
   routing;
+- connect the source-graph backend to the final print rewrite path;
+- rebuild Dashboard configuration around heads, sources and edges instead of
+  the old `native`/`ace` mode split;
+- add Web G-code machine/dialect safety validation so non-U1 Bambu/P1S-style
+  files are blocked before upload;
 - improve unload/reload parameters from real failure logs.
 
 Longer-term work:
@@ -155,7 +162,11 @@ Longer-term work:
 See [native/ACE MVP plan](multiace/docs/native_ace_mvp_plan.md) for the current
 engineering notes and TODO list. See
 [post-MVP optimization plan](multiace/docs/post_mvp_optimization_plan.md) for
-the swap optimization and slicer-integration roadmap.
+the swap optimization and slicer-integration roadmap. See
+[source graph architecture](multiace/docs/source_graph_architecture.md) for the
+current backend routing refactor, and
+[real-printer G-code validation strategy](multiace/docs/real_printer_gcode_validation_strategy.md)
+for the Web send safety plan.
 
 ## Installation
 

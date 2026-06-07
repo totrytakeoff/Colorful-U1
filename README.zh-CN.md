@@ -107,8 +107,10 @@ ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
 - 当前自动映射算法偏保守，还没有针对最少换料次数做优化。
 - ACE 换料可用，但速度仍然很慢。
 - 擦料、冲刷和退料策略目前偏保守。
-- ACE 槽位目前仍按 ACE 设备整体分配给某个 ACE 工具头；任意槽位映射到任意工具头仍在规划中。
-- 单个 native 工具头配合多个普通 native 进料器的多色方案尚未实现。
+- source graph 后端架构已开始落地，可以表达任意 source/head edge，并能预览
+  source transition；但前端配置 UI 和正式打印执行路径还没有按新架构重构。
+- ACE slot 任意映射到任意工具头、单个 native 工具头配合多个普通 native
+  进料器、native + ACE 同头混合换料仍未进入实机验证。
 - 这个分支目前面向硬件实验，不是开箱即用的终端用户产品。
 
 ## 路线图
@@ -119,6 +121,10 @@ ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
 - 在 Preflight 中更清晰地显示最终生成的命令意图；
 - 区分可恢复警告和硬阻断错误；
 - 增加 native-only、ACE-only、mixed-routing 的 dry-run 回归测试；
+- 完成 source graph 后端到正式打印 rewrite 的接入；
+- 重构 Dashboard，使工具头/source/edge 配置从旧 `native/ace` 模式切换到
+  source graph；
+- 增加 Web G-code 机型/方言安全校验，阻止非 U1/P1S/Bambu 风格文件直接发送；
 - 基于真实失败日志继续调整进退料参数。
 
 长期工作：
@@ -132,6 +138,10 @@ ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
 当前工程记录和 TODO 见 [native/ACE MVP plan](multiace/docs/native_ace_mvp_plan.md)。
 换料效率优化与切片软件集成路线见
 [post-MVP optimization plan](multiace/docs/post_mvp_optimization_plan.md)。
+source graph 架构和当前后端重构进度见
+[source graph architecture](multiace/docs/source_graph_architecture.md)。
+实机 G-code 校验策略见
+[real-printer G-code validation strategy](multiace/docs/real_printer_gcode_validation_strategy.md)。
 
 ## 安装与测试
 
