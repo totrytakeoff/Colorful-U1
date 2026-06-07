@@ -1884,6 +1884,8 @@ def _build_route_plan(
     }
     route_plan["resources"] = _route_plan_resource_summary(
         route_plan, graph or {})
+    route_plan["execution"] = _route_plan_execution_summary(
+        route_plan, graph or {})
     return route_plan
 
 def _route_plan_from_source_map(source_map: dict) -> dict:
@@ -2300,7 +2302,123 @@ def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
         expected = _route_plan_resource_summary(route_plan, graph)
         if resources != expected:
             errors.append("route plan resources summary does not match events")
+    execution = route_plan.get("execution")
+    if isinstance(execution, dict):
+        expected_execution = _route_plan_execution_summary(route_plan, graph)
+        if execution != expected_execution:
+            errors.append("route plan execution summary does not match events")
     return errors
+
+def _route_step_locks(event: dict, step: dict, graph: dict) -> dict:
+    locks = {
+        "heads": set(),
+        "sources": set(),
+        "aces": set(),
+        "ace_slots": set(),
+        "native_channels": set(),
+    }
+    head_id = step.get("head") or event.get("head")
+    head_id = _normalize_route_head_id({"head": head_id})
+    if head_id:
+        locks["heads"].add(head_id)
+    source_id = step.get("source") or event.get("source")
+    if source_id:
+        locks["sources"].add(str(source_id))
+    sources = graph.get("sources") or {}
+    source = sources.get(source_id) if source_id in sources else {}
+    kind = source.get("kind") if isinstance(source, dict) else None
+    if kind == "ace_slot" or step.get("ace") is not None:
+        ace_raw = step.get(
+            "ace", source.get("ace") if isinstance(source, dict) else None)
+        slot_raw = step.get(
+            "slot", source.get("slot") if isinstance(source, dict) else None)
+        try:
+            ace = int(ace_raw)
+            locks["aces"].add("ace:%d" % ace)
+            try:
+                locks["ace_slots"].add("ace:%d:%d" % (ace, int(slot_raw)))
+            except (TypeError, ValueError):
+                pass
+        except (TypeError, ValueError):
+            pass
+    if kind == "native_feeder" or step.get("module") is not None:
+        module = step.get(
+            "module", source.get("module") if isinstance(source, dict) else None)
+        channel = step.get(
+            "channel", source.get("channel") if isinstance(source, dict) else None)
+        if module is not None and channel is not None:
+            try:
+                locks["native_channels"].add("%s:%d" % (module, int(channel)))
+            except (TypeError, ValueError):
+                pass
+    return locks
+
+def _merge_lock_sets(items: list[dict]) -> dict:
+    merged = {
+        "heads": set(),
+        "sources": set(),
+        "aces": set(),
+        "ace_slots": set(),
+        "native_channels": set(),
+    }
+    for item in items:
+        for key in merged:
+            merged[key].update(item.get(key) or set())
+    return {
+        key: sorted(values)
+        for key, values in merged.items()
+        if values
+    }
+
+def _route_plan_execution_summary(route_plan: dict, graph: dict) -> dict:
+    phases = []
+    for event_idx, event in enumerate(route_plan.get("events") or []):
+        if not isinstance(event, dict):
+            continue
+        step_summaries = []
+        step_locks = []
+        for step_idx, step in enumerate(event.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            locks = _route_step_locks(event, step, graph)
+            step_locks.append(locks)
+            step_summaries.append({
+                "index": step_idx,
+                "kind": step.get("kind"),
+                "profile_action": step.get("profile_action"),
+                "source": step.get("source") or event.get("source"),
+                "head": step.get("head") or event.get("head"),
+                "command": step.get("command"),
+                "locks": _merge_lock_sets([locks]),
+            })
+        phase = {
+            "index": len(phases),
+            "event_index": event.get("index", event_idx),
+            "event_type": event.get("event_type"),
+            "slicer_tool": event.get("slicer_tool"),
+            "action": event.get("action"),
+            "source": event.get("source"),
+            "head": event.get("head"),
+            "previous_source": event.get("previous_source"),
+            "source_changed": bool(event.get("source_changed")),
+            "commands": event.get("commands") or [],
+            "locks": _merge_lock_sets(step_locks),
+            "steps": step_summaries,
+        }
+        phases.append({
+            key: value
+            for key, value in phase.items()
+            if value not in (None, [], {})
+        })
+    return {
+        "version": 1,
+        "mode": "sequential",
+        "phases": phases,
+        "constraints": {
+            "sequential_hardware_actions": True,
+            "allows_preload_phases": False,
+        },
+    }
 
 def _route_plan_affected_heads(route_plan: dict) -> set[str]:
     heads: set[str] = set()

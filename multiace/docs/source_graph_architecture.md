@@ -669,6 +669,45 @@ route plan 必须是可审计、可复现的打印任务计划。它不能只记
       "single_ace_single_head_per_plan": true
     }
   },
+  "execution": {
+    "version": 1,
+    "mode": "sequential",
+    "phases": [
+      {
+        "index": 0,
+        "event_index": 0,
+        "event_type": "tool_select",
+        "slicer_tool": 0,
+        "action": "select_loaded",
+        "source": "native:0",
+        "head": "head:0",
+        "source_changed": false,
+        "commands": ["T0"],
+        "locks": {
+          "heads": ["head:0"],
+          "sources": ["native:0"],
+          "native_channels": ["left:1"]
+        },
+        "steps": [
+          {
+            "index": 0,
+            "kind": "select_head",
+            "source": "native:0",
+            "head": "head:0",
+            "command": "T0",
+            "locks": {
+              "heads": ["head:0"],
+              "sources": ["native:0"]
+            }
+          }
+        ]
+      }
+    ],
+    "constraints": {
+      "sequential_hardware_actions": true,
+      "allows_preload_phases": false
+    }
+  },
   "events": [
     {
       "index": 0,
@@ -710,6 +749,10 @@ route plan 校验规则：
   head；跨 head ACE 调度必须等后续资源锁和提前换料模型落地后再开放。
 - `resources` 是由 route plan 的 tool_map/events/steps 推导出来的资源摘要；
   如果提交的摘要与事件内容不一致，validator 必须拒绝。
+- `execution` 是由 route plan events/steps 推导出的执行 phase 摘要。当前
+  `mode=sequential`，只记录顺序硬件动作和资源 lock，不改变 rewrite 行为。
+- 当前 `execution.constraints.allows_preload_phases=false`；提前换料阶段未落地前，
+  validator 必须拒绝与事件不一致的 execution 摘要，不能信任 UI 手写 phase。
 - `preload` event 只能由调度器生成，不能由用户手动 target 直接生成。
 - 任何 `confidence = unknown/failed` 的 head 参与 event 时，必须阻止打印发送，
   除非 route plan 明确包含人工恢复后的确认状态。

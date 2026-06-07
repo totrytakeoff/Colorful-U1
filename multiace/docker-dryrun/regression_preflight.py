@@ -389,6 +389,19 @@ def assert_route_plan_shape(report: dict) -> None:
                 f"route plan resources missing source constraint: {route_plan}")
     assert_true(constraints.get("single_ace_single_head_per_plan") is True,
                 f"route plan resources missing ACE constraint: {route_plan}")
+    execution = route_plan.get("execution") or {}
+    assert_true(execution.get("version") == 1,
+                f"route plan missing execution summary: {route_plan}")
+    assert_true(execution.get("mode") == "sequential",
+                f"route plan execution mode mismatch: {route_plan}")
+    exec_constraints = execution.get("constraints") or {}
+    assert_true(exec_constraints.get("sequential_hardware_actions") is True,
+                f"route plan execution missing sequential constraint: {route_plan}")
+    assert_true(exec_constraints.get("allows_preload_phases") is False,
+                f"route plan execution should not allow preload yet: {route_plan}")
+    phases = execution.get("phases") or []
+    assert_true(len(phases) == len(route_plan.get("events") or []),
+                f"route plan execution phase count mismatch: {route_plan}")
     heads = initial_state.get("heads") or {}
     assert_true(set(heads.keys()) >= {"head:0", "head:1", "head:2", "head:3"},
                 f"route plan initial state missing heads: {route_plan}")
@@ -1739,6 +1752,37 @@ def test_route_plan_validate_rejects_tampered_resources() -> None:
                 f"tampered resources error mismatch: {validation}")
 
 
+def test_route_plan_validate_rejects_tampered_execution() -> None:
+    reset_default()
+    report = multipart_upload(
+        "tampered_execution.gcode",
+        gcode(
+            "PETG",
+            "#1e78dc",
+            """
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    route_plan = report.get("route_plan") or {}
+    tampered = json.loads(json.dumps(route_plan))
+    execution = tampered.get("execution") or {}
+    phases = execution.get("phases") or []
+    assert_true(phases, f"test route plan should include execution phases: {route_plan}")
+    phases[0]["locks"] = {"heads": ["head:3"]}
+    execution["phases"] = phases
+    tampered["execution"] = execution
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": tampered,
+    })
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"tampered execution should be rejected: {validation}")
+    assert_true("execution summary does not match" in errors,
+                f"tampered execution error mismatch: {validation}")
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -1768,6 +1812,7 @@ def main() -> int:
         test_route_plan_validate_rejects_incomplete_tool_contract,
         test_route_plan_validate_rejects_tampered_profile_command,
         test_route_plan_validate_rejects_tampered_resources,
+        test_route_plan_validate_rejects_tampered_execution,
     ]
     for test in tests:
         test()
