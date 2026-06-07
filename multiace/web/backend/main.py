@@ -2169,6 +2169,76 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
     for t in sorted(used_tools):
         if t not in event_tools:
             errors.append("route plan missing tool_select event for T%d" % t)
+    errors.extend(_validate_route_plan_resources(route_plan, graph))
+    return errors
+
+def _normalize_route_head_id(target: dict) -> str | None:
+    head_id = target.get("head_id") or target.get("head")
+    if head_id is None:
+        return None
+    if str(head_id).startswith("head:"):
+        return str(head_id)
+    try:
+        return "head:%d" % int(head_id)
+    except (TypeError, ValueError):
+        return None
+
+def _route_target_resource_entries(route_plan: dict) -> list[tuple[str, str, dict]]:
+    entries: list[tuple[str, str, dict]] = []
+    if not isinstance(route_plan, dict):
+        return entries
+    for raw_t, item in (route_plan.get("tool_map") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target")
+        if isinstance(target, dict):
+            entries.append(("tool_map[%s]" % raw_t, "target", target))
+    for idx, event in enumerate(route_plan.get("events") or []):
+        if not isinstance(event, dict):
+            continue
+        target = event.get("target")
+        if isinstance(target, dict):
+            entries.append(("event[%d]" % idx, "target", target))
+        for step_idx, step in enumerate(event.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            if step.get("source") or step.get("head"):
+                entries.append(
+                    ("event[%d].step[%d]" % (idx, step_idx), "step", step))
+    return entries
+
+def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
+    """Validate resource ownership constraints that are not profile-specific."""
+    errors: list[str] = []
+    if not isinstance(route_plan, dict):
+        return errors
+    source_heads: dict[str, set[str]] = {}
+    ace_heads: dict[int, set[str]] = {}
+    sources = graph.get("sources") or {}
+    for _label, _kind, target in _route_target_resource_entries(route_plan):
+        source_id = target.get("source")
+        head_id = _normalize_route_head_id(target)
+        if not source_id or not head_id:
+            continue
+        source_heads.setdefault(str(source_id), set()).add(head_id)
+        source = sources.get(source_id) if source_id in sources else {}
+        if source.get("kind") == "ace_slot" or target.get("kind") == "ace":
+            ace_raw = target.get("ace", source.get("ace") if isinstance(source, dict) else None)
+            try:
+                ace = int(ace_raw)
+            except (TypeError, ValueError):
+                continue
+            ace_heads.setdefault(ace, set()).add(head_id)
+    for source_id, heads in sorted(source_heads.items()):
+        if len(heads) > 1:
+            errors.append(
+                "route plan maps source %s to multiple heads: %s"
+                % (source_id, ", ".join(sorted(heads))))
+    for ace, heads in sorted(ace_heads.items()):
+        if len(heads) > 1:
+            errors.append(
+                "route plan maps ACE %d to multiple heads in one print plan: %s"
+                % (ace, ", ".join(sorted(heads))))
     return errors
 
 def _route_plan_affected_heads(route_plan: dict) -> set[str]:

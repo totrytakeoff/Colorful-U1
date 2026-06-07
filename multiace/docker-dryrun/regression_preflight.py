@@ -230,6 +230,119 @@ def target_for(report: dict, tool: int) -> dict:
     return entries_by_tool(report)[tool].get("target") or {}
 
 
+def target_for_source(graph: dict, source_id: str, head_id: str) -> dict:
+    sources = graph.get("sources") or {}
+    source = sources.get(source_id) or {}
+    edge_obj = None
+    for edge in graph.get("edges") or []:
+        if (isinstance(edge, dict)
+                and edge.get("source") == source_id
+                and edge.get("head") == head_id
+                and edge.get("enabled", True)):
+            edge_obj = edge
+            break
+    assert_true(edge_obj is not None,
+                f"missing source graph edge {source_id} -> {head_id}")
+    head = int(str(head_id).split(":", 1)[1])
+    kind = source.get("kind")
+    target = {
+        "kind": "native" if kind == "native_feeder" else "ace",
+        "source": source_id,
+        "key": f"{source_id}->{head_id}",
+        "head": head,
+        "head_id": head_id,
+        "edge": {
+            "source": source_id,
+            "head": head_id,
+            "priority": edge_obj.get("priority", 100),
+            "constraints": edge_obj.get("constraints") or {},
+        },
+        "execution_profile": source.get("execution_profile") or "",
+    }
+    if kind == "native_feeder":
+        target["module"] = source.get("module")
+        target["channel"] = source.get("channel")
+    else:
+        target["ace"] = source.get("ace")
+        target["slot"] = source.get("slot")
+    return target
+
+
+def route_event_for_target(index: int, tool: int, target: dict) -> dict:
+    head = int(target.get("head"))
+    steps = [{
+        "kind": "select_head",
+        "head": f"head:{head}",
+        "command": f"T{head}",
+    }]
+    if target.get("kind") == "ace":
+        steps.append({
+            "kind": "swap_source",
+            "profile": target.get("execution_profile"),
+            "profile_action": "swap",
+            "source": target.get("source"),
+            "head": f"head:{head}",
+            "command": (
+                "ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d"
+                % (head, int(target.get("ace")), int(target.get("slot")))
+            ),
+            "ace": target.get("ace"),
+            "slot": target.get("slot"),
+        })
+    return {
+        "index": index,
+        "event_type": "tool_select",
+        "slicer_tool": tool,
+        "source": target.get("source"),
+        "head": f"head:{head}",
+        "edge": target.get("edge") or {},
+        "execution_profile": target.get("execution_profile"),
+        "source_changed": True,
+        "previous_source": None,
+        "steps": steps,
+        "commands": [
+            step.get("command") for step in steps if step.get("command")
+        ],
+        "target": target,
+    }
+
+
+def make_route_plan(meta: dict, initial_state: dict,
+                    tool_targets: dict[str, dict], events: list[int]) -> dict:
+    tool_map = {}
+    route_events = []
+    for index, tool in enumerate(events):
+        target = tool_targets[str(tool)]
+        head_id = target.get("head_id") or "head:%d" % int(target.get("head"))
+        tool_map[str(tool)] = {
+            "source": target.get("source"),
+            "head": head_id,
+            "edge": target.get("edge") or {},
+            "execution_profile": target.get("execution_profile"),
+            "target": target,
+        }
+        route_events.append(route_event_for_target(index, tool, target))
+    return {
+        "version": 2,
+        "token": "dryrun-resource-test",
+        "filename": "dryrun-resource-test.gcode",
+        "created_at": time.time(),
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "initial_state": initial_state,
+        "used_tools": sorted(int(t) for t in tool_targets.keys()),
+        "tool_map": tool_map,
+        "events": route_events,
+        "stats": {},
+    }
+
+
 def assert_target_matches(target: dict, expected: dict) -> None:
     for key, value in expected.items():
         assert_true(target.get(key) == value,
@@ -627,6 +740,72 @@ def test_manual_mapping_can_reuse_source_edge() -> None:
     assert_true("T1" in content, "manual reused native source should select T1")
     assert_true("ACE_SWAP_HEAD" not in content,
                 "manual reused native source should not emit ACE swaps")
+
+
+def test_route_plan_validate_allows_same_source_same_head_reuse() -> None:
+    reset_default()
+    report = multipart_upload(
+        "reuse_source_edge_validate.gcode",
+        gcode(
+            "PLA;PLA",
+            "#dc2828;#dc2828",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    native_target = target_for(report, 0)
+    started = start_print(
+        report,
+        tool_targets={"0": native_target, "1": native_target},
+    )
+    status = wait_job(started["job_id"])
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": status.get("route_plan") or {},
+    })
+    assert_true(validation.get("ok"),
+                f"same source on same head should validate: {validation}")
+
+
+def test_route_plan_validate_rejects_single_ace_multi_head_resource() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "ace", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "ace:0:1",
+        "head": "head:1",
+        "enabled": True,
+        "priority": 50,
+    })
+    push_graph(graph)
+    meta = request("GET", f"{WEB}/source-graph").get("meta") or {}
+    state = request("GET", f"{WEB}/source-state")
+    t0 = target_for_source(graph, "ace:0:0", "head:0")
+    t1 = target_for_source(graph, "ace:0:1", "head:1")
+    route_plan = make_route_plan(
+        meta=meta,
+        initial_state=state,
+        tool_targets={"0": t0, "1": t1},
+        events=[0, 1],
+    )
+    validation = post_json(f"{WEB}/route-plan/validate", {
+        "route_plan": route_plan,
+    })
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"single ACE multi-head route plan should be rejected: {validation}")
+    assert_true("maps ace 0 to multiple heads" in errors,
+                f"single ACE multi-head error mismatch: {validation}")
 
 
 def test_wrong_feed_auto_channel_rejected() -> None:
@@ -1526,6 +1705,8 @@ def main() -> int:
         test_unmapped_tool_is_not_feasible,
         test_invalid_bambu_p1s_gcode_blocked,
         test_manual_mapping_can_reuse_source_edge,
+        test_route_plan_validate_allows_same_source_same_head_reuse,
+        test_route_plan_validate_rejects_single_ace_multi_head_resource,
         test_wrong_feed_auto_channel_rejected,
         test_source_action_profile_preview,
         test_source_transition_preview_unloads_previous_source,
