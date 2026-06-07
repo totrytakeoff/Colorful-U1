@@ -3921,40 +3921,11 @@ async def reboot() -> dict:
 
 @app.post("/api/upload-and-print")
 async def upload_and_print(file: UploadFile = File(...)) -> dict:
-
-    try:
-        parsed = _parse_state(await _query_state())
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
-    failed = _load_failed_toolheads(parsed)
-    if failed:
-        raise HTTPException(
-            status_code=409,
-            detail="; ".join(_load_failed_message(t) for t in failed),
-        )
-
-    raw_name = file.filename or ""
-    safe_name = os.path.basename(raw_name)
-    if not safe_name or safe_name in (".", "..") or "/" in safe_name or "\\" in safe_name:
-        raise HTTPException(status_code=400, detail="invalid filename")
-    if not safe_name.lower().endswith((".gcode", ".gco", ".g")):
-        raise HTTPException(status_code=400, detail="not a g-code file")
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty file")
-    files = {"file": (safe_name, data, file.content_type or "application/octet-stream")}
-    payload = {"root": "gcodes", "print": "true"}
-    try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            r = await client.post(f"{MOONRAKER_URL}/server/files/upload",
-                                  data=payload, files=files)
-            r.raise_for_status()
-            return {"ok": True, "filename": safe_name, "moonraker": r.json()}
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code,
-                            detail=f"moonraker: {e.response.text}")
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    raise HTTPException(
+        status_code=410,
+        detail=("direct upload-and-print is disabled; use "
+                "/api/route-plan/preview followed by "
+                "/api/route-plan/print"))
 
 @app.get("/api/state")
 async def get_state() -> dict:

@@ -904,6 +904,8 @@ POST /api/route-plan/print
 
 当前已实现 preflight 兼容入口以及独立 route plan preview/remap/print 入口。
 旧 `/api/preflight/print` 仅保留兼容 token 打印，不再接受 `tool_targets` 覆盖。
+旧 `/api/upload-and-print` 已禁用并返回 410，避免原始 G-code 绕过 route plan
+校验直接上传打印。
 
 ## 与旧代码的替换关系
 

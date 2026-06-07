@@ -776,6 +776,26 @@ def test_preflight_print_rejects_tool_targets_override() -> None:
                 f"legacy print override should be rejected: {err}")
 
 
+def test_direct_upload_and_print_disabled() -> None:
+    reset_default()
+    err = multipart_upload(
+        "direct_upload_disabled.gcode",
+        gcode(
+            "PLA",
+            "#dc2828",
+            """
+            T0
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="upload-and-print",
+        expect_status=410,
+    )
+    assert_true("route-plan/preview" in str(err)
+                and "route-plan/print" in str(err),
+                f"direct upload-and-print should point to route-plan flow: {err}")
+
+
 def test_unmapped_tool_is_not_feasible() -> None:
     set_scenario({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -1880,6 +1900,7 @@ def main() -> int:
         test_single_ace_head_print,
         test_route_plan_preview_and_print_api,
         test_preflight_print_rejects_tool_targets_override,
+        test_direct_upload_and_print_disabled,
         test_unmapped_tool_is_not_feasible,
         test_invalid_bambu_p1s_gcode_blocked,
         test_manual_mapping_can_reuse_source_edge,
