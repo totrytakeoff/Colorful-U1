@@ -447,11 +447,12 @@
             <div class="card-title">
               <h3>耗材映射</h3>
               <div class="card-actions">
-                <button @click="autoValidateRoutePlan" :disabled="busy.validate">重新校验</button>
-                <button @click="remapRoutePlan" :disabled="busy.remap">应用映射</button>
+                <button @click="autoValidateRoutePlan" :disabled="busy.validate || !canValidateRoutePlan">重新校验</button>
+                <button @click="remapRoutePlan" :disabled="busy.remap || !canApplyMapping">应用映射</button>
               </div>
             </div>
             <p v-if="manualMappingTools.length" class="notice warn">需要手动选择 source 并点击“应用映射”：{{ manualMappingTools.map((t) => 'T' + displayIndex(t)).join(', ') }}</p>
+            <p v-else-if="!preflight.report.route_plan" class="notice warn">映射已选齐，点击“应用映射”生成 route plan。</p>
             <div class="mapping-flow">
               <article v-for="tool in usedTools" :key="'map-flow-' + tool.t" class="mapping-flow-row">
                 <button class="slicer-card" :class="{active: selectedTool === String(tool.t)}" @click="selectedTool = String(tool.t)">
@@ -516,7 +517,8 @@
       <span v-for="item in cmdQueue" :key="item.id" :class="item.status">{{ item.label }}</span>
     </div>
     <button @click="cmdPaused = !cmdPaused">{{ cmdPaused ? 'Resume' : 'Pause' }}</button>
-    <button @click="clearQueue">Clear</button>
+    <button @click="cancelQueuedCommands" :disabled="!hasQueuedCommands">Cancel queued</button>
+    <button @click="clearDoneQueue" :disabled="!hasFinishedCommands">Clear done</button>
     <button @click="queueOpen = false">Hide</button>
   </div>
 

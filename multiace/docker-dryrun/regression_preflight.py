@@ -1844,11 +1844,12 @@ def test_route_plan_rejects_graph_hash_change() -> None:
                 f"route plan validate should fail after graph change: {validation}")
     assert_true("hash mismatch" in "; ".join(validation.get("errors") or []).lower(),
                 f"route plan validate error mismatch: {validation}")
-    started = post_json(f"{WEB}/preflight/print", {
+    err = post_json(f"{WEB}/preflight/print", {
         "token": report["token"],
         "mode": "slicer",
-    })
-    wait_job_error(started["job_id"], "hash mismatch")
+    }, expect_status=409)
+    assert_true("hash mismatch" in str(err).lower(),
+                f"hash-mismatch print should be rejected before job start: {err}")
 
 
 def test_route_plan_rejects_stale_runtime_state() -> None:
@@ -1889,11 +1890,98 @@ def test_route_plan_rejects_stale_runtime_state() -> None:
                 f"stale runtime state should be rejected: {validation}")
     assert_true("stale" in errors and "head:0" in errors,
                 f"stale runtime state error mismatch: {validation}")
-    started = post_json(f"{WEB}/preflight/print", {
+    err = post_json(f"{WEB}/preflight/print", {
         "token": report["token"],
         "mode": "slicer",
+    }, expect_status=409)
+    assert_true("stale" in str(err).lower(),
+                f"stale print should be rejected before job start: {err}")
+
+
+def test_route_plan_rejects_target_source_not_ready() -> None:
+    ready_scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "native_heads": [],
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+    }
+    set_scenario(ready_scenario)
+    report = multipart_upload(
+        "route_target_source_empty.gcode",
+        gcode(
+            "PLA",
+            "#dc2828",
+            """
+            T0
+            G1 X10 Y10 E1
+            """,
+        ),
+    )
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    assert_true(validation.get("ok"),
+                f"fresh ready source route plan should validate: {validation}")
+
+    empty_scenario = dict(ready_scenario)
+    empty_scenario["slots"] = [
+        {
+            "ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828",
+            "status": "empty",
+        },
+    ]
+    set_scenario(empty_scenario)
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    errors = "; ".join(validation.get("errors") or []).lower()
+    assert_true(not validation.get("ok"),
+                f"empty planned source should be rejected: {validation}")
+    assert_true("planned source ace:0:0 is not ready" in errors
+                and "slot empty" in errors,
+                f"empty planned source error mismatch: {validation}")
+    err = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    }, expect_status=409)
+    assert_true("planned source ace:0:0 is not ready" in str(err).lower(),
+                f"empty source print should be rejected before job start: {err}")
+
+
+def test_source_state_marks_loaded_empty_ace_slot_exhausted() -> None:
+    set_scenario({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {
+                "ace": 0, "slot": 0, "material": "PLA", "color": "#dc2828",
+                "status": "empty",
+            },
+        ],
+        "head_sources": [
+            {
+                "head": 0, "ace": 0, "slot": 0, "material": "PLA",
+                "color": "#dc2828", "sensor_loaded": True,
+            },
+        ],
     })
-    wait_job_error(started["job_id"], "stale")
+    state = request("GET", f"{WEB}/source-state")
+    head0 = (state.get("heads") or {}).get("head:0") or {}
+    assert_true(head0.get("current_source") == "ace:0:0",
+                f"exhausted setup should preserve current source: {state}")
+    assert_true(head0.get("source_confidence") == "exhausted",
+                f"empty loaded ACE slot should be exhausted: {state}")
+    validation = request(
+        "GET",
+        f"{WEB}/source-state",
+    )
+    assert_true(
+        ((validation.get("heads") or {}).get("head:0") or {}).get(
+            "source_ready_reason") == "slot empty",
+        f"exhausted head should expose slot-empty reason: {validation}")
 
 
 def test_route_plan_only_rewrite() -> None:
@@ -2287,6 +2375,8 @@ def main() -> int:
         test_source_graph_edge_required_for_ace_swap,
         test_route_plan_rejects_graph_hash_change,
         test_route_plan_rejects_stale_runtime_state,
+        test_route_plan_rejects_target_source_not_ready,
+        test_source_state_marks_loaded_empty_ace_slot_exhausted,
         test_route_plan_only_rewrite,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,

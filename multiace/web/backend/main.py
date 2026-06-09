@@ -2499,7 +2499,8 @@ def _route_plan_affected_heads(route_plan: dict) -> set[str]:
     return heads
 
 def _validate_route_plan_runtime_state(route_plan: dict,
-                                       current_state: dict) -> list[str]:
+                                       current_state: dict,
+                                       current_sources: dict | None = None) -> list[str]:
     """Reject stale route plans before moving or uploading print G-code."""
     errors: list[str] = []
     if not isinstance(route_plan, dict):
@@ -2529,6 +2530,8 @@ def _validate_route_plan_runtime_state(route_plan: dict,
         return ["route plan initial_state.heads must be an object"]
     if not isinstance(current_heads, dict):
         return ["current source state heads must be an object"]
+    if current_sources is None:
+        current_sources = {}
     # "stale" means the source record exists but the head sensor is empty. The
     # print start path can safely clean that up, so allow it only when the live
     # state still exactly matches the preflight snapshot.
@@ -2563,6 +2566,16 @@ def _validate_route_plan_runtime_state(route_plan: dict,
             errors.append(
                 "route plan initial_state[%s] confidence changed: initial=%s current=%s"
                 % (head_id, planned_conf, live_conf))
+    for source_id in sorted((route_plan.get("resources") or {}).get("sources") or {}):
+        source = current_sources.get(source_id) if isinstance(current_sources, dict) else None
+        if source is None:
+            errors.append(
+                "current source state missing planned source %s" % source_id)
+            continue
+        if source.get("ready") is False:
+            errors.append(
+                "planned source %s is not ready: %s"
+                % (source_id, source.get("ready_reason") or "not ready"))
     return errors
 
 def _source_map_slicer_meta(source_map: dict) -> tuple[dict[int, str], dict[int, str]]:
@@ -3283,9 +3296,11 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                 "route plan missing; run source graph preflight again")
         graph, graph_meta = _load_source_graph(parsed)
         route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
+        current_state = sg.source_state(graph, parsed)
+        current_sources = sg.runtime_sources(graph, parsed)
         route_errors.extend(
             _validate_route_plan_runtime_state(
-                route_plan, sg.source_state(graph, parsed)))
+                route_plan, current_state, current_sources))
         if route_errors:
             raise RuntimeError(
                 "route plan validation failed: " + "; ".join(route_errors[:8]))
@@ -3434,9 +3449,11 @@ async def _apply_route_plan_tool_targets(token: str,
         created_at=source_map.get("created_at"),
     )
     route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
+    current_state = sg.source_state(graph, parsed)
+    current_sources = sg.runtime_sources(graph, parsed)
     route_errors.extend(
         _validate_route_plan_runtime_state(
-            route_plan, sg.source_state(graph, parsed)))
+            route_plan, current_state, current_sources))
     if route_errors:
         raise HTTPException(
             status_code=409,
@@ -3468,7 +3485,8 @@ async def _start_route_plan_print(token: str, *, set_prefs: bool = False,
     if not gpath.is_file():
         raise HTTPException(status_code=404,
                             detail="route plan token expired or unknown")
-    if not _load_preflight_route_plan(token):
+    route_plan = _load_preflight_route_plan(token)
+    if not route_plan:
         raise HTTPException(
             status_code=404,
             detail="route plan missing; run route-plan preview again")
@@ -3482,6 +3500,17 @@ async def _start_route_plan_print(token: str, *, set_prefs: bool = False,
             status_code=409,
             detail="; ".join(_load_failed_message(t) for t in failed),
         )
+    graph, graph_meta = _load_source_graph(parsed)
+    route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
+    current_state = sg.source_state(graph, parsed)
+    current_sources = sg.runtime_sources(graph, parsed)
+    route_errors.extend(
+        _validate_route_plan_runtime_state(
+            route_plan, current_state, current_sources))
+    if route_errors:
+        raise HTTPException(
+            status_code=409,
+            detail="route plan validation failed: " + "; ".join(route_errors[:8]))
     safe_name = (npath.read_text(encoding="utf-8").strip()
                  if npath.is_file() else (token + ".gcode"))
     _prune_old_jobs()
@@ -3571,7 +3600,9 @@ async def preflight_route_plan_validate(token: str) -> dict:
     graph, meta = _load_source_graph(parsed)
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
     current_state = sg.source_state(graph, parsed)
-    errors.extend(_validate_route_plan_runtime_state(route_plan, current_state))
+    current_sources = sg.runtime_sources(graph, parsed)
+    errors.extend(_validate_route_plan_runtime_state(
+        route_plan, current_state, current_sources))
     return {
         "ok": not errors,
         "errors": errors,
@@ -3600,7 +3631,9 @@ async def route_plan_validate(payload: RoutePlanValidateRequest) -> dict:
     route_plan = payload.route_plan
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
     current_state = sg.source_state(graph, parsed)
-    errors.extend(_validate_route_plan_runtime_state(route_plan, current_state))
+    current_sources = sg.runtime_sources(graph, parsed)
+    errors.extend(_validate_route_plan_runtime_state(
+        route_plan, current_state, current_sources))
     return {
         "ok": not errors,
         "errors": errors,

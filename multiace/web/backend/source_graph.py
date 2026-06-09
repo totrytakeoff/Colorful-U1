@@ -391,6 +391,7 @@ def _source_for_loaded_toolhead(graph: dict[str, Any], parsed: dict[str, Any],
 
 def source_state(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
     heads_state: dict[str, Any] = {}
+    sources_runtime = runtime_sources(graph, parsed)
     for head_id, head in (graph.get("heads") or {}).items():
         try:
             idx = int(head.get("index"))
@@ -400,8 +401,13 @@ def source_state(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any
         sensor = bool(th.get("filament_at_extruder"))
         current = _source_for_loaded_toolhead(graph, parsed, idx)
         load_failed = bool(th.get("load_failed"))
+        current_runtime = sources_runtime.get(current or "") or {}
+        current_unready = (
+            bool(current) and current_runtime.get("ready") is False)
         if load_failed:
             confidence = "failed"
+        elif sensor and current_unready:
+            confidence = "exhausted"
         elif sensor and current:
             confidence = "known"
         elif sensor and not current:
@@ -416,6 +422,8 @@ def source_state(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any
             "sensor_filament": sensor,
             "current_source": current,
             "source_confidence": confidence,
+            "source_ready": current_runtime.get("ready") if current else None,
+            "source_ready_reason": current_runtime.get("ready_reason") or "",
             "last_error": th.get("channel_error") or None,
             "updated_at": time.time(),
         }

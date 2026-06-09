@@ -447,6 +447,8 @@ createApp({
       const queued = cmdQueue.value.filter((item) => item.status === "queued").length;
       return queued ? `${queued} queued` : "idle";
     });
+    const hasQueuedCommands = computed(() => cmdQueue.value.some((item) => item.status === "queued"));
+    const hasFinishedCommands = computed(() => cmdQueue.value.some((item) => ["done", "error"].includes(item.status)));
     function macroLabel(name, args) {
       const parts = Object.entries(args || {}).map(([k, v]) => `${k}=${v}`).join(" ");
       return `${name}${parts ? " " + parts : ""}`;
@@ -513,8 +515,8 @@ createApp({
     function clearDoneQueue() {
       cmdQueue.value = cmdQueue.value.filter((item) => !["done", "error"].includes(item.status));
     }
-    function clearQueue() {
-      cmdQueue.value = cmdQueue.value.filter((item) => item.status === "running");
+    function cancelQueuedCommands() {
+      cmdQueue.value = cmdQueue.value.filter((item) => item.status !== "queued");
     }
     function enqueueCommands(commands) {
       let count = 0;
@@ -1506,6 +1508,12 @@ createApp({
     const canPrintRoutePlan = computed(() => {
       return !!preflight.report?.token && preflight.validation?.ok === true && preflightErrors.value.length === 0 && sourceAlerts.value.length === 0;
     });
+    const canValidateRoutePlan = computed(() => {
+      return !!preflight.report?.token && !!preflight.report?.route_plan && !manualMappingTools.value.length;
+    });
+    const canApplyMapping = computed(() => {
+      return !!preflight.report?.token && !manualMappingTools.value.length && !preflightStatus.value.ok;
+    });
     const swapSummary = computed(() => {
       const stats = preflight.report?.route_plan?.stats || preflight.report?.source_map?.swap_stats || {};
       const swaps = stats.active_ace_swaps ?? 0;
@@ -1760,7 +1768,8 @@ createApp({
       sourceOptionsForHead, edgeEnabled, edgePriority, setEdgeEnabled, setEdgePriority,
       setHeadSourceBinding, bindingLabel,
       syncGraphJson, applyGraphJson, saveSourceGraph,
-      cmdQueue, cmdPaused, queueOpen, queuedCount, runningQueueLabel, queueMacro, clearDoneQueue, clearQueue,
+      cmdQueue, cmdPaused, queueOpen, queuedCount, runningQueueLabel, hasQueuedCommands,
+      hasFinishedCommands, queueMacro, clearDoneQueue, cancelQueuedCommands,
       confirmUnloadAll,
       dryerCfg, dryStart, dryStop,
       headPanel, activeHeadCard, allowedSourcesForHead,
@@ -1781,6 +1790,7 @@ createApp({
       fileInput, gcodeCanvas, gcodePreview, gcodeBoundsLabel,
       preflight, manualTargets, selectedTool, usedTools, preflightTargets,
       preflightErrors, manualMappingTools, preflightStatus, mappingCheckLabel,
+      canValidateRoutePlan, canApplyMapping,
       canPrintRoutePlan, swapSummary, routePlanSummary,
       handleFileInput, handleDrop, autoValidateRoutePlan, remapRoutePlan,
       checkClass, mappingLabel, mappingCommands, assignSelectedTool,

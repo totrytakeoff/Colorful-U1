@@ -617,6 +617,7 @@ class DryRunHeadSource(BaseModel):
     color: str = "FFFFFF"
     brand: str = "DryRunACE"
     load_failed: bool = False
+    sensor_loaded: bool = False
 
 class DryRunScenario(BaseModel):
     ace_device_count: int = 1
@@ -822,6 +823,13 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
             "brand": src.brand,
             "load_failed": bool(src.load_failed),
         }
+        if src.sensor_loaded:
+            module, key = _head_key(head)
+            feed = state[module][key]
+            feed["filament_detected"] = True
+            feed["filament_in_ace"] = True
+            feed["filament_in_toolhead"] = True
+            feed["filament_at_extruder"] = True
 
     _save_state(state)
     for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
