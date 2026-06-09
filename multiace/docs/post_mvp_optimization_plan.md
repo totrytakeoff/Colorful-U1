@@ -1,6 +1,6 @@
 # Colorful-U1 后 MVP 优化路线
 
-日期：2026-06-05
+日期：2026-06-08
 
 当前基线：
 
@@ -14,6 +14,11 @@
 - 2026-06-06 实机发现 Web 可直接发送非 U1 的 P1S/Bambu 风格 G-code 并触发
   `Must home Z axis first`。校验规则和实机发送策略见
   [实机 G-code 校验与 Web 发送策略](real_printer_gcode_validation_strategy.md)。
+- 2026-06-08：source graph / route plan / post-processor dry-run 基线进一步
+  收口。真实 Snapmaker Orca U1 切片
+  `摆摊提示牌001_PLA_1h21m.gcode` 已通过 dry-run：
+  preview -> manual remap -> validate -> print。此次修复了
+  `Change ToolX -> ToolX` no-op marker 导致 route cursor 错位的问题。
 
 ## 阶段划分
 
@@ -38,7 +43,7 @@ Phase 4: 切片软件集成
 目标：让当前已经能打印的 native/ACE 混合链路变成可复现、可排查、可回归的
 稳定基线。
 
-### 实现进度：2026-06-05
+### 实现进度：2026-06-08
 
 已落地第一轮收尾：
 
@@ -64,6 +69,12 @@ Phase 4: 切片软件集成
 - 2026-06-06：实机日志确认 Web 发送路径需要新增 G-code 机型/方言校验。
   非 U1 目标机型、Bambu/P1S 启动段、`G380`/`M620` 等危险命令应在
   preflight 阶段阻止发送。
+- 2026-06-08：route-plan-only 发送路径已通过真实 U1 G-code dry-run 验证。
+  当前后端能够处理 Snapmaker Orca 输出中的初始裸 `Tn`、`Change Tool X -> Y`
+  后物理 `Tn` 与 slicer target 不一致、重复物理 `Tn`、以及
+  `Change ToolX -> ToolX` no-op marker。
+- 2026-06-08：控制台 Source 卡片和上传映射卡片已显示 source runtime 状态；
+  不可用 source 保持可见但不可发送，便于手动 remap 时判断原因。
 
 ### 必做项
 
@@ -107,10 +118,29 @@ Phase 4: 切片软件集成
 - 出错时能从日志里还原：哪个 slicer tool、哪个 head、哪个 ACE、哪个 slot。
 - 打印中不会通过 UI 改坏路由配置。
 
+当前判断：Phase 1 的后端 dry-run 基线基本可进入“只修 blocker”的状态。后续
+不应继续在 route-plan 基础链路上做大改，除非真实 G-code 样本或实机日志证明
+仍有阻断发送/错误换料的 bug。
+
+### Phase 1 剩余收口
+
+- 把真实 G-code 样本最小化为固定回归样本，不把 4MB 原文件纳入仓库。
+- 改善 route-plan rewrite 错误信息：包含 marker 行号、期望 event、当前 event、
+  route cursor index，而不是只报 `commands for Tn`。
+- UI 上传页在 resolver 不能自动完成映射时，应明确显示“需要手动映射”，不要让
+  `route_plan=null` 看起来像未知崩溃。
+- source graph 保存后，应在上传页明确提示旧 token/route plan 失效。
+
 ## Phase 2：低风险效率优化
 
 目标：先减少不必要的换料次数，再优化单次换料耗时。优先做不改变硬件控制
 边界的优化。
+
+当前优先级：
+
+1. 先做统计和可视化，不改变最终 G-code。
+2. 再做人工可确认的 mapping suggestion，不自动应用。
+3. 最后才进入会改变换料顺序或动作时机的调度优化。
 
 ### 实现进度：2026-06-05
 
@@ -153,6 +183,17 @@ Phase 4: 切片软件集成
 
 能稳定减少明显无意义 swap 即可。
 
+下一步建议落地：
+
+- 在上传页展示完整 toolchange 序列摘要：
+  - route events 数；
+  - 真实 ACE swap 次数；
+  - 同 source 可跳过次数；
+  - 每个 slicer tool 的段数和出现层。
+- 给每种手动映射实时计算预计 swap 次数和预计耗时。
+- 自动建议只作为 preview，用户点击后通过 `/api/route-plan/remap` 生成新的
+  route plan。
+
 ### 2.2 优化映射策略
 
 当前 resolver 的目标是正确，不是高效。后续可以在 preflight 中提供几种模式：
@@ -171,6 +212,16 @@ Manual: 用户完全手动指定
 - 高频交替的两个颜色尽量不要都放在 ACE 上。
 - 点缀色可以放 ACE slot。
 - 当前已经 loaded 的 ACE slot 获得额外权重。
+
+短期不要追求色差算法完美。当前真实样本已经证明：颜色不匹配时，系统需要清晰地
+进入 manual remap，而不是强行匹配到错误 source。自动匹配策略应分级：
+
+```text
+exact material + close color: 自动建议
+material match + color far: 低置信度建议，需确认
+material mismatch: 默认不自动映射
+unready source: 可见但禁用
+```
 
 ### 2.3 跳过无效 swap
 
@@ -269,7 +320,7 @@ purge/prime: 35s
 
 目标：扩展硬件路由模型，但仍保持显式配置和可验证 source map。
 
-### 实现进度：2026-06-06
+### 实现进度：2026-06-08
 
 已完成后端基础设施：
 
@@ -290,10 +341,14 @@ purge/prime: 35s
   G-code 能包含同一 head 多 source 的 unload/load transition 命令。
 - dry-run 已覆盖 `native:1 -> head:0`，确认跨头 native source 使用的是
   source 自己的送料通道，而不是目标 head 的默认通道。
+- route plan resource/execution 校验已能拒绝当前执行器不支持的资源共享。
+- 真实 U1 G-code dry-run 已验证 route-plan rewrite 能消费 Snapmaker Orca
+  工具切换语法，并保持最终上传 G-code 与 route plan 命令一致。
 
 未完成：
 
-- 前端 Dashboard 还没有按 source graph 重构。
+- 前端已开始按 source graph 重构，但交互和视觉仍未完成，需要继续围绕
+  控制台、配置、上传打印三个 tab 收口。
 - source transition 尚未实机验证。
 - post-processor 仍保留旧 `tool_targets` / `ace_targets` fallback。
 - 任意 ACE slot 到任意 head、native + ACE 同 head 混合打印、提前换料调度
@@ -445,14 +500,15 @@ Phase 4c:
 
 ## 建议近期开发顺序
 
-1. Phase 1：source map 持久化。
-2. Phase 1：最终命令意图预览。
-3. Phase 1：dry-run 回归脚本。
-4. Phase 1：打印中锁定危险配置。
-5. Phase 2：统计 swap 次数和耗时。
-6. Phase 2：跳过重复 swap。
-7. Phase 2：preflight 显示预计换料次数。
-8. Phase 2：低风险映射优化。
+1. Phase 1 收尾：固定真实 U1 G-code 最小回归样本。
+2. Phase 1 收尾：改进 route-plan rewrite 错误信息和 UI 错误解释。
+3. Phase 1 收尾：上传页明确区分 auto-resolved、manual-required、invalid。
+4. Phase 2：统计 swap 次数和耗时，并在上传页实时展示。
+5. Phase 2：跳过重复 same-source swap 的可观测性和统计确认。
+6. Phase 2：低风险映射建议，只 preview，不自动应用。
+7. UI：控制台/配置/上传打印三 tab 继续收口，尤其 source 状态、映射状态和
+   route plan validate 状态。
+8. 实机：在 dry-run 同样样本稳定后，再做真实打印发送验证。
 9. Phase 4a 原型：post-processing script 调用 Colorful-U1 API。
 
 切片软件完整集成可以开始调研，但不建议早于 Phase 2 完成前进入主线实现。

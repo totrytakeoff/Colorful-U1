@@ -154,7 +154,13 @@ def _route_plan_event_cursor(route_plan=None):
     for event in events:
         t = int(event.get('slicer_tool'))
         by_tool.setdefault(t, []).append(event)
-    return {'by_tool': by_tool, 'offsets': {}, 'strict': bool(events)}
+    return {
+        'events': events,
+        'index': 0,
+        'by_tool': by_tool,
+        'offsets': {},
+        'strict': bool(events),
+    }
 
 def _commands_from_route_event(event):
     if not isinstance(event, dict):
@@ -192,6 +198,20 @@ def _route_event_for_tool(cursor, t_index):
         t = int(t_index)
     except (TypeError, ValueError):
         return None
+    events = cursor.get('events') or []
+    if events:
+        idx = int(cursor.get('index', 0) or 0)
+        if idx >= len(events):
+            return None
+        event = events[idx]
+        try:
+            event_t = int(event.get('slicer_tool'))
+        except (TypeError, ValueError):
+            return None
+        if event_t != t:
+            return None
+        cursor['index'] = idx + 1
+        return event
     rows = cursor.get('by_tool', {}).get(t) or []
     if not rows:
         return None
@@ -202,15 +222,53 @@ def _route_event_for_tool(cursor, t_index):
     offsets[t] = idx + 1
     return rows[idx]
 
+def _route_has_event_for_tool(cursor, t_index):
+    if not cursor:
+        return False
+    try:
+        t = int(t_index)
+    except (TypeError, ValueError):
+        return False
+    events = cursor.get('events') or []
+    if events:
+        idx = int(cursor.get('index', 0) or 0)
+        if idx >= len(events):
+            return False
+        try:
+            return int(events[idx].get('slicer_tool')) == t
+        except (TypeError, ValueError):
+            return False
+    return bool(cursor.get('by_tool', {}).get(t) or [])
+
+def _route_cursor_context(cursor):
+    if not cursor:
+        return 'no route cursor'
+    events = cursor.get('events') or []
+    if events:
+        idx = int(cursor.get('index', 0) or 0)
+        if idx >= len(events):
+            return 'cursor index %d at end of %d events' % (idx, len(events))
+        event = events[idx]
+        return (
+            'cursor index %d/%d expects T%s event=%s'
+            % (idx, len(events), event.get('slicer_tool'), event.get('index'))
+        )
+    offsets = cursor.get('offsets') or {}
+    return 'per-tool offsets %s' % offsets
+
+def _missing_route_event_error(kind, t_index, cursor):
+    return ValueError(
+        'route plan missing %s for T%d (%s)'
+        % (kind, int(t_index), _route_cursor_context(cursor)))
+
 def _commands_for_tool_event(t_index, cursor, ace_targets=None, tool_targets=None):
     event = _route_event_for_tool(cursor, t_index)
     commands = _commands_from_route_event(event)
     if commands:
         return commands
     if cursor and cursor.get('strict'):
-        raise ValueError(
-            'route plan missing tool_select event commands for T%d'
-            % int(t_index))
+        raise _missing_route_event_error(
+            'tool_select event commands', t_index, cursor)
     target = _target_for_tool(int(t_index), ace_targets, tool_targets)
     head = target['head']
     if target['kind'] != 'ace':
@@ -284,13 +342,19 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     else:
         pre, body = gcode[:m.start()], gcode[m.start():]
 
+    consumed_initial_tools = set()
+
     def _expand_initial(m):
-        if route_strict and _route_event_for_tool(route_cursor, int(m.group(1))) is None:
-            raise ValueError(
-                'route plan missing initial tool_select event for T%d'
-                % int(m.group(1)))
+        tool = int(m.group(1))
+        if (route_strict and tool not in consumed_initial_tools
+                and not _route_has_event_for_tool(route_cursor, tool)):
+            raise _missing_route_event_error(
+                'initial tool_select event', tool, route_cursor)
+        if route_strict and tool not in consumed_initial_tools:
+            _route_event_for_tool(route_cursor, tool)
+            consumed_initial_tools.add(tool)
         target = _target_for_tool(
-            int(m.group(1)), ace_targets, tool_targets,
+            tool, ace_targets, tool_targets,
             strict=route_strict)
         head = target['head']
         if target['kind'] != 'ace':
@@ -301,12 +365,46 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     pre = re.sub(r'^T(1[0-5]|[0-9])\s*$',
                  _expand_initial, pre, flags=re.MULTILINE)
 
-    def _expand_swap(m):
-        return '\n'.join(_commands_for_tool_event(
-            int(m.group(1)), route_cursor, ace_targets, tool_targets))
-
-    body = re.sub(r'^T(1[0-5]|[0-9])\s*$',
-                  _expand_swap, body, flags=re.MULTILINE)
+    change_target_re = re.compile(
+        r'^;\s*Change Tool\s*(\d+)\s*->\s*Tool\s*(\d+)')
+    pending_route_tool = None
+    current_route_tool = None
+    body_lines = []
+    for line in body.splitlines():
+        m_change = change_target_re.match(line.strip())
+        if m_change:
+            from_tool = int(m_change.group(1))
+            to_tool = int(m_change.group(2))
+            if (route_strict and from_tool not in consumed_initial_tools
+                    and _route_has_event_for_tool(route_cursor, from_tool)):
+                _route_event_for_tool(route_cursor, from_tool)
+                consumed_initial_tools.add(from_tool)
+            if from_tool == to_tool:
+                current_route_tool = from_tool
+            else:
+                pending_route_tool = to_tool
+            body_lines.append(line)
+            continue
+        m_tool = re.match(r'^T(1[0-5]|[0-9])\s*$', line.strip())
+        if m_tool:
+            if pending_route_tool is not None:
+                tool = pending_route_tool
+                pending_route_tool = None
+                current_route_tool = tool
+                body_lines.extend(_commands_for_tool_event(
+                    tool, route_cursor, ace_targets, tool_targets))
+            elif route_strict and current_route_tool is not None:
+                target = _target_for_tool(
+                    current_route_tool, ace_targets, tool_targets,
+                    strict=True)
+                body_lines.append('T%d' % target['head'])
+            else:
+                tool = int(m_tool.group(1))
+                body_lines.extend(_commands_for_tool_event(
+                    tool, route_cursor, ace_targets, tool_targets))
+            continue
+        body_lines.append(line)
+    body = '\n'.join(body_lines)
 
     head_loaded = {}
     filtered_lines = []
@@ -1911,7 +2009,7 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     in-memory version's contract."""
     m104_re   = re.compile(r'^M10[49]\b')
     preextr_re = re.compile(r'^(SM_PRINT_PREEXTRUDE_FILAMENT INDEX=)(1[0-5]|[0-9])(\b.*)$')
-    change_t  = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+')
+    change_t  = re.compile(r'^;\s*Change Tool\s*(\d+)\s*->\s*Tool\s*(\d+)')
     ace_targets = _normalize_ace_targets(ace_targets)
     tool_targets = _normalize_tool_targets(tool_targets)
     route_plan_targets = _normalize_route_plan_targets(route_plan)
@@ -1938,6 +2036,9 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
 
     pending_head = None
     pending_blanks: list[str] = []
+    consumed_initial_tools = set()
+    pending_route_tool = None
+    current_route_tool = None
 
     total = os.path.getsize(in_path) or 1
     seen = 0
@@ -2019,21 +2120,37 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 
-            if not in_body and change_t.match(stripped):
-                in_body = True
+            m_change = change_t.match(stripped)
+            if m_change:
+                if not in_body:
+                    in_body = True
+                from_tool = int(m_change.group(1))
+                to_tool = int(m_change.group(2))
+                if (route_strict and from_tool not in consumed_initial_tools
+                        and _route_has_event_for_tool(route_cursor, from_tool)):
+                    _route_event_for_tool(route_cursor, from_tool)
+                    consumed_initial_tools.add(from_tool)
+                if from_tool == to_tool:
+                    current_route_tool = from_tool
+                else:
+                    pending_route_tool = to_tool
 
             if not in_body:
                 if pending_head is not None:
                     flush_pending_unmatched(fout)
                 m = bare_hi.match(stripped)
                 if m:
-                    if route_strict and _route_event_for_tool(
-                            route_cursor, int(m.group(1))) is None:
-                        raise ValueError(
-                            'route plan missing initial tool_select event for T%d'
-                            % int(m.group(1)))
+                    tool = int(m.group(1))
+                    if (route_strict and tool not in consumed_initial_tools
+                            and not _route_has_event_for_tool(
+                                route_cursor, tool)):
+                        raise _missing_route_event_error(
+                            'initial tool_select event', tool, route_cursor)
+                    if route_strict and tool not in consumed_initial_tools:
+                        _route_event_for_tool(route_cursor, tool)
+                        consumed_initial_tools.add(tool)
                     target = _target_for_tool(
-                        int(m.group(1)), ace_targets, tool_targets,
+                        tool, ace_targets, tool_targets,
                         strict=route_strict)
                     head = target['head']
                     fout.write('T%d\n' % head)
@@ -2073,10 +2190,25 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
 
             m = bare_hi.match(stripped)
             if m:
-                emit_route_commands(
-                    fout,
-                    _commands_for_tool_event(
-                        int(m.group(1)), route_cursor, ace_targets, tool_targets))
+                if pending_route_tool is not None:
+                    tool = pending_route_tool
+                    pending_route_tool = None
+                    current_route_tool = tool
+                    emit_route_commands(
+                        fout,
+                        _commands_for_tool_event(
+                            tool, route_cursor, ace_targets, tool_targets))
+                elif route_strict and current_route_tool is not None:
+                    target = _target_for_tool(
+                        current_route_tool, ace_targets, tool_targets,
+                        strict=True)
+                    fout.write('T%d\n' % target['head'])
+                else:
+                    tool = int(m.group(1))
+                    emit_route_commands(
+                        fout,
+                        _commands_for_tool_event(
+                            tool, route_cursor, ace_targets, tool_targets))
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 

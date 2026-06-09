@@ -1,6 +1,6 @@
 # Colorful-U1 Source Graph 架构方案
 
-日期：2026-06-07
+日期：2026-06-08
 
 目标：推翻当前 `head_mode = native / ace` 的二选一模型，建立一套能长期扩展的
 耗材来源图架构。新架构需要支持：
@@ -12,14 +12,45 @@
 - 后续基于空闲头提前换料，实现接近原生 U1 换头效率的调度策略。
 
 本文是架构设计和阶段状态文档。当前分支后端已经进入 source graph +
-route plan 收口阶段；前端 UI 还没有按新架构重构。通用 source transition
-已进入正式 preflight/rewrite 的 dry-run 闭环，尚未在新 source graph 路径下
-完整实机验证。
+route plan 收口阶段；前端 UI 已开始按新架构重写，但仍处于 dry-run
+校验和交互收口阶段。通用 source transition 已进入正式 preflight/rewrite
+的 dry-run 闭环，尚未在新 source graph 路径下完整实机验证。
 
 前端重构和后端 API 边界见：
-`multiace/docs/backend_source_graph_api_contract.md`。
+- `multiace/docs/backend_source_graph_api_contract.md`
+- `multiace/docs/frontend_ui_rewrite_plan.md`
 
-## 当前实现状态：2026-06-07
+## 当前实现状态：2026-06-08
+
+当前 dry-run 基线：
+
+- Docker dry-run 回归通过，覆盖 native-only、single ACE head、mixed
+  native/ACE、route-plan-only rewrite、source transition、stale/ghost
+  head、非法 G-code blocker、route plan tamper 校验等核心路径。
+- route plan v2 已成为 Web 打印发送唯一计划来源。上传后必须 preview/remap，
+  打印前必须 validate，发送阶段不再接受 `tool_targets` 覆盖。
+- 真实 Snapmaker Orca U1 切片
+  `摆摊提示牌001_PLA_1h21m.gcode` 已在 dry-run 中完成：
+  upload/preview -> manual remap -> validate -> route-plan/print。
+  该文件 route events 为 `[0, 3, 2, 1, 2, 3]`，最终 job `done 100%`，
+  `error=None`。
+- 本次真实切片暴露并修复了 post-processor 的 no-op toolchange 问题：
+  `; Change Tool0 -> Tool0 (layer -1)` 后跟裸 `T0` 时，不应消费新的
+  `tool_select` event。现在 `Change ToolX -> ToolX` 视为 no-op，只维持
+  当前 route tool，不推进 route cursor。
+- post-processor 已覆盖以下 Snapmaker Orca 常见形态：
+  - 初始裸 `Tn`；
+  - `; Change Tool X -> Tool Y` 后裸物理 `Tn` 与 slicer target 不一致；
+  - 同一换色段重复物理 `Tn`；
+  - `Change ToolX -> ToolX` no-op 标记；
+  - body 中按 route plan 顺序严格消费 `tool_select` events。
+- 当前 dry-run 还暴露出自动 resolver 的限制：真实切片颜色与 dry-run 默认
+  loadout 差异较大时，只能部分自动映射。此时 `route_plan=null` 是预期行为，
+  用户必须在 UI 中手动 remap；remap 后 route plan 可正常生成和发送。
+- 控制台 Source 卡片现在显示 source runtime 状态，不再只显示筛选列表。上传
+  打印页会显示完整 configured sources；不可用 source 可见但不可选。
+
+已完成并通过 Docker dry-run 回归：
 
 已完成并通过 Docker dry-run 回归：
 

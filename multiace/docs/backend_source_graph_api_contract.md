@@ -5,6 +5,9 @@
 本文记录后端 source graph 收口后的前端/API 使用边界。前端重构必须以这里的
 接口为准，避免重新接回旧 `head_mode` / `ace_targets` 路径。
 
+前端重构总体方案见：
+`multiace/docs/frontend_ui_rewrite_plan.md`。
+
 ## 核心原则
 
 - source graph 是配置事实来源。
@@ -131,6 +134,30 @@
 
 - `POST /api/upload-and-print` 返回 410。
 - `mode=optimize` / `mode=layer` 打印发送返回 400。
+
+### `POST /api/route-plan/remap` 前端约束
+
+`remap` 是预览阶段唯一允许人工改 tool/source 映射的入口。
+
+前端必须遵守：
+
+- 只在用户点击“应用映射”时调用。
+- 请求体必须包含本次 G-code 使用的所有 slicer tools 的完整 `tool_targets`。
+- 不要在用户每点一个 source 时自动调用，否则半完成映射会被后端按
+  `manual mapping missing T...` 拒绝。
+- remap 成功后必须重新执行
+  `GET /api/preflight/route-plan/validate?token=...`。
+- remap 成功前不得解锁发送打印。
+- 用户修改本地映射后，旧 validate 结果应视为失效。
+
+推荐 UI 状态：
+
+```text
+preview 后未映射完整: 需要手动映射 T...
+用户选齐但未 remap: 待应用
+remap + validate ok: ok
+validate failed: blocked
+```
 
 ## 手动 G-code / 插件边界
 

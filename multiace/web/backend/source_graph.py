@@ -437,16 +437,35 @@ def runtime_sources(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, 
         source_id = f"native:{head}"
         if source_id not in sources:
             continue
+        detected = bool(th.get("filament_detected"))
+        at_extruder = bool(th.get("filament_at_extruder"))
+        channel_error = th.get("channel_error")
+        channel_state = str(th.get("channel_state") or "")
+        channel_ok = channel_error in (None, "", "ok")
+        state_ok = channel_state in ("load_finish", "preload_finish")
+        ready = bool(detected and at_extruder and channel_ok and state_ok)
+        reasons = []
+        if not detected:
+            reasons.append("未检测到耗材")
+        if not at_extruder:
+            reasons.append("耗材未到达挤出机")
+        if not channel_ok:
+            reasons.append("进料通道错误: %s" % channel_error)
+        if not state_ok:
+            reasons.append("通道状态: %s" % (channel_state or "unknown"))
         sources[source_id].update({
             "material": th.get("material") or sources[source_id].get("material", ""),
             "brand": th.get("brand") or sources[source_id].get("brand", ""),
             "subtype": th.get("sku") or sources[source_id].get("subtype", ""),
             "color": th.get("color") or sources[source_id].get("color", ""),
-            "ready": bool(th.get("filament_detected")
-                          and th.get("filament_at_extruder")
-                          and th.get("channel_error") in (None, "", "ok")
-                          and str(th.get("channel_state") or "") in (
-                              "load_finish", "preload_finish")),
+            "ready": ready,
+            "ready_reason": "ready" if ready else "; ".join(reasons),
+            "status_details": {
+                "filament_detected": detected,
+                "filament_at_extruder": at_extruder,
+                "channel_error": channel_error or "",
+                "channel_state": channel_state,
+            },
         })
 
     for ace in parsed.get("aces", []) or []:
@@ -462,20 +481,25 @@ def runtime_sources(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, 
             source_id = f"ace:{ace_idx}:{slot_idx}"
             if source_id not in sources:
                 continue
-            empty = slot.get("state") == "empty"
+            state = slot.get("state") or ""
+            empty = state == "empty"
             sources[source_id].update({
                 "material": slot.get("material") or sources[source_id].get("material", ""),
                 "brand": slot.get("brand") or sources[source_id].get("brand", ""),
                 "subtype": slot.get("sku") or sources[source_id].get("subtype", ""),
                 "color": slot.get("color") or sources[source_id].get("color", ""),
                 "ready": not empty,
-                "state": slot.get("state") or "",
+                "ready_reason": "ready" if not empty else "slot empty",
+                "state": state,
+                "status_details": {
+                    "slot_state": state,
+                },
             })
     return sources
 
 
 def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
-                 color_name_fn=None) -> list[dict[str, Any]]:
+                 color_name_fn=None, include_unready: bool = False) -> list[dict[str, Any]]:
     sources = runtime_sources(graph, parsed)
     out: list[dict[str, Any]] = []
     for edge in graph.get("edges") or []:
@@ -487,7 +511,7 @@ def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
         head = (graph.get("heads") or {}).get(head_id)
         if not source or not head or not head.get("enabled", True):
             continue
-        if source.get("ready") is False:
+        if source.get("ready") is False and not include_unready:
             continue
         try:
             head_idx = int(head.get("index"))
@@ -511,6 +535,9 @@ def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
             "color": color,
             "name": color_name_fn(color) if (color_name_fn and color) else "",
             "ready": bool(source.get("ready")),
+            "ready_reason": source.get("ready_reason") or (
+                "ready" if source.get("ready") else "not ready"),
+            "status_details": deepcopy(source.get("status_details") or {}),
             "state": source.get("state") or "",
             "execution_profile": source.get("execution_profile") or "",
         }

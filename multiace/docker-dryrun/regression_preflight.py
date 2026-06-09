@@ -580,6 +580,23 @@ def test_mixed_native_ace_print() -> None:
     )
     assert_source_map_shape(report)
     assert_route_plan_shape(report)
+    configured_keys = {
+        item.get("key") for item in report.get("configured_loadout") or []
+    }
+    assert_true({
+        "native:0->head:0",
+        "native:1->head:1",
+        "native:2->head:2",
+        "native:3->head:3",
+        "ace:0:0->head:0",
+        "ace:0:1->head:0",
+        "ace:0:2->head:0",
+        "ace:0:3->head:0",
+    }.issubset(configured_keys),
+        f"configured_loadout should expose all configured source edges: {configured_keys}")
+    live_keys = {item.get("key") for item in report.get("live_loadout") or []}
+    assert_true("native:0->head:0" not in live_keys,
+                f"live_loadout should still hide unready sources: {live_keys}")
     assert_true(len(entries_by_tool(report)) == 2, "mixed case should map two tools")
     t0 = target_for(report, 0)
     t1 = target_for(report, 1)
@@ -760,6 +777,158 @@ def test_route_plan_preview_and_print_api() -> None:
                 "route-plan print API upload missing ACE swap")
 
 
+def test_route_plan_infers_initial_tool_from_change_comment() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_plan_initial_from_comment.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="route-plan/preview",
+    )
+    assert_route_plan_shape(report)
+    events = (report.get("route_plan") or {}).get("events") or []
+    assert_true([e.get("slicer_tool") for e in events] == [0, 1],
+                f"route plan should infer initial T0 from change comment: {events}")
+    validation = request(
+        "GET",
+        f"{WEB}/preflight/route-plan/validate?token={report['token']}",
+    )
+    assert_true(validation.get("ok"),
+                f"inferred initial tool route plan should validate: {validation}")
+
+
+def test_route_plan_rewrite_allows_repeated_initial_tool_in_preamble() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_plan_repeated_initial_preamble.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            M104 S210 T0
+            T0
+            ; Change Tool 0 -> Tool 1
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="route-plan/preview",
+    )
+    assert_route_plan_shape(report)
+    events = (report.get("route_plan") or {}).get("events") or []
+    assert_true([e.get("slicer_tool") for e in events] == [0, 1],
+                f"physical bare T should not add fake route events: {events}")
+    started = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    })
+    status = wait_job(started["job_id"])
+    assert_true(not status.get("error"),
+                f"repeated initial T0 should not fail rewrite: {status}")
+
+
+def test_route_plan_rewrite_uses_change_comment_target_not_bare_physical_t() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_plan_change_comment_physical_t.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T0
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="route-plan/preview",
+    )
+    assert_route_plan_shape(report)
+    started = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    })
+    status = wait_job(started["job_id"])
+    assert_true(not status.get("error"),
+                f"physical T0 after Change Tool target should not fail rewrite: {status}")
+    content = uploaded_content(status["filename"])
+    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+                f"Change Tool target T1 should drive ACE swap despite bare T0: {content}")
+
+
+def test_route_plan_rewrite_ignores_repeated_physical_t_after_change() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_plan_repeated_physical_t_after_change.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool 0 -> Tool 1
+            T0
+            G92 E0
+            T0
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="route-plan/preview",
+    )
+    assert_route_plan_shape(report)
+    events = (report.get("route_plan") or {}).get("events") or []
+    assert_true([e.get("slicer_tool") for e in events] == [0, 1],
+                f"repeated physical T0 should not create extra route events: {events}")
+    started = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    })
+    status = wait_job(started["job_id"])
+    assert_true(not status.get("error"),
+                f"repeated physical T0 after Change Tool should not fail rewrite: {status}")
+    content = uploaded_content(status["filename"])
+    assert_true(content.count("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1") == 1,
+                f"repeated physical T0 should not consume extra route events: {content}")
+
+
+def test_route_plan_rewrite_ignores_noop_change_tool_marker() -> None:
+    reset_default()
+    report = multipart_upload(
+        "route_plan_noop_change_tool_marker.gcode",
+        gcode(
+            "PLA;PETG",
+            "#dc2828;#1e78dc",
+            """
+            T0
+            ; Change Tool0 -> Tool0 (layer -1)
+            T0
+            G92 E0
+            ; Change Tool0 -> Tool1 (layer 3)
+            T1
+            G1 X10 Y10 E1
+            """,
+        ),
+        endpoint="route-plan/preview",
+    )
+    assert_route_plan_shape(report)
+    events = (report.get("route_plan") or {}).get("events") or []
+    assert_true([e.get("slicer_tool") for e in events] == [0, 1],
+                f"no-op Change Tool marker should not add route event: {events}")
+    started = post_json(f"{WEB}/route-plan/print", {
+        "token": report["token"],
+    })
+    status = wait_job(started["job_id"])
+    assert_true(not status.get("error"),
+                f"no-op Change Tool marker should not fail rewrite: {status}")
+    content = uploaded_content(status["filename"])
+    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+                f"real Change Tool target T1 should still emit ACE swap: {content}")
+
+
 def test_preflight_print_rejects_tool_targets_override() -> None:
     reset_default()
     report = multipart_upload(
@@ -888,6 +1057,8 @@ def test_unmapped_tool_is_not_feasible() -> None:
     )
     assert_true(report.get("resolve_errors"),
                 f"unmapped tool should report resolver errors: {report}")
+    assert_true(not report.get("route_plan"),
+                f"unmapped preview must not emit invalid route_plan: {report.get('route_plan')}")
     plan = (report.get("plans") or {}).get("slicer") or {}
     assert_true(not plan.get("feasible"), f"unmapped plan should be infeasible: {plan}")
 
@@ -1242,6 +1413,20 @@ def _content_contains_in_order(content: str, needles: list[str]) -> bool:
     return True
 
 
+def _content_has_order_before(content: str, needles: list[str],
+                              anchor: str) -> bool:
+    end = content.rfind(anchor)
+    if end < 0:
+        return False
+    pos = -1
+    for needle in needles:
+        found = content.find(needle, pos + 1, end)
+        if found < 0:
+            return False
+        pos = found
+    return True
+
+
 def test_route_plan_rewrite_native_to_ace_transition() -> None:
     scenario = {
         "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
@@ -1506,9 +1691,12 @@ def test_route_plan_rewrite_repeated_tool_sequence() -> None:
         "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
         "ACE_UNLOAD_HEAD HEAD=0",
         "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
-        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
-        "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1",
     ]), f"rewritten upload missing repeated transition order: {content}")
+    assert_true(_content_has_order_before(content, [
+        "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
+        "T0",
+    ], "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1"),
+        f"rewritten upload missing final native unload/select/load order: {content}")
 
 
 def test_stale_head_source_cleared_on_print_start() -> None:
@@ -1624,14 +1812,16 @@ def test_route_plan_rejects_graph_hash_change() -> None:
     report = multipart_upload(
         "route_hash_change.gcode",
         gcode(
-            "PETG",
-            "#1e78dc",
+            "PLA",
+            "#dc2828",
             """
-            T1
+            T0
             G1 X10 Y10 E1
             """,
         ),
     )
+    assert_true(report.get("route_plan"),
+                f"hash-change setup should produce a valid route plan: {report}")
     graph = source_graph_for({
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
         "ace_targets": {"0": 0},
@@ -1804,6 +1994,8 @@ def test_route_plan_only_rewrite_rejects_missing_event() -> None:
     except ValueError as exc:
         assert_true("route plan missing tool_select" in str(exc),
                     f"unexpected missing-event error: {exc}")
+        assert_true("cursor index" in str(exc),
+                    f"missing-event error should include cursor context: {exc}")
     else:
         raise AssertionError("route-plan rewrite should reject missing T1 event")
 
@@ -1885,6 +2077,8 @@ def test_route_plan_streaming_rewrite_rejects_missing_event() -> None:
         except ValueError as exc:
             assert_true("route plan missing tool_select" in str(exc),
                         f"unexpected streaming missing-event error: {exc}")
+            assert_true("cursor index" in str(exc),
+                        f"streaming missing-event error should include cursor context: {exc}")
         else:
             raise AssertionError(
                 "route-plan streaming rewrite should reject missing T1 event")
@@ -2000,15 +2194,17 @@ def test_route_plan_validate_rejects_tampered_resources() -> None:
     report = multipart_upload(
         "tampered_resources.gcode",
         gcode(
-            "PETG",
-            "#1e78dc",
+            "PLA",
+            "#dc2828",
             """
-            T1
+            T0
             G1 X10 Y10 E1
             """,
         ),
     )
     route_plan = report.get("route_plan") or {}
+    assert_true(route_plan,
+                f"tampered resources setup should produce a valid route plan: {report}")
     tampered = json.loads(json.dumps(route_plan))
     resources = tampered.get("resources") or {}
     resources["heads"] = ["head:3"]
@@ -2028,15 +2224,17 @@ def test_route_plan_validate_rejects_tampered_execution() -> None:
     report = multipart_upload(
         "tampered_execution.gcode",
         gcode(
-            "PETG",
-            "#1e78dc",
+            "PLA",
+            "#dc2828",
             """
-            T1
+            T0
             G1 X10 Y10 E1
             """,
         ),
     )
     route_plan = report.get("route_plan") or {}
+    assert_true(route_plan,
+                f"tampered execution setup should produce a valid route plan: {report}")
     tampered = json.loads(json.dumps(route_plan))
     execution = tampered.get("execution") or {}
     phases = execution.get("phases") or []
@@ -2060,6 +2258,11 @@ def main() -> int:
         test_native_only_print,
         test_single_ace_head_print,
         test_route_plan_preview_and_print_api,
+        test_route_plan_infers_initial_tool_from_change_comment,
+        test_route_plan_rewrite_allows_repeated_initial_tool_in_preamble,
+        test_route_plan_rewrite_uses_change_comment_target_not_bare_physical_t,
+        test_route_plan_rewrite_ignores_repeated_physical_t_after_change,
+        test_route_plan_rewrite_ignores_noop_change_tool_marker,
         test_preflight_print_rejects_tool_targets_override,
         test_preflight_print_rejects_legacy_modes,
         test_print_rejects_missing_route_plan_file,

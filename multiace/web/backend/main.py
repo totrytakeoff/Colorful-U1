@@ -897,13 +897,13 @@ _PREFLIGHT_MAX_SIZE = int(os.environ.get(
     "MULTIACE_PREFLIGHT_MAX_MB", "200")) * 1024 * 1024
 
 _pp_module = None
+_pp_module_src: str | None = None
+_pp_module_mtime: float | None = None
 
 def _load_post_processor():
     """Lazy-load the post-processor as a Python module so its parsing
     and remap helpers can be reused server-side without a subprocess."""
-    global _pp_module
-    if _pp_module is not None:
-        return _pp_module
+    global _pp_module, _pp_module_src, _pp_module_mtime
     candidates = [
         Path("/home/lava/printer_data/config/tools/post_process_virtual_toolheads.py"),
         Path(__file__).resolve().parent.parent.parent / "tools" / "post_process_virtual_toolheads.py",
@@ -912,6 +912,15 @@ def _load_post_processor():
     if src is None:
         raise HTTPException(status_code=503,
                             detail="post-processor script not installed")
+    try:
+        src_mtime = src.stat().st_mtime
+    except OSError:
+        src_mtime = None
+    src_key = str(src)
+    if (_pp_module is not None
+            and _pp_module_src == src_key
+            and _pp_module_mtime == src_mtime):
+        return _pp_module
     import importlib.util
     spec = importlib.util.spec_from_file_location("multiace_postprocess", src)
     mod = importlib.util.module_from_spec(spec)
@@ -921,6 +930,8 @@ def _load_post_processor():
         raise HTTPException(status_code=503,
                             detail=f"post-processor failed to load: {exc}")
     _pp_module = mod
+    _pp_module_src = src_key
+    _pp_module_mtime = src_mtime
     return mod
 
 def _cleanup_preflight_dir() -> None:
@@ -982,6 +993,17 @@ def _live_loadout_from_parsed(parsed: dict, pp=None) -> list[dict]:
         )
     color_name_fn = pp.approx_color_name if pp else None
     return sg.live_loadout(graph, parsed, color_name_fn=color_name_fn)
+
+def _configured_loadout_from_parsed(parsed: dict, pp=None) -> list[dict]:
+    graph, meta = _load_source_graph(parsed)
+    if meta.get("errors"):
+        raise HTTPException(
+            status_code=409,
+            detail="source graph invalid: " + "; ".join(meta.get("errors") or []),
+        )
+    color_name_fn = pp.approx_color_name if pp else None
+    return sg.live_loadout(
+        graph, parsed, color_name_fn=color_name_fn, include_unready=True)
 
 def _slot_to_dict(s: dict | None) -> dict | None:
     if s is None:
@@ -1798,7 +1820,7 @@ def _build_route_plan(
     for head_id, state in ((initial_state or {}).get("heads") or {}).items():
         if isinstance(state, dict):
             head_current[str(head_id)] = state.get("current_source")
-    event_stream = list(events or [])
+    event_stream = _complete_route_tool_events(events, used_tools)
     for idx, raw_t in enumerate(event_stream):
         try:
             t = int(raw_t)
@@ -2879,12 +2901,31 @@ def _route_tool_events(gcode: str, used_tools: set[int] | None = None) -> list[i
     """
     events: list[int] = []
     used = set(int(t) for t in (used_tools or set()))
+    saw_change = False
     for raw in gcode.splitlines():
         line = raw.strip()
-        if not line or line.startswith(";"):
+        if not line:
+            continue
+        change = _TOOLCHANGE_RE.match(line)
+        if change:
+            saw_change = True
+            try:
+                tools = (int(change.group(1)), int(change.group(2)))
+            except (TypeError, ValueError):
+                tools = ()
+            for tool in tools:
+                if used and tool not in used:
+                    continue
+                if events and events[-1] == tool:
+                    continue
+                events.append(tool)
+            continue
+        if line.startswith(";"):
             continue
         m = _BARE_TOOL_RE.match(line)
         if not m:
+            continue
+        if saw_change:
             continue
         try:
             tool = int(m.group(1))
@@ -2896,6 +2937,24 @@ def _route_tool_events(gcode: str, used_tools: set[int] | None = None) -> list[i
             continue
         events.append(tool)
     return events
+
+def _complete_route_tool_events(events: list[int] | tuple[int, ...] | None,
+                                used_tools: set[int]) -> list[int]:
+    """Normalize route events without inventing order for partial streams."""
+    out: list[int] = []
+    for raw in events or []:
+        try:
+            tool = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if used_tools and tool not in used_tools:
+            continue
+        if out and out[-1] == tool:
+            continue
+        out.append(tool)
+    if not out:
+        out = [int(t) for t in sorted(used_tools)]
+    return out
 
 async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
     raw_name = file.filename or ""
@@ -2938,6 +2997,7 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
     tail_lines: deque[str] = deque(maxlen=2000)
     plan_lines: list[str] = []
     used: set[int] = set()
+    bare_used: set[int] = set()
     with open(src_path, "r", encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f):
             if i < 300:
@@ -2948,13 +3008,16 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
             if m:
                 used.add(int(m.group(1)))
                 used.add(int(m.group(2)))
+            bm = _BARE_TOOL_RE.match(line.strip())
+            if bm:
+                bare_used.add(int(bm.group(1)))
             if plan_keep_re.match(line):
                 plan_lines.append(line.rstrip('\n'))
     meta_buf = "".join(head_lines) + "".join(tail_lines)
     plan_proxy = "\n".join(plan_lines)
     del head_lines, tail_lines, plan_lines
-    if not used:
-        used = _used_tool_indices(pp, plan_proxy)
+    used.update(bare_used)
+    used.update(_used_tool_indices(pp, plan_proxy))
 
     slicer_colors = pp.parse_color_names(meta_buf)
     slicer_types  = pp.parse_filament_types(meta_buf)
@@ -2989,6 +3052,7 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         route_events = swap_events
     if not route_events:
         route_events = sorted(used_tools)
+    route_events = _complete_route_tool_events(route_events, used_tools)
     if not swap_events:
         swap_events = route_events
     source_map = _build_preflight_source_map(
@@ -3002,22 +3066,25 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         events=swap_events,
     )
     graph, graph_meta = _load_source_graph(parsed)
-    route_plan = _build_route_plan(
-        token=token,
-        filename=safe_name,
-        graph_meta=graph_meta,
-        tool_targets=tool_targets,
-        used_tools=used_tools,
-        events=route_events,
-        profiles=(graph.get("profiles") or {}),
-        initial_state=sg.source_state(graph, parsed),
-        graph=graph,
-        stats=source_map.get("swap_stats") or {},
-        created_at=source_map.get("created_at"),
-    )
+    route_plan = None
+    if not resolver.get("errors"):
+        route_plan = _build_route_plan(
+            token=token,
+            filename=safe_name,
+            graph_meta=graph_meta,
+            tool_targets=tool_targets,
+            used_tools=used_tools,
+            events=route_events,
+            profiles=(graph.get("profiles") or {}),
+            initial_state=sg.source_state(graph, parsed),
+            graph=graph,
+            stats=source_map.get("swap_stats") or {},
+            created_at=source_map.get("created_at"),
+        )
     _save_preflight_events(token, route_events)
     _save_preflight_source_map(source_map)
-    _save_preflight_route_plan(route_plan)
+    if route_plan:
+        _save_preflight_route_plan(route_plan)
     (_PREFLIGHT_DIR / (token + ".used")).write_text(
         json.dumps(sorted(used_tools)),
         encoding="utf-8")
@@ -3046,6 +3113,14 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         ],
         "live_loadout": sorted(
             _live_loadout_from_parsed(parsed, pp),
+            key=lambda x: (
+                0 if x.get("kind") == "native" else 1,
+                x.get("head", 99),
+                x.get("ace", 99),
+                x.get("slot", 99),
+            )),
+        "configured_loadout": sorted(
+            _configured_loadout_from_parsed(parsed, pp),
             key=lambda x: (
                 0 if x.get("kind") == "native" else 1,
                 x.get("head", 99),
