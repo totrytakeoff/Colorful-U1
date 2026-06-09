@@ -1,6 +1,6 @@
 # Colorful-U1 Source Graph 架构方案
 
-日期：2026-06-08
+日期：2026-06-09
 
 目标：推翻当前 `head_mode = native / ace` 的二选一模型，建立一套能长期扩展的
 耗材来源图架构。新架构需要支持：
@@ -12,15 +12,15 @@
 - 后续基于空闲头提前换料，实现接近原生 U1 换头效率的调度策略。
 
 本文是架构设计和阶段状态文档。当前分支后端已经进入 source graph +
-route plan 收口阶段；前端 UI 已开始按新架构重写，但仍处于 dry-run
-校验和交互收口阶段。通用 source transition 已进入正式 preflight/rewrite
-的 dry-run 闭环，尚未在新 source graph 路径下完整实机验证。
+route plan 收口阶段；前端 UI 已开始按新架构重写，并已完成第一轮实机部署。
+通用 source transition 已进入正式 preflight/rewrite 的 dry-run 闭环；
+per-source 预进料长度配置已落到 source graph，并已推送实机重启验证。
 
 前端重构和后端 API 边界见：
 - `multiace/docs/backend_source_graph_api_contract.md`
 - `multiace/docs/frontend_ui_rewrite_plan.md`
 
-## 当前实现状态：2026-06-08
+## 当前实现状态：2026-06-09
 
 当前 dry-run 基线：
 
@@ -49,20 +49,40 @@ route plan 收口阶段；前端 UI 已开始按新架构重写，但仍处于 d
   用户必须在 UI 中手动 remap；remap 后 route plan 可正常生成和发送。
 - 控制台 Source 卡片现在显示 source runtime 状态，不再只显示筛选列表。上传
   打印页会显示完整 configured sources；不可用 source 可见但不可选。
+- 2026-06-09 已将当前 web + Klipper source-graph 逻辑推送到实机
+  `192.168.1.38`：
+  - 覆盖 `multiace_web` 的 backend/frontend 文件；
+  - 覆盖 Klipper extras `ace.py`、`filament_feed_ace.py`；
+  - 重启 `multiace-web`；
+  - 通过 Moonraker `/printer/restart` 重启 Klipper；
+  - Klipper 连续返回 `state=ready`；
+  - `/api/source-state` 返回 source graph `errors=[]`、`warnings=[]`。
 
 已完成并通过 Docker dry-run 回归：
 
 已完成并通过 Docker dry-run 回归：
 
 - `source_graph.json` 基础读写、normalize、hash 和 schema 校验。
+- source graph 每个 source 新增 `execution.preload_length_mm`：
+  - `native_feeder` 默认 `950`；
+  - `ace_slot` 默认 `0`，表示禁用 ACE 自动预进料；
+  - schema 校验范围为 `0..3000` mm。
 - 默认 graph 生成：
   - 4 个 `head:<n>`；
   - 4 个 `native:<n>`；
   - native source 自带 `module/channel`，目标 head 只决定 `EXTRUDER`；
   - ACE slot source 默认不猜测接线，必须通过 edge 显式配置。
 - `GET /api/source-graph`、`POST /api/source-graph`、`GET /api/source-state`。
+- `POST /api/source-graph` 保存后会发
+  `MULTIACE_REFRESH_SOURCE_GRAPH`，让 Klipper 重新读取
+  `source_graph.json`。该刷新只更新内存配置，不移动硬件、不执行进退料。
 - Klipper `ace.py` 读取 source graph，并用 enabled edge 校验
   `ACE_LOAD_HEAD` / `ACE_SWAP_HEAD` 的 `HEAD/ACE/SLOT` 组合。
+- Klipper ACE 自动预进料 `_pre_load()` 已优先读取
+  `ace:<ace>:<slot>.execution.preload_length_mm`。
+- Klipper native feeder 预进料已优先读取
+  `native:<slot>.execution.preload_length_mm`，source slot 的
+  `preload_finish` 仍只表示 source ready，不代表工具头 loaded。
 - Web preflight 已生成 route plan v2，并持久化 `.route_plan.json`。
 - route plan 现在包含 `source_graph_hash`、`initial_state`、`tool_map`、
   structured `events[].steps` 和镜像 `commands`。
@@ -146,8 +166,10 @@ route plan 收口阶段；前端 UI 已开始按新架构重写，但仍处于 d
 
 尚未完成：
 
-- 前端仍未按 source graph 重构，Dashboard 仍是旧 UI 逻辑为主。
-- 通用 source transition 只提供 preview，不执行硬件动作。
+- 前端已按 source graph 重构第一版 Dashboard/Config/Upload，但视觉和交互仍需
+  继续收口。
+- 通用 source transition 已进入 `/api/operation/*` 执行入口；常规硬件动作不再走
+  前端本地队列。
 - 正式打印 rewrite 已能消费 route plan v2 中同一 head 多 source 的
   unload/load/swap transition，并已通过 dry-run；尚未在新 source graph 路径下
   完整实机验证。
@@ -158,7 +180,7 @@ route plan 收口阶段；前端 UI 已开始按新架构重写，但仍处于 d
   路由依据。Klipper 底层仍有少量兼容 fallback 依赖这些字段，后续前端重构后应继续
   收口到 source graph/source state。
 - 任意 ACE slot -> 任意 head、native + ACE 同 head 混合打印在后端可表达并已
-  dry-run；还没有进入新 source graph 路径的完整实机测试。
+  dry-run；source graph 路径已部署实机，仍需进行带料的真实换料/打印回归。
 - 提前换料调度只做 analysis-only，尚未生成 preload event 或额外 G-code。
 
 ## 设计原则

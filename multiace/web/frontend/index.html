@@ -27,9 +27,7 @@
     <div class="top-status">
       <span class="status-dot" :class="connectionState"></span>
       <span>{{ connectionText }}</span>
-      <button class="queue-pill" @click="queueOpen = !queueOpen">
-        Queue {{ queuedCount }}
-      </button>
+      <span class="queue-pill" :class="{active: operationBusy}">{{ operationLabel }}</span>
       <button class="icon-btn" title="刷新" @click="refreshAll" :disabled="busy.refresh">R</button>
     </div>
   </header>
@@ -69,7 +67,7 @@
               <h2>Toolheads</h2>
               <p>点击工具头配置该头允许使用哪些耗材来源；换料动作只在详情里明确发起。</p>
             </div>
-            <button class="secondary danger" @click="confirmUnloadAll">Unload all</button>
+            <button class="secondary danger" @click="confirmUnloadAll" :disabled="operationBusy">Unload all</button>
           </div>
           <div class="toolhead-grid">
             <article v-for="head in headCards" :key="head.id" class="tool-card" :class="head.confidence">
@@ -90,7 +88,7 @@
               <div class="card-actions">
                 <button @click="openHeadPanel(head.id)">Sources</button>
                 <button @click="openHeadPanel(head.id)">Load</button>
-                <button @click="runHeadUnloadNow(head.id)" :disabled="head.confidence === 'empty'">Unload</button>
+                <button @click="runHeadUnloadNow(head.id)" :disabled="operationBusy || head.confidence === 'empty'">Unload</button>
                 <button class="danger ghost" v-if="['unknown','stale','failed','exhausted'].includes(head.confidence)" @click="openRecovery(head.id)">Recover</button>
               </div>
             </article>
@@ -129,7 +127,7 @@
               </dl>
               <div class="card-actions">
                 <button @click="openMaterialEditor(source.id)">Material</button>
-                <button @click="runSourceLoadNow(source.id)" :disabled="!source.heads.length">Load</button>
+                <button @click="runSourceLoadNow(source.id)" :disabled="operationBusy || !source.heads.length || source.ready === false">Load</button>
               </div>
             </article>
           </div>
@@ -204,8 +202,8 @@
                   <label>Min<input type="number" min="1" max="600" step="5" v-model.number="dryerCfg[ace.idx].duration"></label>
                 </div>
                 <div class="card-actions">
-                  <button @click="dryStart(ace.idx)">Start</button>
-                  <button class="danger ghost" @click="dryStop(ace.idx)">Stop</button>
+                  <button @click="dryStart(ace.idx)" :disabled="operationBusy">Start</button>
+                  <button class="danger ghost" @click="dryStop(ace.idx)" :disabled="operationBusy">Stop</button>
                 </div>
               </details>
             </article>
@@ -297,6 +295,54 @@
           </div>
 
           <div v-show="configTab === 'source'" class="config-grid">
+            <article class="settings-card source-execution-card">
+              <div class="card-title">
+                <h3>Native source preload</h3>
+                <span class="chip">per slot</span>
+              </div>
+              <p class="muted">每个 native slot 从进料口到四通/工具头入口的预进料长度，单位 mm。</p>
+              <div class="source-execution-grid">
+                <label v-for="source in graphSources.filter((item) => item.kind === 'native_feeder')"
+                       :key="'native-preload-' + source.id"
+                       class="source-execution-row">
+                  <span class="source-swatch" :style="swatchStyle(source.color)"></span>
+                  <span>
+                    <strong>{{ source.label }}</strong>
+                    <small>{{ source.id }} · {{ sourceRuntimeDetail(source) || 'source config' }}</small>
+                  </span>
+                  <input type="number" min="0" max="3000" step="1"
+                         :value="sourceExecutionValue(source.id, 'preload_length_mm')"
+                         @input="setSourceExecutionValue(source.id, 'preload_length_mm', $event.target.value)">
+                </label>
+              </div>
+            </article>
+
+            <article class="settings-card source-execution-card">
+              <div class="card-title">
+                <h3>ACE source preload</h3>
+                <span class="chip">per slot</span>
+              </div>
+              <p class="muted">每个 ACE slot 从 ACE 出口到四通/目标头入口的预进料长度，单位 mm；0 表示禁用自动预进料。</p>
+              <div class="source-execution-grid">
+                <label v-for="source in graphSources.filter((item) => item.kind === 'ace_slot')"
+                       :key="'ace-preload-' + source.id"
+                       class="source-execution-row">
+                  <span class="source-swatch" :style="swatchStyle(source.color)"></span>
+                  <span>
+                    <strong>{{ source.label }}</strong>
+                    <small>{{ source.id }} · {{ sourceRuntimeDetail(source) || 'source config' }}</small>
+                  </span>
+                  <input type="number" min="0" max="3000" step="1"
+                         :value="sourceExecutionValue(source.id, 'preload_length_mm')"
+                         @input="setSourceExecutionValue(source.id, 'preload_length_mm', $event.target.value)">
+                </label>
+              </div>
+              <div class="card-actions right">
+                <button @click="reloadSourceGraph">放弃 source 参数</button>
+                <button class="primary" @click="saveSourceGraph" :disabled="busy.saveGraph">保存 Source 执行参数</button>
+              </div>
+            </article>
+
             <article class="settings-card" v-for="i in configForm.ace_device_count" :key="'ace-cfg-' + i">
               <h3>ACE {{ displayIndex(i - 1) }} execution</h3>
               <div class="settings-grid">
@@ -507,21 +553,6 @@
     </section>
   </main>
 
-  <div v-if="queueOpen" class="queue-bar">
-    <div>
-      <strong>Command queue</strong>
-      <small>{{ runningQueueLabel }}</small>
-    </div>
-    <div class="queue-items">
-      <span v-if="!cmdQueue.length" class="empty">No queued commands</span>
-      <span v-for="item in cmdQueue" :key="item.id" :class="item.status">{{ item.label }}</span>
-    </div>
-    <button @click="cmdPaused = !cmdPaused">{{ cmdPaused ? 'Resume' : 'Pause' }}</button>
-    <button @click="cancelQueuedCommands" :disabled="!hasQueuedCommands">Cancel queued</button>
-    <button @click="clearDoneQueue" :disabled="!hasFinishedCommands">Clear done</button>
-    <button @click="queueOpen = false">Hide</button>
-  </div>
-
   <div v-if="screenPopout && screenAvailable" class="screen-popout">
     <div class="card-title">
       <h3>Display · {{ screenFps.toFixed(1) }} fps</h3>
@@ -600,7 +631,7 @@
       <section class="head-operations">
         <div class="card-title">
           <h3>换料操作</h3>
-          <span class="muted">选择 source 后点击装载会直接排入后台队列。</span>
+          <span class="muted">装载选择目标 source；退料始终退出当前已装载 source。</span>
         </div>
         <div class="operation-row">
           <select v-model="headPanel.targetSource">
@@ -609,9 +640,10 @@
               {{ source.label }} · {{ source.material || 'unknown' }}
             </option>
           </select>
-          <button class="primary" @click="runHeadLoadNow" :disabled="!headPanel.targetSource">装载</button>
-          <button @click="runHeadUnloadNow(headPanel.head)" :disabled="activeHeadCard.confidence === 'empty'">退料</button>
+          <button class="primary" @click="runHeadLoadNow" :disabled="operationBusy || !headPanel.targetSource">装载</button>
+          <button @click="runHeadUnloadNow(headPanel.head)" :disabled="operationBusy || activeHeadCard.confidence === 'empty'">退当前耗材</button>
         </div>
+        <p v-if="operationBusy" class="notice warn">硬件操作执行中：{{ operationLabel }}</p>
         <p v-if="headPanel.status" class="notice ok">{{ headPanel.status }}</p>
       </section>
     </div>
@@ -620,7 +652,7 @@
   <modal-panel v-if="recovery.open" title="恢复指引" @close="recovery.open = false">
     <p class="notice warn">{{ recovery.message }}</p>
     <div class="card-actions right">
-      <button @click="runHeadUnloadNow(recovery.head); recovery.open = false">执行退料</button>
+      <button @click="runHeadUnloadNow(recovery.head); recovery.open = false" :disabled="operationBusy">执行退料</button>
       <button @click="recovery.open = false">关闭</button>
     </div>
   </modal-panel>

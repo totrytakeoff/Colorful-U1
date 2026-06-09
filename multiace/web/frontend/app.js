@@ -53,6 +53,7 @@ createApp({
       print: false,
       saveGraph: false,
       config: false,
+      operation: false,
     });
     const globalError = ref("");
     const toast = ref(null);
@@ -145,6 +146,7 @@ createApp({
           reloadState(),
           reloadSourceGraph(),
           reloadSourceState(),
+          reloadOperation(),
           screenProbe(),
           reloadSnapshots(),
         ]);
@@ -211,27 +213,30 @@ createApp({
         const head = (state.toolheads || []).find((item) => Number(item.idx) === headIdx);
         if (!head) return {};
         const detected = !!head.filament_detected;
+        const inAcePath = !!head.filament_in_ace;
+        const inNativePath = detected && !inAcePath;
         const atExtruder = !!head.filament_at_extruder;
         const channelError = head.channel_error || "";
         const channelState = head.channel_state || "";
         const channelOk = !channelError || channelError === "ok";
-        const stateOk = channelState === "load_finish" || channelState === "preload_finish";
-        const ready = detected && atExtruder && channelOk && stateOk;
+        const sourceStateOk = channelState === "load_finish" || channelState === "preload_finish";
+        const ready = inNativePath && channelOk && sourceStateOk;
         const reasons = [];
-        if (!detected) reasons.push("未检测到耗材");
-        if (!atExtruder) reasons.push("耗材未到达挤出机");
+        if (!inNativePath) reasons.push("native slot empty");
         if (!channelOk) reasons.push(`进料通道错误: ${channelError}`);
-        if (!stateOk) reasons.push(`通道状态: ${channelState || "unknown"}`);
+        if (inNativePath && !sourceStateOk) reasons.push(`通道状态: ${channelState || "unknown"}`);
         return {
-          material: head.material || "",
-          brand: head.brand || "",
-          subtype: head.sku || head.subtype || "",
-          color: head.color || "",
+          material: inNativePath ? (head.material || "") : "",
+          brand: inNativePath ? (head.brand || "") : "",
+          subtype: inNativePath ? (head.sku || head.subtype || "") : "",
+          color: inNativePath ? (head.color || "") : "",
           ready,
           ready_reason: ready ? "ready" : reasons.join("; "),
           state: channelState,
           status_details: {
             filament_detected: detected,
+            filament_in_ace: inAcePath,
+            filament_in_native_path: inNativePath,
             filament_at_extruder: atExtruder,
             channel_error: channelError,
             channel_state: channelState,
@@ -359,6 +364,23 @@ createApp({
       const idx = edgeIndex(sourceId, headId);
       return idx >= 0 ? Number(sourceGraph.value.edges[idx].priority ?? 100) : 100;
     }
+    function sourceExecutionValue(sourceId, key) {
+      const source = (sourceGraph.value.sources || {})[sourceId] || {};
+      const execution = source.execution || {};
+      const value = execution[key];
+      return value == null ? "" : value;
+    }
+    function setSourceExecutionValue(sourceId, key, value) {
+      const source = (sourceGraph.value.sources || {})[sourceId];
+      if (!source) return;
+      if (!source.execution || typeof source.execution !== "object") source.execution = {};
+      if (value === "" || value == null) {
+        delete source.execution[key];
+      } else {
+        source.execution[key] = Number(value);
+      }
+      syncGraphJson();
+    }
     function setEdgeEnabled(sourceId, headId, enabled) {
       ensureEdge(sourceId, headId).enabled = !!enabled;
       syncGraphJson();
@@ -424,6 +446,7 @@ createApp({
         sourceGraphMeta.path = payload.meta?.path || "";
         sourceGraphMeta.errors = payload.meta?.errors || [];
         sourceGraphMeta.warnings = payload.meta?.warnings || [];
+        await reloadSourceGraph();
         await reloadSourceState();
         syncGraphJson();
         setToast("Source Graph 已保存，旧 route plan 已失效");
@@ -434,114 +457,87 @@ createApp({
       }
     }
 
-    const cmdQueue = ref([]);
-    const cmdPaused = ref(false);
-    const queueOpen = ref(false);
-    let queueRunning = false;
-    const queuedCount = computed(() => {
-      return cmdQueue.value.filter((item) => ["queued", "running", "error"].includes(item.status)).length;
+    const currentOperation = ref({ active: false });
+    const operationBusy = computed(() => {
+      const status = currentOperation.value?.status || "";
+      return busy.operation || currentOperation.value?.active || status === "queued" || status === "running";
     });
-    const runningQueueLabel = computed(() => {
-      const running = cmdQueue.value.find((item) => item.status === "running");
-      if (running) return `running ${running.label}`;
-      const queued = cmdQueue.value.filter((item) => item.status === "queued").length;
-      return queued ? `${queued} queued` : "idle";
+    const operationLabel = computed(() => {
+      const op = currentOperation.value || {};
+      if (!op.id || (!op.active && op.status !== "error")) return "idle";
+      const parts = [op.status || "unknown", op.kind || "operation"];
+      if (op.head) parts.push(op.head);
+      if (op.source) parts.push(op.source);
+      return parts.join(" · ");
     });
-    const hasQueuedCommands = computed(() => cmdQueue.value.some((item) => item.status === "queued"));
-    const hasFinishedCommands = computed(() => cmdQueue.value.some((item) => ["done", "error"].includes(item.status)));
-    function macroLabel(name, args) {
-      const parts = Object.entries(args || {}).map(([k, v]) => `${k}=${v}`).join(" ");
-      return `${name}${parts ? " " + parts : ""}`;
-    }
-    function queueMacro(name, args = {}, options = {}) {
-      const item = {
-        id: nowId(),
-        name,
-        args: clone(args || {}),
-        label: options.label || macroLabel(name, args),
-        status: "queued",
-        error: "",
-        jobId: "",
-      };
-      cmdQueue.value.push(item);
-      processQueue();
-      return item;
-    }
-    function confirmUnloadAll() {
-      if (!window.confirm("确认将所有工具头执行退料？该动作会移动送料系统。")) return;
-      queueMacro("ACE_UNLOAD_ALL_HEADS", {});
-    }
-    async function processQueue() {
-      if (queueRunning || cmdPaused.value) return;
-      const item = cmdQueue.value.find((entry) => entry.status === "queued");
-      if (!item) return;
-      queueRunning = true;
-      item.status = "running";
+    async function reloadOperation() {
       try {
-        const payload = await api("/macro-async", {
-          method: "POST",
-          body: { name: item.name, args: item.args },
-        });
-        item.jobId = payload.job_id || "";
-        if (item.jobId) {
-          await pollMacroJob(item);
-        }
-        item.status = "done";
-        await Promise.allSettled([reloadState(), reloadSourceState()]);
-      } catch (error) {
-        item.status = "error";
-        item.error = error.message || String(error);
-        globalError.value = item.error;
-        queueOpen.value = true;
-        setToast(item.error, "error");
-      } finally {
-        queueRunning = false;
-        if (!cmdPaused.value) setTimeout(processQueue, 400);
-      }
+        const payload = await api("/operation/current");
+        currentOperation.value = payload.operation || { active: false };
+      } catch (_) {}
     }
-    async function pollMacroJob(item) {
+    async function pollOperation(id) {
       const started = Date.now();
       while (Date.now() - started < 20 * 60 * 1000) {
         await new Promise((resolve) => setTimeout(resolve, 1200));
-        const job = await api(`/macro-jobs/${encodeURIComponent(item.jobId)}`);
-        if (job.done) {
-          if (job.error) throw new Error(job.error);
-          return;
+        await reloadOperation();
+        const op = currentOperation.value || {};
+        if (id && op.id && op.id !== id && op.active) {
+          throw new Error(`操作状态切换到 ${op.id}`);
+        }
+        if (!op.active && op.status) {
+          if (op.status === "error") throw new Error(op.error || "硬件操作失败");
+          return op;
         }
       }
-      throw new Error(`${item.label} timeout`);
+      throw new Error("硬件操作超时");
     }
-    watch(cmdPaused, (paused) => { if (!paused) processQueue(); });
-    function clearDoneQueue() {
-      cmdQueue.value = cmdQueue.value.filter((item) => !["done", "error"].includes(item.status));
-    }
-    function cancelQueuedCommands() {
-      cmdQueue.value = cmdQueue.value.filter((item) => item.status !== "queued");
-    }
-    function enqueueCommands(commands) {
-      let count = 0;
-      for (const command of commands || []) {
-        const [name, ...parts] = String(command).trim().split(/\s+/);
-        const args = {};
-        for (const part of parts) {
-          const [key, raw] = part.split("=", 2);
-          if (key && raw != null) args[key] = isNaN(Number(raw)) ? raw : Number(raw);
-        }
-        if (name) {
-          queueMacro(name, args, { label: command });
-          count += 1;
-        }
+    async function runOperation(path, body, label) {
+      if (operationBusy.value) {
+        globalError.value = `已有硬件操作正在执行：${operationLabel.value}`;
+        return null;
       }
-      return count;
+      busy.operation = true;
+      globalError.value = "";
+      try {
+        const payload = await api(path, { method: "POST", body });
+        const op = payload.operation || {};
+        currentOperation.value = op;
+        if (op.active || op.status === "queued" || op.status === "running") {
+          await pollOperation(op.id);
+        }
+        await Promise.allSettled([reloadState(), reloadSourceState(), reloadOperation()]);
+        setToast(`${label} 完成`);
+        return payload;
+      } catch (error) {
+        globalError.value = error.message || String(error);
+        setToast(globalError.value, "error");
+        await Promise.allSettled([reloadOperation(), reloadState(), reloadSourceState()]);
+        return null;
+      } finally {
+        busy.operation = false;
+      }
+    }
+    async function confirmUnloadAll() {
+      if (!window.confirm("确认将所有工具头执行退料？该动作会移动送料系统。")) return;
+      await runOperation("/operation/unload-all", { execute: true }, "全部退料");
     }
 
     const dryerCfg = reactive({});
-    function dryStart(aceIdx) {
+    async function dryStart(aceIdx) {
       const cfg = dryerCfg[aceIdx] || { temp: 50, duration: 240 };
-      queueMacro("ACE_DRY", { ACE: aceIdx, TEMP: cfg.temp, DURATION: cfg.duration });
+      await runOperation("/operation/ace/dry-start", {
+        ace: aceIdx,
+        temp: cfg.temp,
+        duration: cfg.duration,
+        execute: true,
+      }, `ACE ${displayIndex(aceIdx)} 烘干启动`);
     }
-    function dryStop(aceIdx) {
-      queueMacro("ACE_STOP_DRYING", { ACE: aceIdx });
+    async function dryStop(aceIdx) {
+      await runOperation("/operation/ace/dry-stop", {
+        ace: aceIdx,
+        execute: true,
+      }, `ACE ${displayIndex(aceIdx)} 烘干停止`);
     }
 
     const headPanel = reactive({
@@ -571,113 +567,54 @@ createApp({
       headPanel.plan = null;
       headPanel.status = "";
     }
-    function commandsFromPlan(plan) {
-      if (!plan || plan.error) {
-        throw new Error(plan?.error || "后端没有返回可执行动作");
-      }
-      const commands = plan.commands || plan.event?.commands || [];
-      if (!commands.length) {
-        const action = plan.event?.action || plan.target?.kind || "action";
-        if (action === "select_loaded") return [];
-        throw new Error("后端校验通过，但没有生成硬件动作");
-      }
-      return commands;
-    }
     async function runHeadLoadNow() {
       if (!headPanel.head || !headPanel.targetSource) return;
-      globalError.value = "";
-      headPanel.status = "校验并排入后台队列...";
-      try {
-        const plan = await api("/source-transition/preview", {
-          method: "POST",
-          body: { head: headPanel.head, source: headPanel.targetSource },
-        });
-        const count = enqueueCommands(commandsFromPlan(plan));
-        headPanel.status = count ? `已排入 ${count} 个动作` : "目标耗材已在该工具头，无需动作";
-        setToast(`${headLabelById(headPanel.head)} 装载 ${headPanel.targetSource} 已排入后台队列`);
-      } catch (error) {
-        headPanel.status = "";
-        globalError.value = error.message || String(error);
-        queueOpen.value = true;
-      }
+      headPanel.status = "执行装载...";
+      const source = graphSources.value.find((item) => item.id === headPanel.targetSource);
+      const payload = await runOperation("/operation/head/load", {
+        head: headPanel.head,
+        source: headPanel.targetSource,
+        execute: true,
+      }, `${headLabelById(headPanel.head)} 装载 ${source?.label || headPanel.targetSource}`);
+      headPanel.status = payload ? "装载完成" : "";
     }
     async function runHeadUnloadNow(headId) {
       const head = headCards.value.find((item) => item.id === headId);
-      const current = head?.current_source;
-      if (!current) {
-        globalError.value = `${head?.label || headId} 没有已知 current_source`;
+      if (!head?.current_source || head.confidence === "empty") {
+        globalError.value = `${head?.label || headId} 当前没有已知已装载 source`;
         return;
       }
-      globalError.value = "";
-      if (headPanel.open && headPanel.head === headId) headPanel.status = "校验并排入后台队列...";
-      try {
-        const plan = await api("/source-action/preview", {
-          method: "POST",
-          body: { source: current, head: headId, action: "unload" },
-        });
-        const count = enqueueCommands(commandsFromPlan(plan));
-        if (headPanel.open && headPanel.head === headId) headPanel.status = `已排入 ${count} 个退料动作`;
-        setToast(`${head?.label || headId} 退料已排入后台队列`);
-      } catch (error) {
-        if (headPanel.open && headPanel.head === headId) headPanel.status = "";
-        globalError.value = error.message || String(error);
-        queueOpen.value = true;
-      }
+      if (headPanel.open && headPanel.head === headId) headPanel.status = "执行退料...";
+      const payload = await runOperation("/operation/head/unload", {
+        head: headId,
+        execute: true,
+      }, `${head?.label || headId} 退料`);
+      if (headPanel.open && headPanel.head === headId) headPanel.status = payload ? "退料完成" : "";
     }
     async function runSourceLoadNow(sourceId) {
       const source = graphSources.value.find((item) => item.id === sourceId);
       const heads = source?.heads || [];
       if (!source || !heads.length) return;
+      if (source.ready === false) {
+        globalError.value = `${source.label} 当前不可用：${source.ready_reason || "source not ready"}`;
+        return;
+      }
       if (heads.length > 1) {
-        openHeadPanel(heads[0]);
-        headPanel.targetSource = sourceId;
-        headPanel.status = "该 source 绑定了多个工具头，请确认目标工具头后点击装载。";
+        globalError.value = `${source.label} 绑定了多个工具头，请打开目标工具头详情后选择该 source 装载。`;
         return;
       }
-      openHeadPanel(heads[0]);
-      headPanel.targetSource = sourceId;
-      await runHeadLoadNow();
-    }
-    async function prepareHeadLoad() {
-      headPanel.plan = null;
-      globalError.value = "";
-      try {
-        headPanel.plan = await api("/source-transition/preview", {
-          method: "POST",
-          body: { head: headPanel.head, source: headPanel.targetSource },
-        });
-      } catch (error) {
-        globalError.value = error.message || String(error);
-      }
-    }
-    async function prepareHeadUnload() {
-      const current = activeHeadCard.value.current_source;
-      if (!current) {
-        globalError.value = `${activeHeadCard.value.label} 没有已知 current_source`;
-        return;
-      }
-      headPanel.plan = null;
-      globalError.value = "";
-      try {
-        headPanel.plan = await api("/source-action/preview", {
-          method: "POST",
-          body: { source: current, head: headPanel.head, action: "unload" },
-        });
-      } catch (error) {
-        globalError.value = error.message || String(error);
-      }
-    }
-    function enqueueHeadPanelPlan() {
-      enqueueCommands(headPanel.plan?.commands || []);
-      headPanel.plan = null;
-      closeHeadPanel();
+      await runOperation("/operation/head/load", {
+        head: heads[0],
+        source: sourceId,
+        execute: true,
+      }, `${headLabelById(heads[0])} 装载 ${source.label}`);
     }
     function humanPlanSummary(plan) {
       if (!plan) return "";
       if (plan.error) return plan.error;
       const target = plan.target || plan.event?.target || {};
-      const source = target.source || plan.event?.source || headPanel.targetSource || loadDialog.source;
-      const head = target.head_id || plan.event?.head || headPanel.head || loadDialog.head;
+      const source = target.source || plan.event?.source || headPanel.targetSource;
+      const head = target.head_id || plan.event?.head || headPanel.head;
       const action = plan.event?.action || plan.event?.profile_action || plan.target?.kind || "action";
       const commands = plan.commands || plan.event?.commands || [];
       const commandCount = commands.length;
@@ -694,54 +631,6 @@ createApp({
         return `从 ${head} 退出现有耗材 ${source}。请确认料路没有堵塞。`;
       }
       return `准备对 ${head} 使用 ${source}，将执行 ${commandCount} 个动作。`;
-    }
-
-    const loadDialog = reactive({ open: false, head: "head:0", source: "", preview: null });
-    function openLoadDialog(headId = null, sourceId = "") {
-      loadDialog.head = headId || graphHeads.value[0]?.id || "head:0";
-      loadDialog.source = sourceId || sourceOptionsForHead(loadDialog.head)[0]?.id || "";
-      loadDialog.preview = null;
-      loadDialog.open = true;
-    }
-    function closeLoadDialog() {
-      loadDialog.open = false;
-      loadDialog.preview = null;
-    }
-    async function previewTransition() {
-      loadDialog.preview = null;
-      globalError.value = "";
-      try {
-        loadDialog.preview = await api("/source-transition/preview", {
-          method: "POST",
-          body: { head: loadDialog.head, source: loadDialog.source },
-        });
-      } catch (error) {
-        globalError.value = error.message || String(error);
-      }
-    }
-    function enqueuePreviewCommands() {
-      enqueueCommands(loadDialog.preview?.commands || []);
-      closeLoadDialog();
-    }
-    async function previewSourceAction(sourceId, action) {
-      const source = graphSources.value.find((item) => item.id === sourceId);
-      const head = source?.heads?.[0];
-      if (!head) return;
-      loadDialog.head = head;
-      loadDialog.source = sourceId;
-      loadDialog.open = true;
-      loadDialog.preview = await api("/source-action/preview", {
-        method: "POST",
-        body: { source: sourceId, head, action },
-      }).catch((error) => ({ error: error.message || String(error) }));
-    }
-    async function previewUnloadHead(headId) {
-      const head = headCards.value.find((item) => item.id === headId);
-      if (!head?.current_source) {
-        globalError.value = `${head?.label || headId} 没有已知 current_source`;
-        return;
-      }
-      await previewSourceAction(head.current_source, "unload");
     }
     const recovery = reactive({ open: false, head: "", message: "" });
     function openRecovery(headId) {
@@ -806,7 +695,6 @@ createApp({
             body: { head: materialEditor.head, ...body },
           });
         }
-        queueMacro("MULTIACE_REFRESH_OVERRIDES", {}, { label: "Refresh material overrides" });
         await refreshAll();
         setToast("耗材信息已保存");
         if (loadAfter) await runSourceLoadNow(materialEditor.source);
@@ -847,8 +735,11 @@ createApp({
         for (const proposal of plan.override_proposals || []) {
           await api("/slot-override", { method: "POST", body: proposal });
         }
-        for (const action of plan.actions || []) queueMacro(action.name, action.args || {});
-        setToast("Snapshot actions queued");
+        if ((plan.actions || []).length) {
+          setToast("预设耗材已应用；硬件进退料动作请在对应工具头/source 上手动执行。", "warn");
+        } else {
+          setToast("Loadout preset applied");
+        }
       } catch (error) {
         globalError.value = error.message || String(error);
       }
@@ -1567,7 +1458,7 @@ createApp({
       const material = target.material ? ` · ${target.material}` : "";
       if (kind === "native" || kind === "native_feeder" || String(target.source || "").startsWith("native:")) {
         const headValue = target.head ?? target.head_id ?? target.edge?.head ?? "";
-        return `Native T${displayIndex(headValue)}${material}`;
+        return `Native Slot ${displayIndex(headValue)}${material}`;
       }
       if (kind === "ace" || kind === "ace_slot" || String(target.source || "").startsWith("ace:")) {
         const ace = target.ace ?? String(target.source || "").split(":")[1];
@@ -1750,7 +1641,7 @@ createApp({
       await Promise.allSettled([loadConfig(), refreshDebugState()]);
       startScreenPolling();
       setInterval(() => {
-        if (!busy.refresh) Promise.allSettled([reloadState(), reloadSourceState()]);
+        if (!busy.refresh) Promise.allSettled([reloadState(), reloadSourceState(), reloadOperation()]);
       }, 3000);
       setInterval(() => { if (camera.mode === "image") camera.nonce = Date.now(); }, 5000);
     });
@@ -1767,17 +1658,14 @@ createApp({
       swatchStyle, ringStyle, dryerLabel, pretty,
       sourceOptionsForHead, edgeEnabled, edgePriority, setEdgeEnabled, setEdgePriority,
       setHeadSourceBinding, bindingLabel,
+      sourceExecutionValue, setSourceExecutionValue,
       syncGraphJson, applyGraphJson, saveSourceGraph,
-      cmdQueue, cmdPaused, queueOpen, queuedCount, runningQueueLabel, hasQueuedCommands,
-      hasFinishedCommands, queueMacro, clearDoneQueue, cancelQueuedCommands,
+      currentOperation, operationBusy, operationLabel, reloadOperation,
       confirmUnloadAll,
       dryerCfg, dryStart, dryStop,
       headPanel, activeHeadCard, allowedSourcesForHead,
       openHeadPanel, closeHeadPanel, runHeadLoadNow, runHeadUnloadNow, runSourceLoadNow,
-      prepareHeadLoad, prepareHeadUnload,
-      enqueueHeadPanelPlan, humanPlanSummary,
-      loadDialog, openLoadDialog, closeLoadDialog,
-      previewTransition, enqueuePreviewCommands, previewSourceAction, previewUnloadHead,
+      humanPlanSummary,
       recovery, openRecovery,
       materialEditor, openMaterialEditor, closeMaterialEditor, readMaterialFromRfid, saveMaterialEditor,
       snapshots, selectedSnapshot, saveSnapshot, applySnapshot, deleteSnapshot,

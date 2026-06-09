@@ -536,7 +536,7 @@ class FilamentFeed:
         self._feed_load_position_x = config.getfloat('load_position_x', FEED_LOAD_POSITION_X, minval=2, maxval=265)
         self._feed_load_position_y = config.getfloat('load_position_y', FEED_LOAD_POSITION_Y, minval=2, maxval=250)
         self._feed_load_extrude_max_times = config.getint('load_extrude_max_times', FEED_LOAD_EXTRUDE_TIMES_MAX, minval=3, maxval=50)
-        preload_length = config.getfloat('preload_length', FEED_PRELOAD_LENGTH, minval=600.0, maxval=1500.0)
+        preload_length = config.getfloat('preload_length', FEED_PRELOAD_LENGTH, minval=0.0, maxval=3000.0)
         self.coil_freq_threshold_soft = config.getint('coil_freq_thershold_soft', FEED_COIL_FREQ_THERSHOLD_SOFT, minval=100)
         self.coil_freq_threshold_hard = config.getint('coil_freq_thershold_hard', FEED_COIL_FREQ_THERSHOLD_HARD, minval=100)
 
@@ -559,7 +559,14 @@ class FilamentFeed:
         self.printer.register_event_handler("filament_switch_sensor:runout", self._runout_evt_handle)
         self._check_init_state_timer = self.reactor.register_timer(self._check_init_state_timer_handler)
 
-        self._feed_preload_counts = int(preload_length / FEED_WHEEL_CIRCUMFERENCE * 2)
+        self._feed_preload_counts = [
+            int(config.getfloat(
+                'preload_length_%d' % ch,
+                preload_length,
+                minval=0.0,
+                maxval=3000.0) / FEED_WHEEL_CIRCUMFERENCE * 2)
+            for ch in range(FEED_CHANNEL_NUMS)
+        ]
         self._feed_load_counts_max = int(FEED_LOAD_LENGTH_MAX / FEED_WHEEL_CIRCUMFERENCE * 2)
 
         self.motor_speed_slow_switching = FEED_MOTOR_SPEED_SLOW_SWITCHING
@@ -810,6 +817,21 @@ class FilamentFeed:
         return (0 <= head_idx < len(head_modes)
                 and head_modes[head_idx] == 'ace')
 
+    def _native_preload_counts(self, ch):
+        default = self._feed_preload_counts[ch]
+        if self.ace is None:
+            return default
+        try:
+            head_idx = int(self.filament_ch[ch])
+            length = self.ace.get_source_preload_length(
+                'native:%d' % head_idx,
+                None)
+            if length is None:
+                return default
+            return int(float(length) / FEED_WHEEL_CIRCUMFERENCE * 2)
+        except Exception:
+            return default
+
     def _snapshot_inner_resume_state(self):
 
         try:
@@ -987,8 +1009,9 @@ class FilamentFeed:
                                 self.channel_error[ch] = FEED_ERR_NO_FILAMENT
                                 self.exception_code[ch] = 13
                                 break
-                            if (wheel_cnt_a_2 - wheel_cnt_a_1) / self.wheel[ch].ppr > self._feed_preload_counts or \
-                                    (wheel_cnt_b_2 - wheel_cnt_b_1) / self.wheel_2[ch].ppr > self._feed_preload_counts:
+                            preload_counts = self._native_preload_counts(ch)
+                            if (wheel_cnt_a_2 - wheel_cnt_a_1) / self.wheel[ch].ppr > preload_counts or \
+                                    (wheel_cnt_b_2 - wheel_cnt_b_1) / self.wheel_2[ch].ppr > preload_counts:
                                 self.channel_error[ch] = FEED_OK
                                 break
                             if motor_speed < FEED_PRELOAD_MOTOR_MIN_SPEED:

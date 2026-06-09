@@ -63,11 +63,37 @@
 - 不重启 Klipper。
 - 不移动硬件。
 - 不写入当前装载状态。
+- 保存后后端会尝试执行 `MULTIACE_REFRESH_SOURCE_GRAPH`，让 Klipper 重新读取
+  `source_graph.json`。该命令只刷新内存中的 source graph，不执行任何送料、
+  换料或打印动作。若刷新失败，保存结果仍返回 `ok=true`，并在 `refresh.error`
+  中暴露错误。
 
 前端要求：
 
-- 保存 graph 后应重新读取 `/api/source-state`。
+- 保存 graph 后应重新读取 `/api/source-graph` 和 `/api/source-state`。
 - 保存 graph 后已有 route plan 可能失效，打印前必须重新 preview/validate。
+
+### Source Execution
+
+每个 source 可带 `execution` 对象。当前已支持：
+
+```json
+{
+  "execution": {
+    "preload_length_mm": 950
+  }
+}
+```
+
+语义：
+
+- `preload_length_mm` 是 source slot 从入口预进料到四通/目标路径入口的长度，
+  单位 mm。
+- `native:<n>` 和 `ace:<ace>:<slot>` 都按 source 独立配置。
+- 合法范围为 `0..3000`。
+- 对 ACE source，`0` 表示禁用 ACE 自动预进料。
+- 该字段是 source 状态/执行参数，不代表工具头已经 loaded；工具头是否 loaded
+  仍只由 `source-state.heads[head:N].current_source/source_confidence` 判断。
 
 ## Source State
 

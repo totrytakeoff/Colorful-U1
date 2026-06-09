@@ -894,6 +894,29 @@ class MultiAce:
             return False
         return any(edge_head == h for edge_head, _ace, _slot in self._source_graph_edges)
 
+    def _source_graph_preload_length(self, source_id, default=None):
+        if not self._source_graph_loaded():
+            return default
+        try:
+            source = (self._source_graph.get('sources') or {}).get(source_id)
+            execution = (source or {}).get('execution') or {}
+            raw = execution.get('preload_length_mm')
+            if raw is None or raw == '':
+                return default
+            value = int(float(raw))
+        except Exception:
+            return default
+        if value < 0:
+            return default
+        return value
+
+    def get_source_preload_length(self, source_id, default=None):
+        return self._source_graph_preload_length(source_id, default)
+
+    def get_ace_preload_length(self, ace_idx, slot, default=None):
+        return self._source_graph_preload_length(
+            'ace:%d:%d' % (int(ace_idx), int(slot)), default)
+
     cmd_MULTIACE_REFRESH_SOURCE_GRAPH_help = (
         '[multiACE] Re-read source_graph.json routing')
     def cmd_MULTIACE_REFRESH_SOURCE_GRAPH(self, gcmd):
@@ -3377,7 +3400,8 @@ class MultiAce:
         self._handle_per_ace_failure(self._active_device_index, err)
 
     def _pre_load(self, gate):
-        feed_length = self.head_feed_length[gate]
+        feed_length = self.get_ace_preload_length(
+            self._active_device_index, gate, self.head_feed_length[gate])
 
         if feed_length <= 0:
             return

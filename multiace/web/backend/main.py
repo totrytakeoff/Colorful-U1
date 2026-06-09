@@ -616,6 +616,28 @@ class SourceTransitionPreview(BaseModel):
     source: str
     head: str | int
 
+class HeadLoadRequest(BaseModel):
+    head: str | int
+    source: str
+    execute: bool = True
+
+class HeadUnloadRequest(BaseModel):
+    head: str | int
+    execute: bool = True
+
+class AceDryStartRequest(BaseModel):
+    ace: int
+    temp: int | float | None = None
+    duration: int | float | None = None
+    execute: bool = True
+
+class AceDryStopRequest(BaseModel):
+    ace: int | None = None
+    execute: bool = True
+
+class OperationExecuteRequest(BaseModel):
+    execute: bool = True
+
 class RoutePlanValidateRequest(BaseModel):
     route_plan: dict[str, Any]
 
@@ -623,6 +645,15 @@ EXPLICIT_ROUTE_MACROS = {"ACE_LOAD_HEAD", "ACE_SWAP_HEAD"}
 EXPLICIT_ROUTE_ARGS = {"HEAD", "ACE", "SLOT"}
 OBSOLETE_MACROS_BLOCKED = {"SET_ACE_MODE", "ACE_RUN_MODE_SWITCH"}
 EXPLICIT_PLAN_MACROS = {"ACE_TEST", "ACE_SEQ", "ACE_PRELOAD"}
+OPERATION_ONLY_MACROS = {
+    "ACE_LOAD_HEAD",
+    "ACE_UNLOAD_HEAD",
+    "ACE_SWAP_HEAD",
+    "ACE_UNLOAD_ALL_HEADS",
+    "ACE_DRY",
+    "ACE_STOP_DRYING",
+    "FEED_AUTO",
+}
 
 OBSOLETE_ACE_CONFIG_KEYS = {
     "ace_route_mode",
@@ -727,6 +758,17 @@ def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
         _validate_plan_arg(macro, None if args is None else args.get("PLAN", args.get("plan")))
     if macro == "FEED_AUTO":
         _validate_feed_auto_args(args)
+
+def _validate_direct_macro_request(name: str, args: dict[str, Any] | None) -> None:
+    _validate_macro_request(name, args)
+    macro = str(name or "").strip().upper()
+    if macro in OPERATION_ONLY_MACROS or macro in EXPLICIT_PLAN_MACROS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{macro} must be executed through /api/operation/* "
+                "so source state, route validation, and the single-operation "
+                "lock are enforced"))
 
 def _validate_plan_arg(macro: str, plan: Any) -> None:
     plan_str = str(plan or "").strip()
@@ -1635,6 +1677,7 @@ def _target_from_graph_source_edge(
             "constraints": edge_obj.get("constraints") or {},
         },
         "execution_profile": source.get("execution_profile") or "",
+        "execution": source.get("execution") or {},
     }
     if kind == "native_feeder":
         channel = _native_source_channel(source)
@@ -2511,7 +2554,9 @@ def _validate_route_plan_runtime_state(route_plan: dict,
         isinstance(event, dict) and event.get("event_type") == "tool_select"
         for event in route_plan.get("events") or []
     )
-    if not (used_tools or has_tool_map or has_tool_select):
+    has_events = bool(route_plan.get("events"))
+    has_resources = bool((route_plan.get("resources") or {}).get("sources"))
+    if not (used_tools or has_tool_map or has_tool_select or has_events or has_resources):
         return []
     initial_state = route_plan.get("initial_state")
     if not isinstance(initial_state, dict) or not initial_state:
@@ -3876,9 +3921,19 @@ async def update_source_graph(payload: SourceGraphUpdate) -> dict:
         meta = sg.save_graph(MULTIACE_SOURCE_GRAPH_PATH, payload.graph)
     except sg.SourceGraphError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    refresh: dict[str, Any] | None = None
+    try:
+        refresh = await _mr_post(
+            "/printer/gcode/script",
+            {"script": "MULTIACE_REFRESH_SOURCE_GRAPH"},
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        refresh = {"error": str(exc) or type(exc).__name__}
     return {
         "ok": True,
         "meta": meta,
+        "refresh": refresh,
     }
 
 @app.get("/api/source-state")
@@ -4051,6 +4106,381 @@ async def preview_source_transition(payload: SourceTransitionPreview) -> dict:
         "route_plan": route_plan,
     }
 
+_operation_lock = asyncio.Lock()
+_operation_job: dict[str, Any] | None = None
+
+def _operation_public(job: dict[str, Any] | None) -> dict[str, Any]:
+    if not job:
+        return {"active": False}
+    return {
+        "active": job.get("status") in ("queued", "running"),
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "kind": job.get("kind"),
+        "head": job.get("head"),
+        "source": job.get("source"),
+        "previous_source": job.get("previous_source"),
+        "commands": job.get("commands") or [],
+        "error": job.get("error"),
+        "created": job.get("created"),
+        "updated": job.get("updated"),
+    }
+
+def _operation_active() -> bool:
+    return bool(_operation_job and _operation_job.get("status") in ("queued", "running"))
+
+def _finalize_operation_route_plan(route_plan: dict, graph: dict) -> dict:
+    route_plan["resources"] = _route_plan_resource_summary(route_plan, graph)
+    route_plan["execution"] = _route_plan_execution_summary(route_plan, graph)
+    return route_plan
+
+def _validate_operation_route_plan(
+        route_plan: dict,
+        graph: dict,
+        meta: dict,
+        current_state: dict,
+        current_sources: dict,
+) -> list[str]:
+    errors = _validate_route_plan_for_graph(route_plan, graph, meta)
+    errors.extend(_validate_route_plan_runtime_state(
+        route_plan, current_state, current_sources))
+    script = _script_from_commands(route_plan.get("commands") or [])
+    if script:
+        try:
+            _validate_gcode_script(script)
+        except HTTPException as exc:
+            errors.append(str(exc.detail))
+    return errors
+
+def _script_from_commands(commands: list[str] | tuple[str, ...]) -> str:
+    lines = []
+    for command in commands or []:
+        line = str(command or "").strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+async def _execute_operation_job(job: dict[str, Any]) -> None:
+    global _operation_job
+    job["status"] = "running"
+    job["updated"] = time.time()
+    script = _script_from_commands(job.get("commands") or [])
+    try:
+        if script:
+            _validate_gcode_script(script)
+            result = await _mr_post(
+                "/printer/gcode/script",
+                {"script": script},
+                timeout=None,
+            )
+            job["result"] = result
+        job["status"] = "done"
+        job["updated"] = time.time()
+    except httpx.HTTPStatusError as e:
+        job["status"] = "error"
+        job["error"] = e.response.text or str(e)
+        job["updated"] = time.time()
+        _trace.warning("operation %s failed for %r: %s",
+                       job.get("id"), script, str(job.get("error"))[:300])
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e) or type(e).__name__
+        job["updated"] = time.time()
+        _trace.warning("operation %s failed for %r: %s",
+                       job.get("id"), script, job.get("error"))
+    finally:
+        if _operation_job is job:
+            _operation_job = job
+
+async def _start_operation_job(
+        *,
+        kind: str,
+        head: str | None,
+        source: str | None,
+        previous_source: str | None,
+        route_plan: dict,
+        execute: bool,
+) -> dict[str, Any]:
+    global _operation_job
+    commands = route_plan.get("commands") or []
+    now = time.time()
+    async with _operation_lock:
+        if execute and _operation_active():
+            raise HTTPException(
+                status_code=409,
+                detail="another hardware operation is already running")
+        job = {
+            "id": uuid.uuid4().hex,
+            "status": "queued" if execute else "preview",
+            "kind": kind,
+            "head": head,
+            "source": source,
+            "previous_source": previous_source,
+            "commands": commands,
+            "route_plan": route_plan,
+            "created": now,
+            "updated": now,
+            "error": None,
+        }
+        if execute:
+            _operation_job = job
+            asyncio.create_task(_execute_operation_job(job))
+    return job
+
+async def _build_head_load_operation(payload: HeadLoadRequest) -> dict[str, Any]:
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    target = _target_from_graph_source_edge(graph, payload.source, payload.head)
+    if target is None:
+        raise HTTPException(status_code=404, detail="enabled source edge not found")
+    initial_state = sg.source_state(graph, parsed)
+    head_id = target.get("head_id") or "head:%d" % int(target.get("head"))
+    head_state = (initial_state.get("heads") or {}).get(head_id) or {}
+    if head_state.get("source_confidence") in ("unknown", "failed", "exhausted"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "%s current source is %s; recover before loading"
+                % (head_id, head_state.get("source_confidence"))))
+    event = _source_transition_event(
+        index=0,
+        target=target,
+        initial_state=initial_state,
+        graph=graph,
+    )
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "initial_state": initial_state,
+        "events": [event],
+        "commands": event.get("commands") or [],
+    }
+    route_plan = _finalize_operation_route_plan(route_plan, graph)
+    current_sources = sg.runtime_sources(graph, parsed)
+    errors = _validate_operation_route_plan(
+        route_plan, graph, meta, initial_state, current_sources)
+    if errors:
+        raise HTTPException(status_code=409, detail="; ".join(errors))
+    job = await _start_operation_job(
+        kind="head_load",
+        head=head_id,
+        source=target.get("source"),
+        previous_source=event.get("previous_source"),
+        route_plan=route_plan,
+        execute=payload.execute,
+    )
+    return {
+        "ok": True,
+        "operation": _operation_public(job),
+        "target": target,
+        "event": event,
+        "route_plan": route_plan,
+    }
+
+async def _build_head_unload_operation(payload: HeadUnloadRequest) -> dict[str, Any]:
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    initial_state = sg.source_state(graph, parsed)
+    head_idx = _head_index_from_id(payload.head)
+    if head_idx is None:
+        raise HTTPException(status_code=400, detail="invalid head")
+    head_id = f"head:{head_idx}"
+    head_state = (initial_state.get("heads") or {}).get(head_id) or {}
+    current_source = head_state.get("current_source")
+    confidence = head_state.get("source_confidence")
+    if not current_source or confidence == "empty":
+        raise HTTPException(status_code=409, detail=f"{head_id} has no loaded source")
+    if confidence in ("unknown", "failed", "exhausted"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{head_id} current source is {confidence}; recover before unloading")
+    target = _target_from_graph_source_edge(graph, current_source, head_id)
+    if target is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{head_id} current source {current_source} has no enabled edge")
+    step = _profile_step(
+        target=target,
+        profiles=(graph.get("profiles") or {}),
+        action="unload",
+    )
+    if step is None:
+        raise HTTPException(status_code=409, detail="current source cannot unload")
+    event = _source_action_event(index=0, action="unload", target=target, step=step)
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "initial_state": initial_state,
+        "events": [event],
+        "commands": event.get("commands") or [],
+    }
+    route_plan = _finalize_operation_route_plan(route_plan, graph)
+    current_sources = sg.runtime_sources(graph, parsed)
+    errors = _validate_operation_route_plan(
+        route_plan, graph, meta, initial_state, current_sources)
+    if errors:
+        raise HTTPException(status_code=409, detail="; ".join(errors))
+    job = await _start_operation_job(
+        kind="head_unload",
+        head=head_id,
+        source=current_source,
+        previous_source=current_source,
+        route_plan=route_plan,
+        execute=payload.execute,
+    )
+    return {
+        "ok": True,
+        "operation": _operation_public(job),
+        "target": target,
+        "event": event,
+        "route_plan": route_plan,
+    }
+
+def _macro_command(name: str, args: dict[str, Any] | None = None) -> str:
+    _validate_macro_request(name, args)
+    parts = [str(name).strip()]
+    for key, value in (args or {}).items():
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+async def _build_macro_operation(
+        *,
+        kind: str,
+        command: str,
+        execute: bool,
+        head: str | None = None,
+        source: str | None = None,
+) -> dict[str, Any]:
+    route_plan = {
+        "version": 2,
+        "events": [{
+            "index": 0,
+            "event_type": "hardware_operation",
+            "action": kind,
+            "head": head,
+            "source": source,
+            "steps": [{
+                "kind": kind,
+                "head": head,
+                "source": source,
+                "command": command,
+            }],
+            "commands": [command],
+        }],
+        "commands": [command],
+    }
+    errors = []
+    try:
+        _validate_gcode_script(command)
+    except HTTPException as exc:
+        errors.append(str(exc.detail))
+    if errors:
+        raise HTTPException(status_code=409, detail="; ".join(errors))
+    job = await _start_operation_job(
+        kind=kind,
+        head=head,
+        source=source,
+        previous_source=None,
+        route_plan=route_plan,
+        execute=execute,
+    )
+    return {
+        "ok": True,
+        "operation": _operation_public(job),
+        "route_plan": route_plan,
+    }
+
+async def _build_ace_dry_start_operation(payload: AceDryStartRequest) -> dict[str, Any]:
+    ace = int(payload.ace)
+    if ace < 0 or ace > 7:
+        raise HTTPException(status_code=400, detail="ace must be 0..7")
+    args: dict[str, Any] = {"ACE": ace}
+    if payload.temp is not None:
+        temp = float(payload.temp)
+        if temp < 35 or temp > 80:
+            raise HTTPException(status_code=400, detail="temp must be 35..80")
+        args["TEMP"] = int(temp)
+    if payload.duration is not None:
+        duration = float(payload.duration)
+        if duration <= 0 or duration > 600:
+            raise HTTPException(status_code=400, detail="duration must be 1..600")
+        args["DURATION"] = int(duration)
+    return await _build_macro_operation(
+        kind="ace_dry_start",
+        command=_macro_command("ACE_DRY", args),
+        execute=payload.execute,
+        source=f"ace:{ace}",
+    )
+
+async def _build_ace_dry_stop_operation(payload: AceDryStopRequest) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    source = None
+    if payload.ace is not None:
+        ace = int(payload.ace)
+        if ace < 0 or ace > 7:
+            raise HTTPException(status_code=400, detail="ace must be 0..7")
+        args["ACE"] = ace
+        source = f"ace:{ace}"
+    return await _build_macro_operation(
+        kind="ace_dry_stop",
+        command=_macro_command("ACE_STOP_DRYING", args),
+        execute=payload.execute,
+        source=source,
+    )
+
+async def _build_unload_all_operation(payload: OperationExecuteRequest) -> dict[str, Any]:
+    return await _build_macro_operation(
+        kind="unload_all_heads",
+        command=_macro_command("ACE_UNLOAD_ALL_HEADS", {}),
+        execute=payload.execute,
+    )
+
+@app.get("/api/operation/current")
+async def get_current_operation() -> dict:
+    return {"operation": _operation_public(_operation_job)}
+
+@app.post("/api/operation/head/load")
+async def operation_head_load(payload: HeadLoadRequest) -> dict:
+    return await _build_head_load_operation(payload)
+
+@app.post("/api/operation/head/unload")
+async def operation_head_unload(payload: HeadUnloadRequest) -> dict:
+    return await _build_head_unload_operation(payload)
+
+@app.post("/api/operation/ace/dry-start")
+async def operation_ace_dry_start(payload: AceDryStartRequest) -> dict:
+    return await _build_ace_dry_start_operation(payload)
+
+@app.post("/api/operation/ace/dry-stop")
+async def operation_ace_dry_stop(payload: AceDryStopRequest) -> dict:
+    return await _build_ace_dry_stop_operation(payload)
+
+@app.post("/api/operation/unload-all")
+async def operation_unload_all(payload: OperationExecuteRequest) -> dict:
+    return await _build_unload_all_operation(payload)
+
 @app.get("/api/aces")
 async def list_aces() -> dict:
     """Backwards-compatible subset of /api/state - only the per-ACE list."""
@@ -4123,7 +4553,7 @@ async def run_macro_batch(req: MacroBatchRequest) -> dict:
         raise HTTPException(status_code=400, detail="no commands")
     lines = []
     for c in req.commands:
-        _validate_macro_request(c.name, c.args)
+        _validate_direct_macro_request(c.name, c.args)
         parts = [c.name]
         if c.args:
             for k, v in c.args.items():
@@ -4144,7 +4574,7 @@ async def run_macro_batch(req: MacroBatchRequest) -> dict:
 
 @app.post("/api/macro-async", status_code=202)
 async def run_macro_async(req: MacroRequest) -> dict:
-    _validate_macro_request(req.name, req.args)
+    _validate_direct_macro_request(req.name, req.args)
     parts = [req.name]
     if req.args:
         for k, v in req.args.items():
@@ -4206,7 +4636,7 @@ async def get_macro_job(job_id: str) -> dict:
 
 @app.post("/api/macro")
 async def run_macro(req: MacroRequest) -> dict:
-    _validate_macro_request(req.name, req.args)
+    _validate_direct_macro_request(req.name, req.args)
     parts = [req.name]
     if req.args:
         for k, v in req.args.items():

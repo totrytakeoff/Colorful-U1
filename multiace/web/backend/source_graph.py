@@ -16,6 +16,14 @@ NATIVE_CHANNELS = {
     2: {"module": "right", "channel": 0},
     3: {"module": "right", "channel": 1},
 }
+SOURCE_EXECUTION_DEFAULTS = {
+    "native_feeder": {
+        "preload_length_mm": 950,
+    },
+    "ace_slot": {
+        "preload_length_mm": 0,
+    },
+}
 
 DEFAULT_PROFILES = {
     "ace_v1_slot": {
@@ -72,7 +80,81 @@ def graph_hash(graph: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def default_graph(ace_count: int = 1) -> dict[str, Any]:
+def _coerce_head(value: Any) -> int | None:
+    try:
+        head = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= head < HEAD_COUNT:
+        return head
+    return None
+
+
+def _legacy_route_head_mode(route: dict[str, Any], head: int) -> str:
+    head_modes = route.get("head_modes") or {}
+    mode = head_modes.get(str(head), head_modes.get(head))
+    if str(mode).lower() in ("ace", "native"):
+        return str(mode).lower()
+    if route.get("mode") == "single_head":
+        primary = _coerce_head(route.get("primary_head"))
+        if primary == head:
+            return "ace"
+    return "native"
+
+
+def _ace_edge(source_id: str, head: int, priority: int = 50) -> dict[str, Any]:
+    return {
+        "source": source_id,
+        "head": f"head:{head}",
+        "enabled": True,
+        "priority": priority,
+        "constraints": {
+            "requires_empty_head_before_load": True,
+            "allows_preload_while_other_head_prints": True,
+        },
+    }
+
+
+def _legacy_ace_edges(parsed: dict[str, Any] | None,
+                      ace_count: int) -> list[dict[str, Any]]:
+    """Build ACE edges from the pre-source-graph route config.
+
+    This is only used for generated graphs when source_graph.json does not
+    exist yet. Saved source graphs are authoritative and are never expanded
+    from legacy route fields.
+    """
+    if not isinstance(parsed, dict):
+        return []
+    route = ((parsed.get("route") or {}) if isinstance(parsed.get("route"), dict)
+             else {})
+    ace_targets = route.get("ace_targets") or {}
+    slot_targets = route.get("slot_targets") or {}
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for ace in range(max(1, min(8, int(ace_count or 1)))):
+        ace_target = ace_targets.get(str(ace), ace_targets.get(ace))
+        ace_head = _coerce_head(ace_target)
+        for slot in range(4):
+            slot_target = slot_targets.get(str(slot), slot_targets.get(slot))
+            head = _coerce_head(slot_target)
+            if head is None:
+                head = ace_head
+            if head is None:
+                continue
+            if _legacy_route_head_mode(route, head) != "ace":
+                continue
+            source_id = f"ace:{ace}:{slot}"
+            head_id = f"head:{head}"
+            key = (source_id, head_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(_ace_edge(source_id, head))
+    return edges
+
+
+def default_graph(ace_count: int = 1,
+                  parsed: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a conservative default graph.
 
     Native feeder edges are known from U1's fixed feed module/channel layout.
@@ -97,12 +179,13 @@ def default_graph(ace_count: int = 1) -> dict[str, Any]:
             "head": head,
             "module": NATIVE_CHANNELS[head]["module"],
             "channel": NATIVE_CHANNELS[head]["channel"],
-            "label": f"Native T{head}",
+            "label": f"Native Slot {head + 1}",
             "material": "",
             "brand": "",
             "subtype": "",
             "color": "",
             "ready": False,
+            "execution": deepcopy(SOURCE_EXECUTION_DEFAULTS["native_feeder"]),
             "execution_profile": "u1_native_feeder",
         }
         edges.append({
@@ -129,8 +212,11 @@ def default_graph(ace_count: int = 1) -> dict[str, Any]:
                 "subtype": "",
                 "color": "",
                 "ready": False,
+                "execution": deepcopy(SOURCE_EXECUTION_DEFAULTS["ace_slot"]),
                 "execution_profile": "ace_v1_slot",
             }
+
+    edges.extend(_legacy_ace_edges(parsed, ace_count))
 
     return {
         "version": GRAPH_VERSION,
@@ -153,11 +239,29 @@ def _merge_defaults(value: Any, defaults: Any) -> Any:
     return deepcopy(value)
 
 
+def _normalize_source_labels(sources: dict[str, Any]) -> None:
+    for source_id, source in sources.items():
+        if not isinstance(source, dict):
+            continue
+        if source.get("kind") != "native_feeder":
+            continue
+        try:
+            head = int(source.get("head", str(source_id).split(":")[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        current = str(source.get("label") or "").strip()
+        legacy = "Native " + f"T{head}"
+        if not current or current == legacy:
+            source["label"] = f"Native Slot {head + 1}"
+
+
 def normalize_graph(graph: dict[str, Any]) -> dict[str, Any]:
     out = deepcopy(graph if isinstance(graph, dict) else {})
     out["version"] = int(out.get("version") or GRAPH_VERSION)
     out.setdefault("heads", {})
-    out.setdefault("sources", {})
+    sources = out.setdefault("sources", {})
+    if isinstance(sources, dict):
+        _normalize_source_labels(sources)
     out.setdefault("edges", [])
     profiles = out.setdefault("profiles", {})
     for profile_id, profile in DEFAULT_PROFILES.items():
@@ -165,6 +269,17 @@ def normalize_graph(graph: dict[str, Any]) -> dict[str, Any]:
             profiles[profile_id] = _merge_defaults(profiles[profile_id], profile)
         else:
             profiles[profile_id] = deepcopy(profile)
+    if isinstance(sources, dict):
+        for source in sources.values():
+            if not isinstance(source, dict):
+                continue
+            defaults = SOURCE_EXECUTION_DEFAULTS.get(source.get("kind"))
+            if defaults is None:
+                continue
+            source["execution"] = _merge_defaults(
+                source.get("execution") or {},
+                defaults,
+            )
     return out
 
 
@@ -221,6 +336,21 @@ def validate_graph(graph: dict[str, Any]) -> tuple[list[str], list[str]]:
         profile = profiles.get(profile_id)
         if kind not in ("native_feeder", "ace_slot"):
             errors.append(f"{source_id}: unknown source kind {kind!r}")
+        execution = source.get("execution") or {}
+        if execution and not isinstance(execution, dict):
+            errors.append(f"{source_id}: execution must be an object")
+            execution = {}
+        if isinstance(execution, dict):
+            for key in ("preload_length_mm",):
+                if key not in execution or execution.get(key) in (None, ""):
+                    continue
+                try:
+                    value = float(execution.get(key))
+                except (TypeError, ValueError):
+                    errors.append(f"{source_id}: execution.{key} must be a number")
+                    continue
+                if value < 0 or value > 3000:
+                    errors.append(f"{source_id}: execution.{key} must be 0..3000")
         if not profile_id or not isinstance(profile, dict):
             errors.append(f"{source_id}: execution_profile {profile_id!r} missing")
         elif profile.get("kind") != kind:
@@ -287,13 +417,13 @@ def load_graph(path: str | Path, ace_count: int = 1,
                parsed: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     p = Path(path)
     if not p.exists():
-        graph = default_graph(ace_count)
+        graph = default_graph(ace_count, parsed=parsed)
         source = "generated"
     else:
         try:
             graph = json.loads(p.read_text(encoding="utf-8"))
         except Exception as exc:
-            graph = default_graph(ace_count)
+            graph = default_graph(ace_count, parsed=parsed)
             errors = [f"failed to read source graph: {exc}"]
             return graph, {
                 "path": str(p),
@@ -368,10 +498,11 @@ def _source_for_loaded_toolhead(graph: dict[str, Any], parsed: dict[str, Any],
             return "ace:%d:%d" % (int(th.get("ace")), int(th.get("slot")))
         except (TypeError, ValueError):
             return None
-    if th.get("filament_at_extruder"):
+    if th.get("filament_at_extruder") and th.get("filament_in_ace"):
+        return None
+    if th.get("filament_at_extruder") and not th.get("filament_in_ace"):
         head_id = f"head:{head}"
         native_sources = []
-        non_native_sources = []
         sources = graph.get("sources") or {}
         for edge in graph.get("edges") or []:
             if not isinstance(edge, dict) or not edge.get("enabled", True):
@@ -382,9 +513,7 @@ def _source_for_loaded_toolhead(graph: dict[str, Any], parsed: dict[str, Any],
             source = sources.get(source_id) or {}
             if source.get("kind") == "native_feeder":
                 native_sources.append(source_id)
-            else:
-                non_native_sources.append(source_id)
-        if len(native_sources) == 1 and not non_native_sources:
+        if len(native_sources) == 1:
             return native_sources[0]
     return None
 
@@ -446,30 +575,46 @@ def runtime_sources(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, 
         if source_id not in sources:
             continue
         detected = bool(th.get("filament_detected"))
+        in_ace_path = bool(th.get("filament_in_ace"))
+        in_native_path = detected and not in_ace_path
         at_extruder = bool(th.get("filament_at_extruder"))
         channel_error = th.get("channel_error")
         channel_state = str(th.get("channel_state") or "")
         channel_ok = channel_error in (None, "", "ok")
         state_ok = channel_state in ("load_finish", "preload_finish")
-        ready = bool(detected and at_extruder and channel_ok and state_ok)
+        ready = bool(
+            in_native_path
+            and channel_ok
+            and state_ok
+        )
         reasons = []
-        if not detected:
-            reasons.append("未检测到耗材")
-        if not at_extruder:
-            reasons.append("耗材未到达挤出机")
+        if not in_native_path:
+            reasons.append("native slot empty")
         if not channel_ok:
             reasons.append("进料通道错误: %s" % channel_error)
-        if not state_ok:
+        if in_native_path and not state_ok:
             reasons.append("通道状态: %s" % (channel_state or "unknown"))
+        material = sources[source_id].get("material", "")
+        brand = sources[source_id].get("brand", "")
+        subtype = sources[source_id].get("subtype", "")
+        color = sources[source_id].get("color", "")
+        if in_native_path:
+            material = th.get("material") or material
+            brand = th.get("brand") or brand
+            subtype = th.get("sku") or subtype
+            color = th.get("color") or color
         sources[source_id].update({
-            "material": th.get("material") or sources[source_id].get("material", ""),
-            "brand": th.get("brand") or sources[source_id].get("brand", ""),
-            "subtype": th.get("sku") or sources[source_id].get("subtype", ""),
-            "color": th.get("color") or sources[source_id].get("color", ""),
+            "material": material,
+            "brand": brand,
+            "subtype": subtype,
+            "color": color,
             "ready": ready,
             "ready_reason": "ready" if ready else "; ".join(reasons),
+            "state": channel_state,
             "status_details": {
                 "filament_detected": detected,
+                "filament_in_ace": in_ace_path,
+                "filament_in_native_path": in_native_path,
                 "filament_at_extruder": at_extruder,
                 "channel_error": channel_error or "",
                 "channel_state": channel_state,
@@ -548,6 +693,7 @@ def live_loadout(graph: dict[str, Any], parsed: dict[str, Any],
             "status_details": deepcopy(source.get("status_details") or {}),
             "state": source.get("state") or "",
             "execution_profile": source.get("execution_profile") or "",
+            "execution": deepcopy(source.get("execution") or {}),
         }
         if kind == "native_feeder":
             channel = _native_channel_for_source(source)

@@ -122,7 +122,7 @@ def source_graph_for(payload: dict[str, Any]) -> dict[str, Any]:
             "head": head,
             "module": channels[head]["module"],
             "channel": channels[head]["channel"],
-            "label": f"Native T{head}",
+            "label": f"Native Slot {head + 1}",
             "material": "",
             "brand": "",
             "subtype": "",
@@ -1330,6 +1330,301 @@ def test_source_transition_preview_unloads_previous_source() -> None:
         f"transition step order mismatch: {preview}")
 
 
+def test_operation_unload_uses_head_current_source() -> None:
+    scenario = {
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {"head": 0, "ace": 0, "slot": 1, "material": "PETG", "color": "1E78DC"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    push_graph(graph)
+    result = post_json(f"{WEB}/operation/head/unload", {
+        "head": "head:0",
+        "execute": False,
+    })
+    operation = result.get("operation") or {}
+    event = result.get("event") or {}
+    assert_true(operation.get("status") == "preview",
+                f"unload preview should not execute: {result}")
+    assert_true(operation.get("source") == "ace:0:1",
+                f"unload must use head current source: {result}")
+    assert_true(event.get("source") == "ace:0:1",
+                f"unload event source mismatch: {result}")
+    assert_true(operation.get("commands") == ["ACE_UNLOAD_HEAD HEAD=0"],
+                f"unload command mismatch: {result}")
+
+
+def test_operation_load_builds_single_transition_task() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "native_heads": [
+            {"head": 0, "material": "PLA", "color": "#dc2828"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "ace:0:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 50,
+        "constraints": {
+            "requires_empty_head_before_load": True,
+            "allows_preload_while_other_head_prints": True,
+        },
+    })
+    push_graph(graph)
+    result = post_json(f"{WEB}/operation/head/load", {
+        "head": "head:0",
+        "source": "ace:0:1",
+        "execute": False,
+    })
+    operation = result.get("operation") or {}
+    event = result.get("event") or {}
+    assert_true(operation.get("status") == "preview",
+                f"load preview should not execute: {result}")
+    assert_true(operation.get("kind") == "head_load",
+                f"load operation kind mismatch: {result}")
+    assert_true(operation.get("source") == "ace:0:1",
+                f"load operation target mismatch: {result}")
+    assert_true(event.get("previous_source") == "native:0",
+                f"load must use current source from head state: {result}")
+    assert_true(operation.get("commands") == [
+        "FEED_AUTO MODULE=left CHANNEL=1 EXTRUDER=0 UNLOAD=1",
+        "T0",
+        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+    ], f"load transition should be one business task with full command script: {result}")
+
+
+def test_operation_load_rejects_native_cross_head_profile() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {"head": 1, "material": "PLA", "color": "#dc2828"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "native:1",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 20,
+    })
+    push_graph(graph)
+    err = post_json(f"{WEB}/operation/head/load", {
+        "head": "head:0",
+        "source": "native:1",
+        "execute": False,
+    }, expect_status=409)
+    assert_true("module/channel does not match extruder" in str(err).lower(),
+                f"native cross-head operation load should be rejected: {err}")
+
+
+def test_operation_load_rejects_empty_source() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    push_graph(graph)
+    err = post_json(f"{WEB}/operation/head/load", {
+        "head": "head:1",
+        "source": "native:1",
+        "execute": False,
+    }, expect_status=409)
+    assert_true("planned source native:1 is not ready" in str(err).lower(),
+                f"empty native operation load should be rejected: {err}")
+
+
+def test_operation_auxiliary_macros_are_single_backend_operations() -> None:
+    reset_default()
+    dry = post_json(f"{WEB}/operation/ace/dry-start", {
+        "ace": 0,
+        "temp": 55,
+        "duration": 120,
+        "execute": False,
+    })
+    dry_op = dry.get("operation") or {}
+    assert_true(dry_op.get("status") == "preview",
+                f"dry start should support preview: {dry}")
+    assert_true(dry_op.get("kind") == "ace_dry_start",
+                f"dry start operation kind mismatch: {dry}")
+    assert_true(dry_op.get("commands") == ["ACE_DRY ACE=0 TEMP=55 DURATION=120"],
+                f"dry start command mismatch: {dry}")
+
+    stop = post_json(f"{WEB}/operation/ace/dry-stop", {
+        "ace": 0,
+        "execute": False,
+    })
+    stop_op = stop.get("operation") or {}
+    assert_true(stop_op.get("commands") == ["ACE_STOP_DRYING ACE=0"],
+                f"dry stop command mismatch: {stop}")
+
+    unload_all = post_json(f"{WEB}/operation/unload-all", {
+        "execute": False,
+    })
+    unload_op = unload_all.get("operation") or {}
+    assert_true(unload_op.get("kind") == "unload_all_heads",
+                f"unload-all operation kind mismatch: {unload_all}")
+    assert_true(unload_op.get("commands") == ["ACE_UNLOAD_ALL_HEADS"],
+                f"unload-all command mismatch: {unload_all}")
+
+
+def test_operation_execute_updates_current_status() -> None:
+    reset_default()
+    result = post_json(f"{WEB}/operation/ace/dry-stop", {
+        "ace": 0,
+        "execute": True,
+    })
+    op = result.get("operation") or {}
+    assert_true(op.get("kind") == "ace_dry_stop",
+                f"executed operation kind mismatch: {result}")
+    op_id = op.get("id")
+    assert_true(bool(op_id), f"executed operation must expose id: {result}")
+    current = {}
+    for _ in range(20):
+        current = request("GET", f"{WEB}/operation/current").get("operation") or {}
+        if current.get("id") == op_id and not current.get("active"):
+            break
+        time.sleep(0.2)
+    assert_true(current.get("id") == op_id,
+                f"current operation id mismatch: {current}")
+    assert_true(current.get("status") == "done",
+                f"executed operation should complete in dry-run: {current}")
+
+
+def test_direct_macro_api_blocks_operation_only_hardware_macros() -> None:
+    reset_default()
+    cases = [
+        ("/macro", {"name": "FEED_AUTO", "args": {
+            "MODULE": "left", "CHANNEL": 1, "EXTRUDER": 0, "LOAD": 1,
+        }}),
+        ("/macro-async", {"name": "ACE_DRY", "args": {
+            "ACE": 0, "TEMP": 55, "DURATION": 120,
+        }}),
+        ("/macro-batch", {"commands": [
+            {"name": "ACE_SWAP_HEAD", "args": {"HEAD": 0, "ACE": 0, "SLOT": 1}},
+        ]}),
+    ]
+    for path, payload in cases:
+        err = post_json(f"{WEB}{path}", payload, expect_status=409)
+        assert_true("/api/operation" in str(err),
+                    f"{path} should direct hardware macro users to operation API: {err}")
+
+
+def test_source_state_native_current_with_mixed_edges() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {"head": 0, "material": "PLA", "color": "#ffffff"},
+        ],
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PETG", "color": "#1e78dc"},
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    graph["edges"].append({
+        "source": "ace:0:0",
+        "head": "head:0",
+        "enabled": True,
+        "priority": 50,
+    })
+    push_graph(graph)
+    state = request("GET", f"{WEB}/source-state")
+    head0 = (state.get("heads") or {}).get("head:0") or {}
+    assert_true(head0.get("current_source") == "native:0",
+                f"native-loaded head must not become unknown just because ACE edge exists: {state}")
+    assert_true(head0.get("source_confidence") == "known",
+                f"native-loaded mixed-edge head should be known: {state}")
+
+
+def test_native_preloaded_slot_is_ready_but_head_is_empty() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": None},
+        "native_heads": [
+            {
+                "head": 0,
+                "material": "PLA",
+                "color": "#ffffff",
+                "loaded": False,
+                "preloaded": True,
+            },
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    push_graph(graph)
+    source_state = request("GET", f"{WEB}/source-state")
+    head0 = (source_state.get("heads") or {}).get("head:0") or {}
+    assert_true(head0.get("source_confidence") == "empty",
+                f"preloaded native slot must not mark the toolhead loaded: {source_state}")
+    assert_true(head0.get("current_source") in (None, ""),
+                f"preloaded native slot must not assign current_source: {source_state}")
+
+    report = multipart_upload(
+        "native-preloaded-source.gcode",
+        gcode("PLA", "#ffffff", "T0\nG1 X1 Y1 E1\n"),
+    )
+    loadout = report.get("live_loadout") or []
+    native0 = [
+        row for row in loadout
+        if row.get("source") == "native:0" and row.get("head_id") == "head:0"
+    ]
+    assert_true(native0 and native0[0].get("ready") is True,
+                f"preloaded native slot should be a ready source: {loadout}")
+    assert_true(
+        (native0[0].get("status_details") or {}).get("channel_state") == "preload_finish",
+        f"preloaded native source should keep source-slot state: {native0}")
+
+
+def test_source_preload_length_is_per_source_execution_config() -> None:
+    reset_default()
+    graph = source_graph_for({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+    })
+    graph["sources"]["native:1"]["execution"] = {"preload_length_mm": 1111}
+    graph["sources"]["ace:0:2"]["execution"] = {"preload_length_mm": 2222}
+    result = post_json(f"{WEB}/source-graph", {"graph": graph})
+    assert_true(result.get("ok"), f"source graph save failed: {result}")
+    assert_true(result.get("refresh", {}).get("result") == "ok",
+                f"source graph save should refresh Klipper cache: {result}")
+
+    saved = request("GET", f"{WEB}/source-graph")
+    sources = (saved.get("graph") or {}).get("sources") or {}
+    assert_true(
+        (sources.get("native:1") or {}).get("execution", {}).get("preload_length_mm") == 1111,
+        f"native source preload length was not preserved: {saved}")
+    assert_true(
+        (sources.get("ace:0:2") or {}).get("execution", {}).get("preload_length_mm") == 2222,
+        f"ACE source preload length was not preserved: {saved}")
+
+    preview = post_json(f"{WEB}/source-action/preview", {
+        "source": "ace:0:2",
+        "head": "head:0",
+        "action": "load",
+    })
+    assert_true(
+        (preview.get("target") or {}).get("execution", {}).get("preload_length_mm") == 2222,
+        f"target should expose source execution config: {preview}")
+
+
 def test_route_plan_rewrite_includes_source_transition() -> None:
     scenario = {
         "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
@@ -1984,6 +2279,43 @@ def test_source_state_marks_loaded_empty_ace_slot_exhausted() -> None:
         f"exhausted head should expose slot-empty reason: {validation}")
 
 
+def test_native_slot_empty_when_head_current_source_is_ace() -> None:
+    scenario = {
+        "head_modes": {"0": "native", "1": "native", "2": "native", "3": "ace"},
+        "ace_targets": {"0": 3},
+        "slots": [
+            {"ace": 0, "slot": 0, "material": "PLA", "color": "#57e389"},
+        ],
+        "head_sources": [
+            {
+                "head": 3, "ace": 0, "slot": 0, "material": "PLA",
+                "color": "#57e389", "sensor_loaded": True,
+            },
+        ],
+    }
+    set_scenario(scenario)
+    graph = source_graph_for(scenario)
+    push_graph(graph)
+    state = request("GET", f"{WEB}/source-state")
+    head3 = (state.get("heads") or {}).get("head:3") or {}
+    assert_true(head3.get("current_source") == "ace:0:0",
+                f"T3 current source should remain ACE: {state}")
+    report = multipart_upload(
+        "native-slot-empty-with-ace-head.gcode",
+        gcode("PLA;PLA", "#57e389;#57e389", "T0\nG1 X1\n"),
+    )
+    loadout = ((report.get("source_map") or {}).get("loadout") or [])
+    native3 = [
+        row for row in loadout
+        if row.get("source") == "native:3" and row.get("head_id") == "head:3"
+    ]
+    assert_true(not native3,
+                f"native:3 must stay unavailable when native slot is empty: {loadout}")
+    configured = request("GET", f"{WEB}/source-state")
+    meta = configured.get("meta") or {}
+    assert_true(not meta.get("errors"), f"source graph errors: {configured}")
+
+
 def test_route_plan_only_rewrite() -> None:
     pp = load_postprocessor()
     route_plan = {
@@ -2364,6 +2696,16 @@ def main() -> int:
         test_plugin_gcode_rejects_wrong_feed_auto_channel,
         test_source_action_profile_preview,
         test_source_transition_preview_unloads_previous_source,
+        test_operation_unload_uses_head_current_source,
+        test_operation_load_builds_single_transition_task,
+        test_operation_load_rejects_native_cross_head_profile,
+        test_operation_load_rejects_empty_source,
+        test_operation_auxiliary_macros_are_single_backend_operations,
+        test_operation_execute_updates_current_status,
+        test_direct_macro_api_blocks_operation_only_hardware_macros,
+        test_source_state_native_current_with_mixed_edges,
+        test_native_preloaded_slot_is_ready_but_head_is_empty,
+        test_source_preload_length_is_per_source_execution_config,
         test_route_plan_rewrite_includes_source_transition,
         test_route_plan_rewrite_native_to_ace_transition,
         test_route_plan_rewrite_ace_to_ace_transition,
@@ -2377,6 +2719,7 @@ def main() -> int:
         test_route_plan_rejects_stale_runtime_state,
         test_route_plan_rejects_target_source_not_ready,
         test_source_state_marks_loaded_empty_ace_slot_exhausted,
+        test_native_slot_empty_when_head_current_source_is_ace,
         test_route_plan_only_rewrite,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,

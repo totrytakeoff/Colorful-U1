@@ -184,7 +184,7 @@ def _default_source_graph(ace_count: int) -> dict[str, Any]:
         sources[f"native:{head}"] = {
             "kind": "native_feeder",
             "head": head,
-            "label": f"Native T{head}",
+            "label": f"Native Slot {head + 1}",
             "material": "",
             "brand": "",
             "subtype": "",
@@ -398,6 +398,18 @@ def _set_native_head_loaded(state: dict[str, Any], head: int) -> None:
     feed["channel_error"] = "ok"
 
 
+def _set_native_slot_preloaded(state: dict[str, Any], head: int) -> None:
+    state["ace"]["head_source"][str(head)] = None
+    module, key = _head_key(head)
+    feed = state[module][key]
+    feed["filament_detected"] = True
+    feed["filament_in_ace"] = False
+    feed["filament_in_toolhead"] = False
+    feed["filament_at_extruder"] = False
+    feed["channel_state"] = "preload_finish"
+    feed["channel_error"] = "ok"
+
+
 def _set_head_empty(state: dict[str, Any], head: int) -> None:
     state["ace"]["head_source"][str(head)] = None
     module, key = _head_key(head)
@@ -587,6 +599,8 @@ def _apply_script(script: str) -> None:
                 ptc["filament_vendor"][head] = args.get("VENDOR", "").strip('"')
                 ptc["filament_sub_type"][head] = args.get("FILAMENT_SUBTYPE", "").strip('"')
                 ptc["filament_color_rgba"][head] = args.get("FILAMENT_COLOR_RGBA", "FFFFFFFF")
+        elif cmd == "MULTIACE_REFRESH_SOURCE_GRAPH":
+            pass
     _save_state(state)
 
 
@@ -600,6 +614,7 @@ class DryRunNativeHead(BaseModel):
     vendor: str = "DryRunNative"
     subtype: str = "Basic"
     loaded: bool = True
+    preloaded: bool = False
 
 class DryRunSlot(BaseModel):
     ace: int = 0
@@ -785,6 +800,8 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail=f"invalid native head {head}")
         if native.loaded:
             _set_native_head_loaded(state, head)
+        elif native.preloaded:
+            _set_native_slot_preloaded(state, head)
         else:
             _set_head_empty(state, head)
         rgba = native.color.strip().lstrip("#")[:6].upper() or "FFFFFF"

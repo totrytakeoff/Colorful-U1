@@ -1,12 +1,12 @@
 # Colorful-U1 Frontend UI Rewrite Plan
 
-日期：2026-06-08
+日期：2026-06-09
 
 本文记录 Colorful-U1 前端 UI 重构方案。此次重构不是在旧 multiACE UI 上继续
 修改，而是基于当前后端 `source graph / source state / route plan` 架构重写
 前端。旧 UI 只作为交互思路参考，不复用旧状态模型。
 
-## 当前实现状态：2026-06-08
+## 当前实现状态：2026-06-09
 
 前端已经开始重写，并进入 dry-run 可验证阶段，但还没有达到最终 UI 质量。
 
@@ -28,6 +28,12 @@
   - print job status。
 - 上传映射页会显示 configured sources；不可用 source 可见但禁用，避免用户误以为
   source 消失。
+- 配置页 `Source 执行` 已增加 per-source 预进料长度入口：
+  - Native source preload：逐 `native:<n>` 配置；
+  - ACE source preload：逐 `ace:<ace>:<slot>` 配置；
+  - 保存到 `source_graph.json` 的 `source.execution.preload_length_mm`；
+  - 保存后重新读取 source graph/source state，并让 Klipper 刷新 source graph
+    缓存。
 - 上传映射页已经区分三段状态：
   - 上传后 resolver 未匹配全部 tool：`需要手动映射 T...`；
   - 用户已选齐 source 但尚未应用：`待应用`；
@@ -50,8 +56,8 @@
 - 自动 resolver 无法匹配全部 slicer tools 时，不能让 `route_plan=null` 表现得像
   隐式错误；应直接提示用户完成映射。
 - 控制台硬件动作的队列/弹窗交互还需要简化，常用 load/unload/swap 应保持直接。
-- 配置页需要继续区分设备通用配置、source 专属 profile、材料信息，不把耗材编辑
-  混进通用配置列表。
+- 配置页已经开始区分设备通用配置、source 专属执行参数和材料信息；后续仍需
+  继续整理 load/unload/retract/purge 等更多 source 专属参数。
 - 模型预览仍是 MVP，需要后续增强为更可信的 G-code 检查/预览入口。
 
 ## 重构目标
@@ -314,6 +320,7 @@ slot 不再表达“归属哪个头”，而表达：
 
 - `native:0` feeder 配置。
 - `ace:0:1` slot 配置。
+- preload length。
 - load length。
 - unload length。
 - swap retract length。
