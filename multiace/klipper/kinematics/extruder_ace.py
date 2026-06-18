@@ -1265,6 +1265,23 @@ class PrinterExtruder:
         if forced_park:
             action = 'PARK'
 
+        if ace is not None:
+            try:
+                target_head = getattr(self, 'extruder_num', None)
+                target_source = None
+                if target_head is not None:
+                    target_source = ace._head_source.get(target_head)
+                if target_source is None:
+                    ace._disable_feed_assist_all()
+                    logging.info(
+                        '[multiACE] switch: preemptively disabled feed_assist '
+                        'before activating native/unbound extruder %s'
+                        % (self.name,))
+            except Exception as e:
+                logging.info(
+                    '[multiACE] switch: pre-activation feed_assist stop failed: %s'
+                    % e)
+
         try:
             if (self.printer.lookup_object('homing_xyz_override', None) is not None or
                 self.printer.lookup_object('safe_z_home', None) is not None):
@@ -1448,9 +1465,6 @@ class PrinterExtruder:
                             toolhead.dwell(0.2)
                             toolhead.wait_moves()
 
-            if ace is not None:
-
-                gcmd.respond_info("ACE disable feed_assist for extruder %s" % (self.name,))
             if action == 'PARK':
                 raise ExtruderParkAction("park action success!!!")
 
@@ -1602,9 +1616,6 @@ class PrinterExtruder:
 
             if switch_complete == True:
 
-                if ace is not None:
-
-                    gcmd.respond_info("ACE enable feed_assist for extruder %s" % (self.name,))
                 gcmd.respond_info("Activating extruder %s" % (self.name,))
                 toolhead.flush_step_generation()
                 toolhead.set_extruder(self, self.last_position)

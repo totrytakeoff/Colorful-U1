@@ -348,8 +348,8 @@ label input, label select { margin-top: 6px; }
 }
 .source-execution-row {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 110px;
-  align-items: center;
+  grid-template-columns: 28px minmax(180px, .75fr) minmax(0, 1.25fr);
+  align-items: start;
   gap: 10px;
   padding: 10px;
   border: 1px solid var(--line-soft);
@@ -365,6 +365,18 @@ label input, label select { margin-top: 6px; }
   margin-top: 2px;
   color: var(--muted);
   font-size: 12px;
+}
+.source-execution-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 8px;
+}
+.source-execution-fields label {
+  display: grid;
+  gap: 4px;
+}
+.source-execution-fields input {
+  width: 100%;
 }
 .sticky-actions {
   grid-column: 1 / -1;

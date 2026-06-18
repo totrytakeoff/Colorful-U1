@@ -76,19 +76,19 @@
                   <span>{{ head.label }}</span>
                 </div>
                 <div class="tool-info">
-                  <strong>{{ head.material.material || 'Empty' }}</strong>
-                  <small>{{ head.current_source || head.confidence }}</small>
+                  <strong>{{ head.display_material }}</strong>
+                  <small>{{ head.current_source || '无已装载 source' }}</small>
                 </div>
               </button>
               <dl>
                 <div><dt>Sensor</dt><dd>{{ head.sensor_filament ? 'filament' : 'empty' }}</dd></div>
-                <div><dt>State</dt><dd><span class="chip" :class="head.confidence">{{ head.confidence }}</span></dd></div>
+                <div><dt>State</dt><dd><span class="chip" :class="head.confidence">{{ headConfidenceLabel(head) }}</span></dd></div>
                 <div><dt>Error</dt><dd>{{ head.last_error || 'ok' }}</dd></div>
               </dl>
               <div class="card-actions">
                 <button @click="openHeadPanel(head.id)">Sources</button>
-                <button @click="openHeadPanel(head.id)">Load</button>
-                <button @click="runHeadUnloadNow(head.id)" :disabled="operationBusy || head.confidence === 'empty'">Unload</button>
+                <button @click="openHeadPanel(head.id)" :disabled="['unknown','stale','failed','exhausted'].includes(head.confidence)">Load</button>
+                <button @click="runHeadUnloadNow(head.id)" :disabled="operationBusy || !head.current_source || ['empty','unknown','stale','failed'].includes(head.confidence)">Unload</button>
                 <button class="danger ghost" v-if="['unknown','stale','failed','exhausted'].includes(head.confidence)" @click="openRecovery(head.id)">Recover</button>
               </div>
             </article>
@@ -119,7 +119,7 @@
                 </span>
               </button>
               <dl>
-                <div><dt>Status</dt><dd><span class="chip" :class="sourceStatusClass(source)">{{ source.ready === true ? 'ready' : (source.ready === false ? 'not ready' : 'unknown') }}</span></dd></div>
+                <div><dt>Status</dt><dd><span class="chip" :class="sourceStatusClass(source)">{{ sourceReadyLabel(source) }}</span></dd></div>
                 <div><dt>Runtime</dt><dd>{{ sourceRuntimeDetail(source) || '-' }}</dd></div>
                 <div><dt>ID</dt><dd>{{ source.id }}</dd></div>
                 <div><dt>Heads</dt><dd>{{ source.heads.join(', ') || 'none' }}</dd></div>
@@ -127,7 +127,9 @@
               </dl>
               <div class="card-actions">
                 <button @click="openMaterialEditor(source.id)">Material</button>
-                <button @click="runSourceLoadNow(source.id)" :disabled="operationBusy || !source.heads.length || source.ready === false">Load</button>
+                <button class="danger ghost"
+                        @click="runSourceFullUnloadNow(source.id)"
+                        :disabled="operationBusy || source.ready === false">Full unload</button>
               </div>
             </article>
           </div>
@@ -297,12 +299,12 @@
           <div v-show="configTab === 'source'" class="config-grid">
             <article class="settings-card source-execution-card">
               <div class="card-title">
-                <h3>Native source preload</h3>
+                <h3>Native Slot execution</h3>
                 <span class="chip">per slot</span>
               </div>
-              <p class="muted">每个 native slot 从进料口到四通/工具头入口的预进料长度，单位 mm。</p>
+              <p class="muted">每个 Native Slot 独立配置预进料、进料辅助、回抽和完全退料参数。</p>
               <div class="source-execution-grid">
-                <label v-for="source in graphSources.filter((item) => item.kind === 'native_feeder')"
+                <div v-for="source in graphSources.filter((item) => item.kind === 'native_feeder')"
                        :key="'native-preload-' + source.id"
                        class="source-execution-row">
                   <span class="source-swatch" :style="swatchStyle(source.color)"></span>
@@ -310,21 +312,26 @@
                     <strong>{{ source.label }}</strong>
                     <small>{{ source.id }} · {{ sourceRuntimeDetail(source) || 'source config' }}</small>
                   </span>
-                  <input type="number" min="0" max="3000" step="1"
-                         :value="sourceExecutionValue(source.id, 'preload_length_mm')"
-                         @input="setSourceExecutionValue(source.id, 'preload_length_mm', $event.target.value)">
-                </label>
+                  <div class="source-execution-fields">
+                    <label v-for="field in sourceExecutionFields" :key="source.id + field.key">
+                      <small>{{ field.label }}</small>
+                      <input type="number" :min="field.min" :max="field.max" :step="field.step"
+                             :value="sourceExecutionValue(source.id, field.key)"
+                             @input="setSourceExecutionValue(source.id, field.key, $event.target.value)">
+                    </label>
+                  </div>
+                </div>
               </div>
             </article>
 
             <article class="settings-card source-execution-card">
               <div class="card-title">
-                <h3>ACE source preload</h3>
+                <h3>ACE Slot execution</h3>
                 <span class="chip">per slot</span>
               </div>
-              <p class="muted">每个 ACE slot 从 ACE 出口到四通/目标头入口的预进料长度，单位 mm；0 表示禁用自动预进料。</p>
+              <p class="muted">每个 ACE Slot 使用同一套字段；当前不支持的阶段可保持 0。</p>
               <div class="source-execution-grid">
-                <label v-for="source in graphSources.filter((item) => item.kind === 'ace_slot')"
+                <div v-for="source in graphSources.filter((item) => item.kind === 'ace_slot')"
                        :key="'ace-preload-' + source.id"
                        class="source-execution-row">
                   <span class="source-swatch" :style="swatchStyle(source.color)"></span>
@@ -332,10 +339,15 @@
                     <strong>{{ source.label }}</strong>
                     <small>{{ source.id }} · {{ sourceRuntimeDetail(source) || 'source config' }}</small>
                   </span>
-                  <input type="number" min="0" max="3000" step="1"
-                         :value="sourceExecutionValue(source.id, 'preload_length_mm')"
-                         @input="setSourceExecutionValue(source.id, 'preload_length_mm', $event.target.value)">
-                </label>
+                  <div class="source-execution-fields">
+                    <label v-for="field in sourceExecutionFields" :key="source.id + field.key">
+                      <small>{{ field.label }}</small>
+                      <input type="number" :min="field.min" :max="field.max" :step="field.step"
+                             :value="sourceExecutionValue(source.id, field.key)"
+                             @input="setSourceExecutionValue(source.id, field.key, $event.target.value)">
+                    </label>
+                  </div>
+                </div>
               </div>
               <div class="card-actions right">
                 <button @click="reloadSourceGraph">放弃 source 参数</button>
@@ -572,7 +584,11 @@
         <span>{{ materialEditor.material || '未设置' }}</span>
       </div>
       <div class="settings-grid">
-        <label>Material<input v-model="materialEditor.material" placeholder="PLA / PETG"></label>
+        <label>Material
+          <select v-model="materialEditor.material">
+            <option v-for="item in materialOptions" :key="'mat-' + item" :value="item">{{ item }}</option>
+          </select>
+        </label>
         <label>Brand<input v-model="materialEditor.brand" placeholder="Generic"></label>
         <label>Subtype<input v-model="materialEditor.subtype" placeholder="Basic / Matte"></label>
         <label>Color<input type="color" v-model="materialEditor.color"></label>
@@ -580,7 +596,6 @@
       <div class="card-actions right">
         <button @click="readMaterialFromRfid" :disabled="!materialEditor.rfid">使用 RFID</button>
         <button class="primary" @click="saveMaterialEditor(false)">保存</button>
-        <button @click="saveMaterialEditor(true)">保存并装载</button>
       </div>
     </div>
   </modal-panel>
@@ -592,11 +607,11 @@
           <span>{{ activeHeadCard.label }}</span>
         </div>
         <div>
-          <strong>{{ activeHeadCard.material.material || 'Empty' }}</strong>
-          <small>{{ activeHeadCard.current_source || activeHeadCard.confidence }}</small>
-          <dl>
-            <div><dt>Sensor</dt><dd>{{ activeHeadCard.sensor_filament ? 'filament' : 'empty' }}</dd></div>
-            <div><dt>State</dt><dd>{{ activeHeadCard.confidence }}</dd></div>
+          <strong>{{ activeHeadCard.material.material || (activeHeadCard.current_source ? '未设置耗材' : '未装载') }}</strong>
+              <small>{{ activeHeadCard.current_source || '无已装载 source' }}</small>
+              <dl>
+                <div><dt>Sensor</dt><dd>{{ activeHeadCard.sensor_filament ? 'filament' : 'empty' }}</dd></div>
+                <div><dt>State</dt><dd>{{ headConfidenceLabel(activeHeadCard) }}</dd></div>
             <div><dt>Error</dt><dd>{{ activeHeadCard.last_error || 'ok' }}</dd></div>
           </dl>
         </div>
@@ -652,7 +667,7 @@
   <modal-panel v-if="recovery.open" title="恢复指引" @close="recovery.open = false">
     <p class="notice warn">{{ recovery.message }}</p>
     <div class="card-actions right">
-      <button @click="runHeadUnloadNow(recovery.head); recovery.open = false" :disabled="operationBusy">执行退料</button>
+      <button @click="runHeadUnloadNow(recovery.head); recovery.open = false" :disabled="operationBusy">执行退料恢复</button>
       <button @click="recovery.open = false">关闭</button>
     </div>
   </modal-panel>

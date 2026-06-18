@@ -15,6 +15,7 @@ DAEMON="/usr/bin/python3"
 ARGS="-m uvicorn main:app --host 127.0.0.1 --port 7126 --log-level warning"
 PIDFILE="/tmp/multiace_web.pid"
 LOGFILE="/home/lava/printer_data/logs/multiace_web.log"
+PORT="7126"
 # Service runs as root: Snapmaker U1 ships without sudo, but the
 # update endpoint has to cp into root-owned dirs (klipper extras,
 # /etc/init.d). Closed appliance, attack surface is bound to 127.0.0.1
@@ -30,6 +31,19 @@ start() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "already running"
         return 1
+    fi
+    # A stale pidfile can leave an old uvicorn bound to the port while
+    # restart appears to succeed.  Clean only the exact multiace-web command.
+    STALE_PIDS="$(pgrep -f "uvicorn main:app --host 127.0.0.1 --port $PORT" 2>/dev/null || true)"
+    if [ -n "$STALE_PIDS" ]; then
+        echo "stale process on port $PORT"
+        kill $STALE_PIDS 2>/dev/null || true
+        sleep 1
+        STALE_PIDS="$(pgrep -f "uvicorn main:app --host 127.0.0.1 --port $PORT" 2>/dev/null || true)"
+        if [ -n "$STALE_PIDS" ]; then
+            kill -KILL $STALE_PIDS 2>/dev/null || true
+            sleep 1
+        fi
     fi
     if [ ! -d "$DAEMON_DIR" ]; then
         echo "FAIL ($DAEMON_DIR missing)"
@@ -68,9 +82,24 @@ stop() {
     if [ -f "$PIDFILE" ]; then
         start-stop-daemon -K -p "$PIDFILE" -s TERM
         rm -f "$PIDFILE"
-        echo "OK"
+    fi
+    STALE_PIDS="$(pgrep -f "uvicorn main:app --host 127.0.0.1 --port $PORT" 2>/dev/null || true)"
+    if [ -n "$STALE_PIDS" ]; then
+        kill $STALE_PIDS 2>/dev/null || true
+        sleep 1
+        STALE_PIDS="$(pgrep -f "uvicorn main:app --host 127.0.0.1 --port $PORT" 2>/dev/null || true)"
+        if [ -n "$STALE_PIDS" ]; then
+            kill -KILL $STALE_PIDS 2>/dev/null || true
+        fi
+    fi
+    if [ -f "$PIDFILE" ]; then
+        rm -f "$PIDFILE"
+    fi
+    if pgrep -f "uvicorn main:app --host 127.0.0.1 --port $PORT" >/dev/null 2>&1; then
+        echo "FAIL"
+        return 1
     else
-        echo "not running"
+        echo "OK"
     fi
 }
 

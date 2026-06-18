@@ -19,9 +19,25 @@ NATIVE_CHANNELS = {
 SOURCE_EXECUTION_DEFAULTS = {
     "native_feeder": {
         "preload_length_mm": 950,
+        "push_to_junction_length_mm": 0,
+        "load_to_toolhead_length_mm": 750,
+        "unload_to_junction_length_mm": 120,
+        "full_unload_length_mm": 950,
+        "toolhead_sync_retract_length_mm": 0,
+        "feed_speed_mm_s": 25,
+        "retract_speed_mm_s": 25,
+        "toolhead_sync_retract_speed_mm_s": 10,
     },
     "ace_slot": {
         "preload_length_mm": 0,
+        "push_to_junction_length_mm": 0,
+        "load_to_toolhead_length_mm": 0,
+        "unload_to_junction_length_mm": 0,
+        "full_unload_length_mm": 0,
+        "toolhead_sync_retract_length_mm": 0,
+        "feed_speed_mm_s": 25,
+        "retract_speed_mm_s": 25,
+        "toolhead_sync_retract_speed_mm_s": 10,
     },
 }
 
@@ -38,6 +54,8 @@ DEFAULT_PROFILES = {
             "requires_current_source": True,
             "clears_current_source": True,
         },
+        "retract": None,
+        "full_unload": None,
         "swap": {
             "command": "ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}",
             "requires_routed_edge": True,
@@ -59,7 +77,17 @@ DEFAULT_PROFILES = {
         "unload": {
             "command": "FEED_AUTO MODULE={module} CHANNEL={channel} EXTRUDER={head} UNLOAD=1",
             "requires_current_source": True,
+            "clears_current_source": False,
+        },
+        "retract": {
+            "command": "FEED_AUTO_RETRACT MODULE={module} CHANNEL={channel} EXTRUDER={head} LENGTH={unload_to_junction_length_mm} SPEED={retract_speed_mm_s} SYNC_LENGTH={toolhead_sync_retract_length_mm} SYNC_SPEED={toolhead_sync_retract_speed_mm_s}",
+            "requires_current_source": True,
             "clears_current_source": True,
+        },
+        "full_unload": {
+            "command": "FEED_AUTO_FULL_UNLOAD MODULE={module} CHANNEL={channel} EXTRUDER={head} LENGTH={full_unload_length_mm} SPEED={retract_speed_mm_s}",
+            "requires_current_source": False,
+            "clears_current_source": False,
         },
         "swap": None,
         "capabilities": {
@@ -239,6 +267,20 @@ def _merge_defaults(value: Any, defaults: Any) -> Any:
     return deepcopy(value)
 
 
+def _normalize_builtin_profile(existing: Any, default: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(existing, dict):
+        return deepcopy(default)
+    out = deepcopy(existing)
+    for key, value in default.items():
+        # Built-in profile execution semantics are a backend/Klipper contract.
+        # Old source_graph.json files may carry obsolete action flags such as
+        # native unload clears_current_source=True; those must not survive
+        # normalization.  Unknown extension keys are preserved at the profile
+        # top level only.
+        out[key] = deepcopy(value)
+    return out
+
+
 def _normalize_source_labels(sources: dict[str, Any]) -> None:
     for source_id, source in sources.items():
         if not isinstance(source, dict):
@@ -265,10 +307,8 @@ def normalize_graph(graph: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("edges", [])
     profiles = out.setdefault("profiles", {})
     for profile_id, profile in DEFAULT_PROFILES.items():
-        if profile_id in profiles:
-            profiles[profile_id] = _merge_defaults(profiles[profile_id], profile)
-        else:
-            profiles[profile_id] = deepcopy(profile)
+        profiles[profile_id] = _normalize_builtin_profile(
+            profiles.get(profile_id), profile)
     if isinstance(sources, dict):
         for source in sources.values():
             if not isinstance(source, dict):
@@ -341,7 +381,20 @@ def validate_graph(graph: dict[str, Any]) -> tuple[list[str], list[str]]:
             errors.append(f"{source_id}: execution must be an object")
             execution = {}
         if isinstance(execution, dict):
-            for key in ("preload_length_mm",):
+            length_keys = (
+                "preload_length_mm",
+                "push_to_junction_length_mm",
+                "load_to_toolhead_length_mm",
+                "unload_to_junction_length_mm",
+                "full_unload_length_mm",
+                "toolhead_sync_retract_length_mm",
+            )
+            speed_keys = (
+                "feed_speed_mm_s",
+                "retract_speed_mm_s",
+                "toolhead_sync_retract_speed_mm_s",
+            )
+            for key in length_keys:
                 if key not in execution or execution.get(key) in (None, ""):
                     continue
                 try:
@@ -351,6 +404,16 @@ def validate_graph(graph: dict[str, Any]) -> tuple[list[str], list[str]]:
                     continue
                 if value < 0 or value > 3000:
                     errors.append(f"{source_id}: execution.{key} must be 0..3000")
+            for key in speed_keys:
+                if key not in execution or execution.get(key) in (None, ""):
+                    continue
+                try:
+                    value = float(execution.get(key))
+                except (TypeError, ValueError):
+                    errors.append(f"{source_id}: execution.{key} must be a number")
+                    continue
+                if value <= 0 or value > 120:
+                    errors.append(f"{source_id}: execution.{key} must be >0..120")
         if not profile_id or not isinstance(profile, dict):
             errors.append(f"{source_id}: execution_profile {profile_id!r} missing")
         elif profile.get("kind") != kind:
@@ -490,17 +553,73 @@ def _native_channel_for_source(source: dict[str, Any]) -> dict[str, Any]:
     return {"module": module, "channel": channel}
 
 
-def _source_for_loaded_toolhead(graph: dict[str, Any], parsed: dict[str, Any],
-                                head: int) -> str | None:
+def _enabled_edge_exists(graph: dict[str, Any], source_id: str,
+                         head_id: str) -> bool:
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or not edge.get("enabled", True):
+            continue
+        if edge.get("source") == source_id and edge.get("head") == head_id:
+            return True
+    return False
+
+
+def _ace_source_for_toolhead(parsed: dict[str, Any], head: int) -> str | None:
     th = _head_sensor(parsed, head)
+    if th.get("load_failed"):
+        return None
     if th.get("head_source_known"):
         try:
             return "ace:%d:%d" % (int(th.get("ace")), int(th.get("slot")))
         except (TypeError, ValueError):
             return None
+    return None
+
+
+def _authoritative_source_for_toolhead(
+        graph: dict[str, Any],
+        head_sources: dict[str, Any] | None,
+        head: int) -> tuple[bool, str | None]:
+    """Return an explicit Web-side head source record.
+
+    The boolean means "a record exists".  A record with source=None is
+    meaningful: it suppresses legacy sensor guessing so an unknown loaded
+    head stays unknown until the user recovers it.
+    """
+    if not isinstance(head_sources, dict):
+        return False, None
+    head_id = f"head:{head}"
+    if head_id in head_sources:
+        raw = head_sources.get(head_id)
+    elif str(head) in head_sources:
+        raw = head_sources.get(str(head))
+    elif head in head_sources:
+        raw = head_sources.get(head)
+    else:
+        return False, None
+    source_id = raw.get("source") if isinstance(raw, dict) else raw
+    if source_id in (None, ""):
+        return True, None
+    source_id = str(source_id)
+    if source_id not in (graph.get("sources") or {}):
+        return True, None
+    if not _enabled_edge_exists(graph, source_id, head_id):
+        return True, None
+    return True, source_id
+
+
+def _fallback_source_for_loaded_toolhead(graph: dict[str, Any],
+                                         parsed: dict[str, Any],
+                                         head: int) -> str | None:
+    th = _head_sensor(parsed, head)
     if th.get("filament_at_extruder") and th.get("filament_in_ace"):
         return None
     if th.get("filament_at_extruder") and not th.get("filament_in_ace"):
+        channel_error = th.get("channel_error")
+        channel_state = str(th.get("channel_state") or "")
+        if channel_error not in (None, "", "ok"):
+            return None
+        if channel_state not in ("load_finish", "preload_finish", "unload_finish"):
+            return None
         head_id = f"head:{head}"
         native_sources = []
         sources = graph.get("sources") or {}
@@ -518,7 +637,8 @@ def _source_for_loaded_toolhead(graph: dict[str, Any], parsed: dict[str, Any],
     return None
 
 
-def source_state(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+def source_state(graph: dict[str, Any], parsed: dict[str, Any],
+                 head_sources: dict[str, Any] | None = None) -> dict[str, Any]:
     heads_state: dict[str, Any] = {}
     sources_runtime = runtime_sources(graph, parsed)
     for head_id, head in (graph.get("heads") or {}).items():
@@ -527,15 +647,42 @@ def source_state(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any
         except (TypeError, ValueError):
             continue
         th = _head_sensor(parsed, idx)
-        sensor = bool(th.get("filament_at_extruder"))
-        current = _source_for_loaded_toolhead(graph, parsed, idx)
+        sensor = (
+            bool(th.get("filament_in_toolhead"))
+            or bool(th.get("filament_at_extruder"))
+        )
         load_failed = bool(th.get("load_failed"))
+        active_failure = load_failed and (
+            sensor
+            or bool(th.get("filament_in_toolhead"))
+            or bool(th.get("filament_at_extruder"))
+            or str(th.get("channel_state") or "") not in ("", "wait_insert", "inited", "test")
+            or str(th.get("channel_error") or "") not in ("", "ok")
+        )
+        current = None
+        if not (load_failed and not active_failure):
+            current = _ace_source_for_toolhead(parsed, idx)
+            if current is None:
+                explicit, explicit_source = _authoritative_source_for_toolhead(
+                    graph, head_sources, idx)
+                if explicit:
+                    current = explicit_source
+                else:
+                    current = _fallback_source_for_loaded_toolhead(
+                        graph, parsed, idx)
         current_runtime = sources_runtime.get(current or "") or {}
         current_unready = (
             bool(current) and current_runtime.get("ready") is False)
-        if load_failed:
+        current_source = (graph.get("sources") or {}).get(current or "") or {}
+        current_kind = current_source.get("kind")
+        current_details = current_runtime.get("status_details") or {}
+        current_channel_error = current_details.get("channel_error")
+        current_has_error = current_channel_error not in (None, "", "ok")
+        if active_failure and (sensor or current):
             confidence = "failed"
-        elif sensor and current_unready:
+        elif sensor and current_unready and current_has_error:
+            confidence = "failed"
+        elif sensor and current_unready and current_kind == "ace_slot":
             confidence = "exhausted"
         elif sensor and current:
             confidence = "known"
@@ -544,7 +691,7 @@ def source_state(graph: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any
         elif (not sensor) and current:
             confidence = "stale"
         else:
-            confidence = "empty"
+            confidence = "unknown" if sensor else "empty"
         heads_state[head_id] = {
             "head": head_id,
             "index": idx,

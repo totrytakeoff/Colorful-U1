@@ -6,6 +6,10 @@
 修改，而是基于当前后端 `source graph / source state / route plan` 架构重写
 前端。旧 UI 只作为交互思路参考，不复用旧状态模型。
 
+进退料执行语义见：
+`multiace/docs/unified_slot_toolhead_flow.md`。前端所有硬件操作入口必须遵守
+该文档里的 source slot / toolhead 职责拆分。
+
 ## 当前实现状态：2026-06-09
 
 前端已经开始重写，并进入 dry-run 可验证阶段，但还没有达到最终 UI 质量。
@@ -51,11 +55,19 @@
 仍需收口：
 
 - 当前 UI 仍偏工程调试态，视觉和交互层级需要继续打磨。
+- 控制台需要重新拆分 source slot 与 toolhead 操作语义：
+  - Source 卡片只做耗材信息、source 状态、执行参数、完全退料。
+  - Toolhead 卡片才负责 Load / Unload / Swap 主流程。
+  - Unload 不允许选择 source，只能退当前 head 的 `current_source`。
+  - `native:<n>` 在 UI 中应显示为 `Native Slot N`，不能显示成容易和工具头混淆的
+    `native Tn`。
 - 上传页还需要继续增强 G-code 被安全校验拒绝、route plan stale、source graph
   hash 变化等状态的视觉提示。
 - 自动 resolver 无法匹配全部 slicer tools 时，不能让 `route_plan=null` 表现得像
   隐式错误；应直接提示用户完成映射。
-- 控制台硬件动作的队列/弹窗交互还需要简化，常用 load/unload/swap 应保持直接。
+- 控制台硬件动作的队列/弹窗交互需要移除或隐式化。常用 load/unload/swap 应保持
+  直接：用户选定 source/head 后立即调用后端单 operation，后端用 active operation
+  lock 防止并发；前端不再维护可见队列。
 - 配置页已经开始区分设备通用配置、source 专属执行参数和材料信息；后续仍需
   继续整理 load/unload/retract/purge 等更多 source 专属参数。
 - 模型预览仍是 MVP，需要后续增强为更可信的 G-code 检查/预览入口。
@@ -181,7 +193,11 @@ empty/load 处理。
 
 - 不显示 `native / ace mode` 下拉框。
 - 点击卡片打开详情面板。
-- 动作执行前显示 route/source action preview。
+- Load：用户选择目标 source 后执行；source 必须来自该 head 可达 source 列表。
+- Unload：不允许选择 source，后端使用该 head 的 `current_source`。
+- Swap：用户选择目标 source，后端负责退当前 source 并装载目标 source。
+- 动作执行前可显示 route/source action preview，但执行必须是一个后端 operation，
+  不是前端排队的多个小动作。
 - `unknown/stale/failed/exhausted` 状态阻止自动动作，并显示恢复指引。
 
 ### Source 卡片
@@ -195,10 +211,13 @@ empty/load 处理。
 每张 source 卡片显示：
 
 - source id。
-- 类型：Native feeder / ACE slot。
+- 类型：Native Slot / ACE Slot。
 - 可达 heads。
 - 耗材信息。
-- ready / empty / loaded / error / exhausted。
+- presence。
+- slot_state。
+- path_position。
+- ready / empty / error / exhausted。
 - execution profile。
 - 回抽配置摘要。
 
@@ -210,6 +229,19 @@ empty/load 处理。
 - Loaded。
 - Empty。
 - Error。
+
+动作：
+
+- 编辑耗材信息。
+- 编辑 source 执行参数。
+- 完全退料。
+- source recovery。
+
+禁止：
+
+- 不在 Source 卡片上执行“进某个工具头”的完整 load。
+- 不在 Source 卡片上表达 loaded toolhead；工具头 loaded 状态只显示在
+  Toolhead 卡片中。
 
 ### ACE 管理
 
@@ -321,9 +353,11 @@ slot 不再表达“归属哪个头”，而表达：
 - `native:0` feeder 配置。
 - `ace:0:1` slot 配置。
 - preload length。
-- load length。
-- unload length。
-- swap retract length。
+- push to junction length。
+- load to toolhead length。
+- unload to junction length。
+- full unload length。
+- feed/retract speed。
 - feed assist 参数。
 - 温度策略。
 - purge/prime 参数。
@@ -333,6 +367,7 @@ slot 不再表达“归属哪个头”，而表达：
 
 - 不和打印机通用配置混在一个列表中。
 - 明确标识该配置影响哪个 source。
+- source 配置只影响 source slot 侧动作，不代表工具头已装载。
 - 危险配置需要说明影响范围。
 
 ### Execution Profiles
@@ -518,7 +553,12 @@ slot 不再表达“归属哪个头”，而表达：
 ## 安全交互要求
 
 - 配置保存不自动执行硬件动作。
-- 硬件动作前显示命令预览。
+- 硬件动作前显示命令预览或阶段摘要。
+- 同一时刻只展示一个 active operation；新动作在 busy 时禁用。
+- 前端不再提供可见操作队列的 clear/隐藏语义，避免用户误以为能取消已经发出的
+  硬件动作。
+- Source 卡片的完全退料必须在 source 未被任何 toolhead 装载时才可点击。
+- Toolhead unload 不允许用户选择 source。
 - 打印发送前强制 route plan validate。
 - source graph 保存后提示旧 route plan 失效。
 - `unknown/stale/failed/exhausted` 必须阻止自动动作。

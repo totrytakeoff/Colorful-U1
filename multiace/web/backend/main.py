@@ -72,6 +72,10 @@ MULTIACE_SOURCE_GRAPH_PATH = os.environ.get(
     "MULTIACE_SOURCE_GRAPH_PATH",
     "/home/lava/printer_data/config/extended/multiace/source_graph.json",
 )
+MULTIACE_HEAD_SOURCE_STATE_PATH = os.environ.get(
+    "MULTIACE_HEAD_SOURCE_STATE_PATH",
+    "/home/lava/printer_data/config/extended/multiace/head_source_state.json",
+)
 DEFAULT_MATERIALS = [
     "PLA", "PLA+", "PLA-CF",
     "PETG", "PETG-CF", "PETG-HF",
@@ -132,6 +136,7 @@ ACE_OBJECTS = [
     "ace",
     "filament_feed left",
     "filament_feed right",
+    "toolhead",
     "save_variables",
     "print_task_config",
     "print_stats",
@@ -165,10 +170,26 @@ def _resolve_head_source(src: Any) -> tuple[int | None, int | None]:
 def _head_source_load_failed(src: Any) -> bool:
     return isinstance(src, dict) and bool(src.get("load_failed"))
 
+def _toolhead_load_failed_active(t: dict) -> bool:
+    if not isinstance(t, dict) or not bool(t.get("load_failed")):
+        return False
+    if bool(t.get("filament_at_extruder")):
+        return True
+    if bool(t.get("filament_in_toolhead")):
+        return True
+    channel_error = t.get("channel_error")
+    channel_state = str(t.get("channel_state") or "")
+    if channel_error not in (None, "", "ok"):
+        return True
+    if channel_state and channel_state not in ("wait_insert", "inited", "test"):
+        return not (channel_state.endswith("_finish")
+                    or channel_state.endswith("_fail"))
+    return False
+
 def _load_failed_toolheads(parsed: dict) -> list[dict]:
     return [
         t for t in (parsed.get("toolheads") or [])
-        if isinstance(t, dict) and t.get("load_failed")
+        if _toolhead_load_failed_active(t)
     ]
 
 def _load_failed_message(t: dict) -> str:
@@ -191,7 +212,7 @@ def _color_to_hex(c: Any) -> str | None:
         return None
     return f"#{r:02x}{g:02x}{b:02x}"
 
-def _parse_state(status: dict) -> dict:
+def _parse_state(status: dict, source_graph_overlay: bool = False) -> dict:
     """
     Translate the raw multi-object status block into the dashboard schema.
 
@@ -474,7 +495,14 @@ def _parse_state(status: dict) -> dict:
                     brand = slot_obj.get("brand", "")
                     sku = slot_obj.get("sku", "")
         else:
-            meta = (_native_override_at(t) if mode == "native" else None) or _ptc_at(t)
+            native_path_loaded = (
+                bool(feed.get("filament_detected"))
+                and not bool(feed.get("filament_in_ace"))
+            )
+            meta = (
+                (_native_override_at(t) if mode == "native" or native_path_loaded else None)
+                or _ptc_at(t)
+            )
             if meta:
                 color = meta.get("color")
                 material = meta.get("material", "")
@@ -531,7 +559,7 @@ def _parse_state(status: dict) -> dict:
         printer_state = "busy" if raw_it == "printing" else raw_it
     language = sv_vars.get("ace__language", os.environ.get("MULTIACE_LANGUAGE", "en"))
     idx_base = _read_display_index_base()
-    return {
+    parsed = {
         "ace_status":         ace.get("status"),
         "ace_temp":           ace.get("temp"),
         "printer_state":      printer_state,
@@ -552,9 +580,127 @@ def _parse_state(status: dict) -> dict:
         "swap_in_progress":   bool(ace.get("swap_in_progress", False)),
         "aces":               aces_out,
         "toolheads":          toolheads,
+        "toolhead":           status.get("toolhead", {}) or {},
         "wiring":             wiring,
         "save_variables":     sv_vars,
     }
+    if source_graph_overlay:
+        _apply_source_graph_toolhead_overlay(parsed)
+    return parsed
+
+def _apply_source_graph_toolhead_overlay(parsed: dict) -> None:
+    """Make dashboard toolhead state follow the source graph, not legacy route.
+
+    Klipper still exposes ace.route.head_modes for older screens and saved
+    configs.  The Colorful-U1 runtime source-of-truth is the source graph plus
+    the runtime source-state attribution, so the dashboard must not display a
+    native-loaded head as ACE just because a stale legacy mode says so.
+    """
+    try:
+        graph, _meta = _load_source_graph(parsed)
+        state = _source_state_for_parsed(graph, parsed)
+        sources = sg.runtime_sources(graph, parsed)
+    except Exception:
+        return
+    topology: dict[str, dict[str, Any]] = {}
+    for head_id in (graph.get("heads") or {}).keys():
+        topology[str(head_id)] = {"sources": [], "kinds": set()}
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("enabled", True) is False:
+            continue
+        head_id = str(edge.get("head") or "")
+        source_id = str(edge.get("source") or "")
+        source = (graph.get("sources") or {}).get(source_id) or {}
+        entry = topology.setdefault(head_id, {"sources": [], "kinds": set()})
+        entry["sources"].append(source_id)
+        if source.get("kind"):
+            entry["kinds"].add(source.get("kind"))
+    legacy_route = parsed.get("route") if isinstance(parsed.get("route"), dict) else {}
+    parsed["legacy_route"] = legacy_route
+    parsed["route"] = {
+        "mode": "source_graph",
+        "source_graph_hash": sg.graph_hash(graph),
+        "heads": {
+            head_id: {
+                "sources": list(entry.get("sources") or []),
+                "source_kinds": sorted(entry.get("kinds") or []),
+            }
+            for head_id, entry in sorted(topology.items())
+        },
+    }
+    heads_state = state.get("heads") or {}
+    for toolhead in parsed.get("toolheads", []) or []:
+        try:
+            idx = int(toolhead.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        head_id = f"head:{idx}"
+        runtime = heads_state.get(head_id) or {}
+        source_id = runtime.get("current_source")
+        source = (graph.get("sources") or {}).get(source_id or "") or {}
+        toolhead["current_source"] = source_id
+        toolhead["source_confidence"] = (
+            runtime.get("source_confidence") or "unknown")
+        toolhead["source_ready"] = runtime.get("source_ready")
+        toolhead["source_ready_reason"] = runtime.get("source_ready_reason") or ""
+        toolhead["route_managed"] = bool(
+            (topology.get(head_id) or {}).get("sources"))
+        if source_id:
+            kind = source.get("kind")
+            toolhead["mode"] = "native" if kind == "native_feeder" else "ace"
+            if kind == "ace_slot":
+                try:
+                    toolhead["ace"] = int(source.get("ace"))
+                    toolhead["slot"] = int(source.get("slot"))
+                except (TypeError, ValueError):
+                    toolhead["ace"] = None
+                    toolhead["slot"] = None
+                toolhead["head_source_known"] = True
+            elif kind == "native_feeder":
+                toolhead["ace"] = None
+                toolhead["slot"] = None
+                toolhead["head_source_known"] = False
+        else:
+            kinds = (topology.get(head_id) or {}).get("kinds") or set()
+            toolhead["mode"] = (
+                "mixed" if len(kinds) > 1
+                else "ace" if "ace_slot" in kinds
+                else "native")
+            toolhead["ace"] = None
+            toolhead["slot"] = None
+            toolhead["head_source_known"] = False
+        if source_id:
+            runtime_source = sources.get(source_id) or {}
+            color = runtime_source.get("color")
+            material = runtime_source.get("material")
+            brand = runtime_source.get("brand")
+            subtype = runtime_source.get("subtype")
+            source = (graph.get("sources") or {}).get(source_id or "") or {}
+            if source.get("kind") == "native_feeder":
+                native_head = source.get("head")
+                try:
+                    native_head = int(native_head)
+                except (TypeError, ValueError):
+                    native_head = idx
+                meta = _native_override_meta_at(native_head)
+                if meta:
+                    color = color or meta.get("color")
+                    material = material or meta.get("material")
+                    brand = brand or meta.get("brand")
+                    subtype = subtype or meta.get("sku")
+            if color:
+                toolhead["color"] = color
+            if material:
+                toolhead["material"] = material
+            if brand:
+                toolhead["brand"] = brand
+            if subtype:
+                toolhead["sku"] = subtype
+        elif not bool(toolhead.get("filament_at_extruder")):
+            toolhead["color"] = None
+            toolhead["material"] = ""
+            toolhead["brand"] = ""
+            toolhead["sku"] = ""
 
 async def _query_state() -> dict:
     qs = "&".join(o.replace(" ", "%20") for o in ACE_OBJECTS)
@@ -625,6 +771,10 @@ class HeadUnloadRequest(BaseModel):
     head: str | int
     execute: bool = True
 
+class SourceFullUnloadRequest(BaseModel):
+    source: str
+    execute: bool = True
+
 class AceDryStartRequest(BaseModel):
     ace: int
     temp: int | float | None = None
@@ -650,9 +800,12 @@ OPERATION_ONLY_MACROS = {
     "ACE_UNLOAD_HEAD",
     "ACE_SWAP_HEAD",
     "ACE_UNLOAD_ALL_HEADS",
+    "ACE_STOP_TRANSPORT",
     "ACE_DRY",
     "ACE_STOP_DRYING",
     "FEED_AUTO",
+    "FEED_AUTO_RETRACT",
+    "FEED_AUTO_FULL_UNLOAD",
 }
 
 OBSOLETE_ACE_CONFIG_KEYS = {
@@ -740,6 +893,68 @@ def _validate_feed_auto_args(args: dict[str, Any] | None) -> None:
             status_code=400,
             detail="FEED_AUTO STAGE must be prepare, doing or cancel")
 
+def _validate_feed_slot_motion_args(
+        macro: str,
+        args: dict[str, Any] | None,
+) -> None:
+    a = {str(k).upper(): v for k, v in (args or {}).items()}
+    allowed = {
+        "MODULE", "CHANNEL", "EXTRUDER", "LENGTH", "SPEED",
+        "SYNC_LENGTH", "SYNC_SPEED",
+    }
+    extra = sorted(set(a.keys()) - allowed)
+    if extra:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{macro} rejects unsupported argument(s): {', '.join(extra)}")
+    for key in ("MODULE", "CHANNEL", "EXTRUDER", "LENGTH"):
+        if key not in a:
+            raise HTTPException(status_code=400, detail=f"{macro} requires {key}")
+    module = str(a.get("MODULE") or "").lower()
+    if module not in ("left", "right"):
+        raise HTTPException(status_code=400, detail=f"{macro} MODULE must be left or right")
+    try:
+        channel = int(a.get("CHANNEL"))
+        extruder = int(a.get("EXTRUDER"))
+        length = float(a.get("LENGTH"))
+        speed = float(a.get("SPEED", 25))
+        sync_length = float(a.get("SYNC_LENGTH", 0))
+        sync_speed = float(a.get("SYNC_SPEED", 10))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{macro} CHANNEL/EXTRUDER/LENGTH/SPEED/SYNC_LENGTH/"
+                "SYNC_SPEED must be numeric"))
+    if channel not in (0, 1) or extruder not in (0, 1, 2, 3):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{macro} CHANNEL must be 0..1 and EXTRUDER must be 0..3")
+    expected = {
+        0: ("left", 1),
+        1: ("left", 0),
+        2: ("right", 0),
+        3: ("right", 1),
+    }.get(extruder)
+    if expected != (module, channel):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{macro} module/channel does not match EXTRUDER; "
+                f"T{extruder} expects MODULE={expected[0]} CHANNEL={expected[1]}"))
+    if length < 0 or length > 3000:
+        raise HTTPException(status_code=400, detail=f"{macro} LENGTH must be 0..3000")
+    if speed <= 0 or speed > 120:
+        raise HTTPException(status_code=400, detail=f"{macro} SPEED must be >0..120")
+    if sync_length < 0 or sync_length > 3000:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{macro} SYNC_LENGTH must be 0..3000")
+    if sync_speed <= 0 or sync_speed > 120:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{macro} SYNC_SPEED must be >0..120")
+
 def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
     macro = str(name or "").strip().upper()
     if macro in OBSOLETE_MACROS_BLOCKED:
@@ -758,6 +973,8 @@ def _validate_macro_request(name: str, args: dict[str, Any] | None) -> None:
         _validate_plan_arg(macro, None if args is None else args.get("PLAN", args.get("plan")))
     if macro == "FEED_AUTO":
         _validate_feed_auto_args(args)
+    if macro in ("FEED_AUTO_RETRACT", "FEED_AUTO_FULL_UNLOAD"):
+        _validate_feed_slot_motion_args(macro, args)
 
 def _validate_direct_macro_request(name: str, args: dict[str, Any] | None) -> None:
     _validate_macro_request(name, args)
@@ -858,6 +1075,13 @@ def _validate_gcode_script(script: str) -> None:
                 raise HTTPException(
                     status_code=e.status_code,
                     detail=f"line {lineno}: {e.detail}")
+        if macro in ("FEED_AUTO_RETRACT", "FEED_AUTO_FULL_UNLOAD"):
+            try:
+                _validate_feed_slot_motion_args(macro, gcode_args)
+            except HTTPException as e:
+                raise HTTPException(
+                    status_code=e.status_code,
+                    detail=f"line {lineno}: {e.detail}")
         if macro not in EXPLICIT_ROUTE_MACROS:
             continue
         keys = set(gcode_args.keys())
@@ -899,6 +1123,92 @@ async def _mr_post(path: str, body: dict | None = None, timeout: float = 30.0) -
         r = await client.post(f"{MOONRAKER_URL}{path}", json=body or {})
         r.raise_for_status()
         return r.json()
+
+async def _mr_gcode(command: str, timeout: float | None = None) -> dict:
+    return await _mr_post(
+        "/printer/gcode/script",
+        {"script": command},
+        timeout=timeout,
+    )
+
+def _homed_axes_from_parsed(parsed: dict) -> set[str]:
+    raw = ((parsed or {}).get("toolhead") or {}).get("homed_axes")
+    if isinstance(raw, str):
+        return {ch.lower() for ch in raw if ch.strip()}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(ch).lower() for ch in raw}
+    return set()
+
+def _requires_ace_motion_homed_axes(route_plan: dict) -> bool:
+    for command in route_plan.get("commands") or []:
+        macro = str(command or "").strip().split(None, 1)[0].upper()
+        if macro in ("ACE_LOAD_HEAD", "ACE_SWAP_HEAD"):
+            return True
+    return False
+
+def _route_plan_includes_home_axes(route_plan: dict) -> bool:
+    for event in route_plan.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        for step in event.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            if step.get("kind") != "home_axes":
+                continue
+            if str(step.get("command") or "").strip().upper() == "G28":
+                return True
+    return False
+
+def _printer_idle_for_auto_home(parsed: dict) -> bool:
+    state = str((parsed or {}).get("printer_state") or "").lower()
+    return state in ("", "idle", "standby", "ready")
+
+def _validate_operation_printer_motion_ready(
+        route_plan: dict,
+        parsed: dict,
+) -> list[str]:
+    if not _requires_ace_motion_homed_axes(route_plan):
+        return []
+    homed = _homed_axes_from_parsed(parsed)
+    missing = [axis for axis in ("x", "y", "z") if axis not in homed]
+    if not missing:
+        return []
+    if _route_plan_includes_home_axes(route_plan):
+        if _printer_idle_for_auto_home(parsed):
+            return []
+        return [
+            "ACE load/swap requires homed axes, but printer state is %s. "
+            "Automatic homing is only allowed while idle."
+            % ((parsed or {}).get("printer_state") or "unknown")
+        ]
+    return [
+        "ACE load/swap requires homed axes before moving the saved toolhead "
+        "position. Home %s first, then retry."
+        % "".join(axis.upper() for axis in missing)
+    ]
+
+def _auto_home_step_if_needed(route_plan: dict, parsed: dict) -> dict | None:
+    if not _requires_ace_motion_homed_axes(route_plan):
+        return None
+    missing = [axis for axis in ("x", "y", "z")
+               if axis not in _homed_axes_from_parsed(parsed)]
+    if not missing:
+        return None
+    if not _printer_idle_for_auto_home(parsed):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "ACE load/swap requires homed axes, but printer state is %s. "
+                "Automatic homing is only allowed while idle."
+                % ((parsed or {}).get("printer_state") or "unknown")
+            ),
+        )
+    return {
+        "kind": "home_axes",
+        "command": "G28",
+        "axes": "".join(axis.upper() for axis in missing),
+        "reason": "ace_load_swap_requires_homed_axes",
+    }
 
 @app.get("/api/health")
 async def health() -> dict:
@@ -1019,6 +1329,115 @@ def _ace_count_from_parsed(parsed: dict) -> int:
     except Exception:
         return 1
 
+def _head_source_state_path() -> Path:
+    return Path(MULTIACE_HEAD_SOURCE_STATE_PATH)
+
+def _empty_head_source_state() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "heads": {},
+        "updated_at": 0.0,
+    }
+
+def _read_head_source_state() -> dict[str, Any]:
+    path = _head_source_state_path()
+    if not path.is_file():
+        return _empty_head_source_state()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return _empty_head_source_state()
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return _empty_head_source_state()
+    heads = data.get("heads")
+    if not isinstance(heads, dict):
+        data["heads"] = {}
+    return data
+
+def _write_head_source_state(state: dict[str, Any]) -> None:
+    normalized = _empty_head_source_state()
+    normalized.update({
+        "version": 1,
+        "heads": state.get("heads") if isinstance(state.get("heads"), dict) else {},
+        "updated_at": time.time(),
+    })
+    path = _head_source_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(normalized, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+def _record_head_source(head_id: str | int, source_id: str | None,
+                        *, reason: str = "operation") -> None:
+    head_idx = _head_index_from_id(head_id)
+    if head_idx is None:
+        return
+    state = _read_head_source_state()
+    heads = state.setdefault("heads", {})
+    key = f"head:{head_idx}"
+    if source_id:
+        heads[key] = {
+            "source": str(source_id),
+            "reason": reason,
+            "updated_at": time.time(),
+        }
+    else:
+        heads.pop(key, None)
+    _write_head_source_state(state)
+
+def _ace_head_sources_from_parsed(parsed: dict) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for th in parsed.get("toolheads", []) or []:
+        try:
+            head = int(th.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        if not th.get("head_source_known"):
+            continue
+        try:
+            out[f"head:{head}"] = {
+                "source": "ace:%d:%d" % (int(th.get("ace")), int(th.get("slot"))),
+                "reason": "ace_head_source",
+                "updated_at": time.time(),
+            }
+        except (TypeError, ValueError):
+            continue
+    return out
+
+def _head_source_records_for_state(graph: dict, parsed: dict) -> dict[str, Any]:
+    records = _read_head_source_state().get("heads") or {}
+    out = {
+        str(head_id): value
+        for head_id, value in records.items()
+        if isinstance(value, dict)
+    }
+    out.update(_ace_head_sources_from_parsed(parsed))
+    graph_heads = set((graph.get("heads") or {}).keys())
+    graph_sources = graph.get("sources") or {}
+    for head_id in list(out.keys()):
+        if head_id not in graph_heads:
+            out.pop(head_id, None)
+            continue
+        source_id = (out.get(head_id) or {}).get("source")
+        if source_id and source_id not in graph_sources:
+            out.pop(head_id, None)
+    return out
+
+def _source_state_for_parsed(graph: dict, parsed: dict) -> dict:
+    state = sg.source_state(
+        graph,
+        parsed,
+        head_sources=_head_source_records_for_state(graph, parsed),
+    )
+    state["head_source_store"] = {
+        "path": MULTIACE_HEAD_SOURCE_STATE_PATH,
+        "heads": _head_source_records_for_state(graph, parsed),
+    }
+    return state
+
 def _load_source_graph(parsed: dict | None = None) -> tuple[dict, dict]:
     return sg.load_graph(
         MULTIACE_SOURCE_GRAPH_PATH,
@@ -1114,6 +1533,8 @@ def _candidate_score(want_mat: str, want_color: str,
             return 0, 0.0, "material_color"
         if mat_match and fuzzy_color:
             return 1, float(dist), "material_fuzzy"
+        if mat_match and dist is not None:
+            return 4, float(dist), "material_nearest_color"
         if exact_color:
             return 2, 0.0, "color"
         if fuzzy_color:
@@ -1618,12 +2039,26 @@ def _profile_step(
         "ace": target.get("ace"),
         "slot": target.get("slot"),
     }
+    execution = target.get("execution") if isinstance(target.get("execution"), dict) else {}
+    for key in (
+            "preload_length_mm",
+            "push_to_junction_length_mm",
+            "load_to_toolhead_length_mm",
+            "unload_to_junction_length_mm",
+            "full_unload_length_mm",
+            "toolhead_sync_retract_length_mm",
+            "feed_speed_mm_s",
+            "retract_speed_mm_s",
+            "toolhead_sync_retract_speed_mm_s"):
+        values[key] = execution.get(key, "")
     command = _format_profile_command(action_spec.get("command"), values)
     if not command:
         return None
     step_kind = {
         "load": "load_source",
         "unload": "unload_source",
+        "retract": "retract_source_to_junction",
+        "full_unload": "full_unload_source",
         "swap": "swap_source",
     }.get(action, action)
     step = {
@@ -1634,6 +2069,10 @@ def _profile_step(
         "head": f"head:{head}",
         "command": command,
     }
+    if "clears_current_source" in action_spec:
+        step["clears_current_source"] = bool(action_spec.get("clears_current_source"))
+    if "sets_current_source" in action_spec:
+        step["sets_current_source"] = bool(action_spec.get("sets_current_source"))
     for key in ("ace", "slot", "module", "channel"):
         if key in target and target.get(key) is not None:
             step[key] = target.get(key)
@@ -1689,6 +2128,35 @@ def _target_from_graph_source_edge(
     else:
         return None
     return target
+
+def _target_for_source_slot_action(
+        graph: dict,
+        source_id: str,
+) -> dict | None:
+    sources = graph.get("sources") or {}
+    source = sources.get(source_id)
+    if not isinstance(source, dict):
+        return None
+    preferred_head = None
+    try:
+        if source.get("kind") == "native_feeder" and source.get("head") is not None:
+            preferred_head = "head:%d" % int(source.get("head"))
+    except (TypeError, ValueError):
+        preferred_head = None
+    candidates = []
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or not edge.get("enabled", True):
+            continue
+        if edge.get("source") != source_id:
+            continue
+        candidates.append(edge.get("head"))
+    if preferred_head in candidates:
+        return _target_from_graph_source_edge(graph, source_id, preferred_head)
+    for head_id in candidates:
+        target = _target_from_graph_source_edge(graph, source_id, head_id)
+        if target:
+            return target
+    return None
 
 def _route_plan_steps(target: dict | None, source_changed: bool,
                       profiles: dict | None = None) -> list[dict]:
@@ -1768,6 +2236,24 @@ def _source_action_event(
         "target": target,
     }
 
+def _native_retract_step_for_target(
+        target: dict | None,
+        profiles: dict | None,
+) -> dict | None:
+    if not target or target.get("kind") != "native":
+        return None
+    return _profile_step(
+        target=target,
+        profiles=profiles,
+        action="retract",
+    )
+
+def _native_unload_is_at_retract_stage(head_state: dict | None) -> bool:
+    if not isinstance(head_state, dict):
+        return False
+    reason = str(head_state.get("source_ready_reason") or "").lower()
+    return "unload_finish" in reason
+
 def _source_transition_event(
         *,
         index: int,
@@ -1775,6 +2261,7 @@ def _source_transition_event(
         initial_state: dict,
         graph: dict,
         current_source: str | None = None,
+        prefer_swap_for_ace: bool = False,
 ) -> dict:
     profiles = graph.get("profiles") or {}
     head_id = target.get("head_id") or target.get("head")
@@ -1789,6 +2276,7 @@ def _source_transition_event(
     current_target = None
     if current_source and current_source != target.get("source"):
         current_target = _target_from_graph_source_edge(graph, current_source, head_id)
+        current_head_state = (initial_state.get("heads") or {}).get(head_id) or {}
         target_kind = target.get("kind")
         current_kind = (current_target or {}).get("kind")
         swap_handles_previous = target_kind == "ace" and current_kind == "ace"
@@ -1799,8 +2287,15 @@ def _source_transition_event(
                     profiles=profiles,
                     action="unload",
                 )
-                if unload:
+                retract = _native_retract_step_for_target(current_target, profiles)
+                if retract and _native_unload_is_at_retract_stage(current_head_state):
+                    steps.append(retract)
+                elif unload:
+                    if retract:
+                        unload["requires_toolhead_empty"] = False
                     steps.append(unload)
+                    if retract:
+                        steps.append(retract)
     try:
         head = int(target.get("head"))
     except (TypeError, ValueError):
@@ -1812,7 +2307,11 @@ def _source_transition_event(
             "command": f"T{head}",
         })
     if current_source != target.get("source"):
-        action = "swap" if target.get("kind") == "ace" else "load"
+        action = (
+            "swap"
+            if target.get("kind") == "ace" and (prefer_swap_for_ace or current_source)
+            else "load"
+        )
         load_or_swap = _profile_step(
             target=target,
             profiles=profiles,
@@ -1826,7 +2325,7 @@ def _source_transition_event(
         "index": index,
         "event_type": "source_transition",
         "action": "select_loaded" if current_source == target.get("source")
-                  else ("swap" if target.get("kind") == "ace" else "load"),
+                  else ("swap" if target.get("kind") == "ace" and (prefer_swap_for_ace or current_source) else "load"),
         "source": entry.get("source"),
         "head": entry.get("head"),
         "edge": entry.get("edge"),
@@ -1883,6 +2382,7 @@ def _build_route_plan(
                 initial_state=initial_state or {},
                 graph=graph,
                 current_source=head_current.get(str(head)) if head else None,
+                prefer_swap_for_ace=True,
             )
             event["event_type"] = "tool_select"
             event["slicer_tool"] = t
@@ -1911,6 +2411,7 @@ def _build_route_plan(
                     initial_state=initial_state or {},
                     graph=graph,
                     current_source=head_current.get(str(head)) if head else None,
+                    prefer_swap_for_ace=True,
                 )
                 event["event_type"] = "tool_select"
                 event["slicer_tool"] = t
@@ -2125,6 +2626,14 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                 continue
             kind = step.get("kind")
             command = step.get("command")
+            if kind == "home_axes":
+                if str(command or "").strip().upper() != "G28":
+                    errors.append(
+                        "route event[%d] step[%d] home_axes must be G28"
+                        % (idx, step_idx))
+                if command:
+                    commands.append(command)
+                continue
             step_source = step.get("source") or source_id
             if not kind:
                 errors.append("route event[%d] step[%d] missing kind"
@@ -2135,7 +2644,7 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                 errors.append("route event[%d] step[%d] references unknown source %r"
                               % (idx, step_idx, step_source))
             if step.get("source") and step.get("source") != source_id:
-                if not (kind == "unload_source"
+                if not (kind in ("unload_source", "retract_source_to_junction")
                         and step.get("source") == event.get("previous_source")):
                     errors.append("route event[%d] step[%d] source mismatch"
                                   % (idx, step_idx))
@@ -2186,7 +2695,8 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                                     errors.append(
                                         "route event[%d] step[%d] %s mismatch"
                                         % (idx, step_idx, key))
-            if kind in ("load_source", "unload_source"):
+            if kind in ("load_source", "unload_source",
+                        "retract_source_to_junction", "full_unload_source"):
                 source = sources.get(step_source) if step_source in sources else {}
                 if source.get("kind") == "native_feeder":
                     if step.get("module") not in ("left", "right"):
@@ -2307,7 +2817,8 @@ def _route_plan_resource_summary(route_plan: dict, graph: dict) -> dict:
         },
         "constraints": {
             "single_source_single_head": True,
-            "single_ace_single_head_per_plan": True,
+            "single_ace_multi_head_allowed": True,
+            "sequential_ace_actions": True,
         },
     }
 
@@ -2324,11 +2835,6 @@ def _validate_route_plan_resources(route_plan: dict, graph: dict) -> list[str]:
             errors.append(
                 "route plan maps source %s to multiple heads: %s"
                 % (source_id, ", ".join(sorted(heads))))
-    for ace, heads in sorted(ace_heads.items()):
-        if len(heads) > 1:
-            errors.append(
-                "route plan maps ACE %d to multiple heads in one print plan: %s"
-                % (ace, ", ".join(sorted(heads))))
     resources = route_plan.get("resources")
     if isinstance(resources, dict):
         expected = _route_plan_resource_summary(route_plan, graph)
@@ -2541,9 +3047,57 @@ def _route_plan_affected_heads(route_plan: dict) -> set[str]:
                 heads.add(str(step.get("head")))
     return heads
 
+def _route_plan_operation_ready_sources(route_plan: dict) -> set[str]:
+    """Sources that must be ready before an operation can begin.
+
+    Manual unload/retract is explicitly allowed to operate on an unready source:
+    that is the recovery path for "toolhead still has filament, source slot is
+    no longer ready" states.  Load/swap still require the target source ready.
+    """
+    sources: set[str] = set()
+    if not isinstance(route_plan, dict):
+        return sources
+    for event in route_plan.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        for step in event.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            action = step.get("profile_action")
+            kind = step.get("kind")
+            if action in ("load", "swap") or kind in ("load_source", "swap_source"):
+                source_id = step.get("source") or event.get("source")
+                if source_id:
+                    sources.add(str(source_id))
+    return sources
+
+def _route_plan_unload_only_head(route_plan: dict, head_id: str) -> bool:
+    saw_unload = False
+    for event in route_plan.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        for step in event.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            step_head = _normalize_route_head_id({
+                "head": step.get("head") or event.get("head")
+            })
+            if step_head != head_id:
+                continue
+            action = step.get("profile_action")
+            kind = step.get("kind")
+            if action in ("unload", "retract") or kind in (
+                    "unload_source", "retract_source_to_junction"):
+                saw_unload = True
+                continue
+            return False
+    return saw_unload
+
 def _validate_route_plan_runtime_state(route_plan: dict,
                                        current_state: dict,
-                                       current_sources: dict | None = None) -> list[str]:
+                                       current_sources: dict | None = None,
+                                       *,
+                                       operation_mode: bool = False) -> list[str]:
     """Reject stale route plans before moving or uploading print G-code."""
     errors: list[str] = []
     if not isinstance(route_plan, dict):
@@ -2577,10 +3131,10 @@ def _validate_route_plan_runtime_state(route_plan: dict,
         return ["current source state heads must be an object"]
     if current_sources is None:
         current_sources = {}
-    # "stale" means the source record exists but the head sensor is empty. The
-    # print start path can safely clean that up, so allow it only when the live
-    # state still exactly matches the preflight snapshot.
-    actionable = {"known", "empty", "stale"}
+    # "stale" means the source record says loaded but the toolhead sensor is
+    # empty. Do not auto-correct that during print dispatch: it must be
+    # recovered explicitly before any load/print operation can continue.
+    actionable = {"known", "empty"}
     for head_id in sorted(_route_plan_affected_heads(route_plan)):
         planned = planned_heads.get(head_id)
         live = current_heads.get(head_id)
@@ -2594,11 +3148,17 @@ def _validate_route_plan_runtime_state(route_plan: dict,
             continue
         planned_conf = str(planned.get("source_confidence") or "")
         live_conf = str(live.get("source_confidence") or "")
-        if planned_conf not in actionable:
+        unload_recovery = (
+            operation_mode
+            and planned_conf == "exhausted"
+            and live_conf == "exhausted"
+            and _route_plan_unload_only_head(route_plan, head_id)
+        )
+        if planned_conf not in actionable and not unload_recovery:
             errors.append(
                 "route plan initial_state[%s] is %s; recover head state and rerun preflight"
                 % (head_id, planned_conf or "unknown"))
-        if live_conf not in actionable:
+        if live_conf not in actionable and not unload_recovery:
             errors.append(
                 "current source state[%s] is %s; recover head state before print"
                 % (head_id, live_conf or "unknown"))
@@ -2611,7 +3171,12 @@ def _validate_route_plan_runtime_state(route_plan: dict,
             errors.append(
                 "route plan initial_state[%s] confidence changed: initial=%s current=%s"
                 % (head_id, planned_conf, live_conf))
+    ready_sources = None
+    if operation_mode:
+        ready_sources = _route_plan_operation_ready_sources(route_plan)
     for source_id in sorted((route_plan.get("resources") or {}).get("sources") or {}):
+        if ready_sources is not None and source_id not in ready_sources:
+            continue
         source = current_sources.get(source_id) if isinstance(current_sources, dict) else None
         if source is None:
             errors.append(
@@ -3134,7 +3699,7 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
             used_tools=used_tools,
             events=route_events,
             profiles=(graph.get("profiles") or {}),
-            initial_state=sg.source_state(graph, parsed),
+            initial_state=_source_state_for_parsed(graph, parsed),
             graph=graph,
             stats=source_map.get("swap_stats") or {},
             created_at=source_map.get("created_at"),
@@ -3341,7 +3906,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                 "route plan missing; run source graph preflight again")
         graph, graph_meta = _load_source_graph(parsed)
         route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
-        current_state = sg.source_state(graph, parsed)
+        current_state = _source_state_for_parsed(graph, parsed)
         current_sources = sg.runtime_sources(graph, parsed)
         route_errors.extend(
             _validate_route_plan_runtime_state(
@@ -3488,13 +4053,13 @@ async def _apply_route_plan_tool_targets(token: str,
         used_tools=used_tools,
         events=route_events,
         profiles=(graph.get("profiles") or {}),
-        initial_state=sg.source_state(graph, parsed),
+        initial_state=_source_state_for_parsed(graph, parsed),
         graph=graph,
         stats=source_map.get("swap_stats") or {},
         created_at=source_map.get("created_at"),
     )
     route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
-    current_state = sg.source_state(graph, parsed)
+    current_state = _source_state_for_parsed(graph, parsed)
     current_sources = sg.runtime_sources(graph, parsed)
     route_errors.extend(
         _validate_route_plan_runtime_state(
@@ -3547,7 +4112,7 @@ async def _start_route_plan_print(token: str, *, set_prefs: bool = False,
         )
     graph, graph_meta = _load_source_graph(parsed)
     route_errors = _validate_route_plan_for_graph(route_plan, graph, graph_meta)
-    current_state = sg.source_state(graph, parsed)
+    current_state = _source_state_for_parsed(graph, parsed)
     current_sources = sg.runtime_sources(graph, parsed)
     route_errors.extend(
         _validate_route_plan_runtime_state(
@@ -3644,7 +4209,7 @@ async def preflight_route_plan_validate(token: str) -> dict:
         raise HTTPException(status_code=502, detail=f"moonraker: {e}")
     graph, meta = _load_source_graph(parsed)
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
-    current_state = sg.source_state(graph, parsed)
+    current_state = _source_state_for_parsed(graph, parsed)
     current_sources = sg.runtime_sources(graph, parsed)
     errors.extend(_validate_route_plan_runtime_state(
         route_plan, current_state, current_sources))
@@ -3675,7 +4240,7 @@ async def route_plan_validate(payload: RoutePlanValidateRequest) -> dict:
     graph, meta = _load_source_graph(parsed)
     route_plan = payload.route_plan
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
-    current_state = sg.source_state(graph, parsed)
+    current_state = _source_state_for_parsed(graph, parsed)
     current_sources = sg.runtime_sources(graph, parsed)
     errors.extend(_validate_route_plan_runtime_state(
         route_plan, current_state, current_sources))
@@ -3899,7 +4464,7 @@ async def get_state() -> dict:
         status = await _query_state()
     except httpx.HTTPError as e:
         return {"error": f"moonraker: {e}"}
-    return _parse_state(status)
+    return _parse_state(status, source_graph_overlay=True)
 
 @app.get("/api/source-graph")
 async def get_source_graph() -> dict:
@@ -3944,7 +4509,7 @@ async def get_source_state() -> dict:
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"moonraker: {e}")
     graph, meta = _load_source_graph(parsed)
-    state = sg.source_state(graph, parsed)
+    state = _source_state_for_parsed(graph, parsed)
     state["meta"] = meta
     return state
 
@@ -3952,10 +4517,10 @@ async def get_source_state() -> dict:
 async def preview_source_action(payload: SourceActionPreview) -> dict:
     """Build one profile-driven source action step without moving hardware."""
     action = str(payload.action or "").strip().lower()
-    if action not in ("load", "unload", "swap"):
+    if action not in ("load", "unload", "swap", "retract", "full_unload"):
         raise HTTPException(
             status_code=400,
-            detail="action must be load, unload or swap")
+            detail="action must be load, unload, swap, retract or full_unload")
     try:
         parsed = _parse_state(await _query_state())
     except httpx.HTTPError as e:
@@ -4011,10 +4576,10 @@ async def preview_source_actions(payload: SourceActionPreviewBatch) -> dict:
     targets = []
     for index, item in enumerate(payload.actions):
         action = str(item.action or "").strip().lower()
-        if action not in ("load", "unload", "swap"):
+        if action not in ("load", "unload", "swap", "retract", "full_unload"):
             raise HTTPException(
                 status_code=400,
-                detail="action must be load, unload or swap")
+                detail="action must be load, unload, swap, retract or full_unload")
         target = _target_from_graph_source_edge(graph, item.source, item.head)
         if target is None:
             raise HTTPException(
@@ -4044,7 +4609,7 @@ async def preview_source_actions(payload: SourceActionPreviewBatch) -> dict:
             "errors": meta.get("errors", []),
             "warnings": meta.get("warnings", []),
         },
-        "initial_state": sg.source_state(graph, parsed),
+        "initial_state": _source_state_for_parsed(graph, parsed),
         "events": events,
         "commands": commands,
     }
@@ -4073,7 +4638,7 @@ async def preview_source_transition(payload: SourceTransitionPreview) -> dict:
         raise HTTPException(
             status_code=404,
             detail="enabled source edge not found")
-    initial_state = sg.source_state(graph, parsed)
+    initial_state = _source_state_for_parsed(graph, parsed)
     event = _source_transition_event(
         index=0,
         target=target,
@@ -4121,6 +4686,8 @@ def _operation_public(job: dict[str, Any] | None) -> dict[str, Any]:
         "source": job.get("source"),
         "previous_source": job.get("previous_source"),
         "commands": job.get("commands") or [],
+        "steps": job.get("steps") or [],
+        "current_step": job.get("current_step"),
         "error": job.get("error"),
         "created": job.get("created"),
         "updated": job.get("updated"),
@@ -4143,7 +4710,7 @@ def _validate_operation_route_plan(
 ) -> list[str]:
     errors = _validate_route_plan_for_graph(route_plan, graph, meta)
     errors.extend(_validate_route_plan_runtime_state(
-        route_plan, current_state, current_sources))
+        route_plan, current_state, current_sources, operation_mode=True))
     script = _script_from_commands(route_plan.get("commands") or [])
     if script:
         try:
@@ -4160,31 +4727,355 @@ def _script_from_commands(commands: list[str] | tuple[str, ...]) -> str:
             lines.append(line)
     return "\n".join(lines)
 
+def _operation_steps(route_plan: dict) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for event_idx, event in enumerate(route_plan.get("events") or []):
+        if not isinstance(event, dict):
+            continue
+        for step_idx, step in enumerate(event.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            item = dict(step)
+            item["_event_index"] = event_idx
+            item["_step_index"] = step_idx
+            item["_event"] = event
+            out.append(item)
+    return out
+
+def _step_head_id(step: dict[str, Any], event: dict[str, Any] | None = None) -> str | None:
+    event = event or step.get("_event") or {}
+    head_id = step.get("head") or event.get("head")
+    if head_id is None:
+        return None
+    return _normalize_route_head_id({"head": head_id})
+
+def _step_source_id(step: dict[str, Any], event: dict[str, Any] | None = None) -> str | None:
+    event = event or step.get("_event") or {}
+    source_id = step.get("source") or event.get("source")
+    return str(source_id) if source_id else None
+
+def _stable_feed_state(channel_state: Any) -> bool:
+    state = str(channel_state or "")
+    if not state:
+        return True
+    if state in ("wait_insert", "inited", "test"):
+        return True
+    return state.endswith("_finish") or state.endswith("_fail")
+
+def _feed_status_for_head(parsed: dict, head_idx: int) -> dict[str, Any]:
+    for th in parsed.get("toolheads", []) or []:
+        try:
+            if int(th.get("idx")) == int(head_idx):
+                return th
+        except (TypeError, ValueError):
+            continue
+    return {}
+
+async def _wait_for_step_quiescent(step: dict[str, Any],
+                                   timeout: float = 8.0) -> dict:
+    head_id = _step_head_id(step)
+    head_idx = _head_index_from_id(head_id)
+    deadline = time.time() + timeout
+    parsed: dict[str, Any] = {}
+    while True:
+        parsed = _parse_state(await _query_state())
+        if head_idx is None:
+            return parsed
+        feed = _feed_status_for_head(parsed, head_idx)
+        if _stable_feed_state(feed.get("channel_state")):
+            return parsed
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "%s did not settle after %s: channel_state=%s"
+                % (head_id, step.get("command"), feed.get("channel_state")))
+        await asyncio.sleep(0.25)
+
+def _route_plan_graph_matches(route_plan: dict, meta: dict) -> None:
+    plan_hash = route_plan.get("source_graph_hash")
+    graph_hash = meta.get("hash")
+    if plan_hash and graph_hash and plan_hash != graph_hash:
+        raise RuntimeError(
+            "source graph changed during operation: plan=%s current=%s"
+            % (plan_hash, graph_hash))
+
+def _postcheck_head_loaded(
+        *,
+        graph: dict,
+        parsed: dict,
+        head_id: str,
+        source_id: str,
+) -> dict:
+    head_idx = _head_index_from_id(head_id)
+    if head_idx is None:
+        raise RuntimeError("invalid head for post-check: %s" % head_id)
+    feed = _feed_status_for_head(parsed, head_idx)
+    if not bool(feed.get("filament_at_extruder")):
+        raise RuntimeError(
+            "%s load did not reach toolhead sensor for %s"
+            % (head_id, source_id))
+    current_state = _source_state_for_parsed(graph, parsed)
+    live_head = (current_state.get("heads") or {}).get(head_id) or {}
+    source = (graph.get("sources") or {}).get(source_id) or {}
+    if source.get("kind") == "native_feeder":
+        if bool(feed.get("filament_in_ace")):
+            raise RuntimeError(
+                "%s native load ended in ACE path for %s"
+                % (head_id, source_id))
+        channel_error = feed.get("channel_error")
+        if channel_error not in (None, "", "ok"):
+            raise RuntimeError(
+                "%s load reported feeder error: %s"
+                % (head_id, channel_error))
+        _record_head_source(head_id, source_id, reason="operation_load")
+        current_state = _source_state_for_parsed(graph, parsed)
+        live_head = (current_state.get("heads") or {}).get(head_id) or {}
+    elif live_head.get("current_source") != source_id:
+        raise RuntimeError(
+            "%s ACE load post-check mismatch: expected %s, got %s"
+            % (head_id, source_id, live_head.get("current_source")))
+    else:
+        _record_head_source(head_id, source_id, reason="operation_load")
+    if live_head.get("source_confidence") not in ("known",):
+        raise RuntimeError(
+            "%s load post-check confidence is %s"
+            % (head_id, live_head.get("source_confidence")))
+    return live_head
+
+def _postcheck_head_unloaded(
+        *,
+        graph: dict,
+        parsed: dict,
+        head_id: str,
+        source_id: str | None,
+        clear_current_source: bool = True,
+        require_toolhead_empty: bool = True,
+) -> dict:
+    head_idx = _head_index_from_id(head_id)
+    if head_idx is None:
+        raise RuntimeError("invalid head for post-check: %s" % head_id)
+    feed = _feed_status_for_head(parsed, head_idx)
+    if require_toolhead_empty and bool(feed.get("filament_at_extruder")):
+        raise RuntimeError(
+            "%s unload completed but toolhead sensor still detects filament"
+            % head_id)
+    channel_error = feed.get("channel_error")
+    if channel_error not in (None, "", "ok"):
+        raise RuntimeError(
+            "%s unload reported feeder error: %s" % (head_id, channel_error))
+    if not clear_current_source:
+        return {
+            "head": head_id,
+            "source": source_id,
+            "toolhead_sensor_empty": not bool(feed.get("filament_at_extruder")),
+            "current_source_cleared": False,
+        }
+    _record_head_source(head_id, None, reason="operation_unload")
+    current_state = _source_state_for_parsed(graph, parsed)
+    live_head = (current_state.get("heads") or {}).get(head_id) or {}
+    if live_head.get("source_confidence") not in ("empty",):
+        raise RuntimeError(
+            "%s unload post-check confidence is %s"
+            % (head_id, live_head.get("source_confidence")))
+    return live_head
+
+def _postcheck_source_retracted(
+        *,
+        graph: dict,
+        parsed: dict,
+        head_id: str,
+        source_id: str | None,
+        clear_current_source: bool = True,
+) -> dict:
+    head_idx = _head_index_from_id(head_id)
+    if head_idx is None:
+        raise RuntimeError("invalid head for post-check: %s" % head_id)
+    feed = _feed_status_for_head(parsed, head_idx)
+    if bool(feed.get("filament_at_extruder")):
+        raise RuntimeError(
+            "%s source retract completed but toolhead sensor still detects filament"
+            % head_id)
+    channel_error = feed.get("channel_error")
+    if channel_error not in (None, "", "ok"):
+        raise RuntimeError(
+            "%s source retract reported feeder error: %s" % (head_id, channel_error))
+    if clear_current_source:
+        _record_head_source(head_id, None, reason="operation_retract")
+        current_state = _source_state_for_parsed(graph, parsed)
+        live_head = (current_state.get("heads") or {}).get(head_id) or {}
+        if live_head.get("source_confidence") not in ("empty",):
+            raise RuntimeError(
+                "%s retract post-check confidence is %s"
+                % (head_id, live_head.get("source_confidence")))
+        return live_head
+    return {
+        "head": head_id,
+        "source": source_id,
+        "toolhead_sensor_empty": True,
+        "current_source_cleared": False,
+    }
+
+def _postcheck_source_full_unloaded(
+        *,
+        parsed: dict,
+        head_id: str,
+        source_id: str | None,
+) -> dict:
+    head_idx = _head_index_from_id(head_id)
+    if head_idx is None:
+        raise RuntimeError("invalid head for post-check: %s" % head_id)
+    feed = _feed_status_for_head(parsed, head_idx)
+    channel_error = feed.get("channel_error")
+    if channel_error not in (None, "", "ok"):
+        raise RuntimeError(
+            "%s full unload reported feeder error: %s" % (head_id, channel_error))
+    if bool(feed.get("filament_detected")):
+        raise RuntimeError(
+            "%s full unload completed but source sensor still detects filament"
+            % head_id)
+    if bool(feed.get("filament_at_extruder")):
+        raise RuntimeError(
+            "%s full unload completed but toolhead sensor still detects filament"
+            % head_id)
+    return {
+        "head": head_id,
+        "source": source_id,
+        "source_empty": True,
+    }
+
+async def _postcheck_macro_operation(job: dict[str, Any]) -> None:
+    if job.get("kind") != "unload_all_heads":
+        return
+    state = _read_head_source_state()
+    state["heads"] = {}
+    _write_head_source_state(state)
+
+async def _postcheck_operation_step(
+        *,
+        graph: dict,
+        step: dict[str, Any],
+        parsed: dict,
+) -> dict | None:
+    action = step.get("profile_action")
+    kind = step.get("kind")
+    if action not in ("load", "unload", "swap", "retract", "full_unload") and kind not in (
+            "load_source", "unload_source", "swap_source",
+            "retract_source_to_junction", "full_unload_source"):
+        return None
+    head_id = _step_head_id(step)
+    source_id = _step_source_id(step)
+    if not head_id:
+        raise RuntimeError("operation step missing head")
+    if action in ("load", "swap") or kind in ("load_source", "swap_source"):
+        if not source_id:
+            raise RuntimeError("operation load step missing source")
+        return _postcheck_head_loaded(
+            graph=graph,
+            parsed=parsed,
+            head_id=head_id,
+            source_id=source_id,
+        )
+    if action == "unload" or kind == "unload_source":
+        return _postcheck_head_unloaded(
+            graph=graph,
+            parsed=parsed,
+            head_id=head_id,
+            source_id=source_id,
+            clear_current_source=bool(step.get("clears_current_source", True)),
+            require_toolhead_empty=bool(step.get("requires_toolhead_empty", True)),
+        )
+    if action == "retract" or kind == "retract_source_to_junction":
+        return _postcheck_source_retracted(
+            graph=graph,
+            parsed=parsed,
+            head_id=head_id,
+            source_id=source_id,
+            clear_current_source=bool(step.get("clears_current_source", True)),
+        )
+    if action == "full_unload" or kind == "full_unload_source":
+        return _postcheck_source_full_unloaded(
+            parsed=parsed,
+            head_id=head_id,
+            source_id=source_id,
+        )
+    return None
+
 async def _execute_operation_job(job: dict[str, Any]) -> None:
     global _operation_job
     job["status"] = "running"
     job["updated"] = time.time()
     script = _script_from_commands(job.get("commands") or [])
+    route_plan = job.get("route_plan") or {}
     try:
-        if script:
-            _validate_gcode_script(script)
-            result = await _mr_post(
-                "/printer/gcode/script",
-                {"script": script},
-                timeout=None,
+        steps = _operation_steps(route_plan)
+        if not steps and script:
+            steps = [{"command": script, "kind": "script"}]
+        parsed = _parse_state(await _query_state())
+        graph, meta = _load_source_graph(parsed)
+        _route_plan_graph_matches(route_plan, meta)
+        motion_errors = _validate_operation_printer_motion_ready(
+            route_plan, parsed)
+        if motion_errors:
+            raise RuntimeError("; ".join(motion_errors))
+        if route_plan.get("source_graph_hash"):
+            current_state = _source_state_for_parsed(graph, parsed)
+            current_sources = sg.runtime_sources(graph, parsed)
+            runtime_errors = _validate_operation_route_plan(
+                route_plan, graph, meta, current_state, current_sources)
+            if runtime_errors:
+                raise RuntimeError(
+                    "operation runtime validation failed: "
+                    + "; ".join(runtime_errors[:8]))
+        executed = []
+        for index, step in enumerate(steps):
+            command = str(step.get("command") or "").strip()
+            if not command:
+                continue
+            if "\n" in command or "\r" in command:
+                raise RuntimeError(
+                    "operation step command must be a single G-code line")
+            _validate_gcode_script(command)
+            job["current_step"] = {
+                "index": index,
+                "kind": step.get("kind"),
+                "command": command,
+            }
+            job["updated"] = time.time()
+            await _wait_for_step_quiescent(step)
+            result = await _mr_gcode(command, timeout=None)
+            parsed = await _wait_for_step_quiescent(step)
+            post_state = await _postcheck_operation_step(
+                graph=graph,
+                step=step,
+                parsed=parsed,
             )
-            job["result"] = result
+            executed.append({
+                "index": index,
+                "kind": step.get("kind"),
+                "profile_action": step.get("profile_action"),
+                "source": _step_source_id(step),
+                "head": _step_head_id(step),
+                "command": command,
+                "result": result,
+                "post_state": post_state,
+            })
+            job["steps"] = executed
+            job["updated"] = time.time()
+        job["current_step"] = None
+        await _postcheck_macro_operation(job)
+        job["result"] = {"executed_steps": len(executed)}
         job["status"] = "done"
         job["updated"] = time.time()
     except httpx.HTTPStatusError as e:
         job["status"] = "error"
         job["error"] = e.response.text or str(e)
+        job["current_step"] = None
         job["updated"] = time.time()
         _trace.warning("operation %s failed for %r: %s",
                        job.get("id"), script, str(job.get("error"))[:300])
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e) or type(e).__name__
+        job["current_step"] = None
         job["updated"] = time.time()
         _trace.warning("operation %s failed for %r: %s",
                        job.get("id"), script, job.get("error"))
@@ -4236,10 +5127,11 @@ async def _build_head_load_operation(payload: HeadLoadRequest) -> dict[str, Any]
     target = _target_from_graph_source_edge(graph, payload.source, payload.head)
     if target is None:
         raise HTTPException(status_code=404, detail="enabled source edge not found")
-    initial_state = sg.source_state(graph, parsed)
+    initial_state = _source_state_for_parsed(graph, parsed)
     head_id = target.get("head_id") or "head:%d" % int(target.get("head"))
     head_state = (initial_state.get("heads") or {}).get(head_id) or {}
-    if head_state.get("source_confidence") in ("unknown", "failed", "exhausted"):
+    if head_state.get("source_confidence") in (
+            "unknown", "failed", "exhausted", "stale"):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -4251,6 +5143,10 @@ async def _build_head_load_operation(payload: HeadLoadRequest) -> dict[str, Any]
         initial_state=initial_state,
         graph=graph,
     )
+    homing_step = _auto_home_step_if_needed(event, parsed)
+    if homing_step:
+        event["steps"] = [homing_step] + (event.get("steps") or [])
+        event["commands"] = [homing_step["command"]] + (event.get("commands") or [])
     route_plan = {
         "version": 2,
         "source_graph_hash": meta.get("hash"),
@@ -4269,6 +5165,7 @@ async def _build_head_load_operation(payload: HeadLoadRequest) -> dict[str, Any]
     current_sources = sg.runtime_sources(graph, parsed)
     errors = _validate_operation_route_plan(
         route_plan, graph, meta, initial_state, current_sources)
+    errors.extend(_validate_operation_printer_motion_ready(route_plan, parsed))
     if errors:
         raise HTTPException(status_code=409, detail="; ".join(errors))
     job = await _start_operation_job(
@@ -4293,7 +5190,7 @@ async def _build_head_unload_operation(payload: HeadUnloadRequest) -> dict[str, 
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"moonraker: {e}")
     graph, meta = _load_source_graph(parsed)
-    initial_state = sg.source_state(graph, parsed)
+    initial_state = _source_state_for_parsed(graph, parsed)
     head_idx = _head_index_from_id(payload.head)
     if head_idx is None:
         raise HTTPException(status_code=400, detail="invalid head")
@@ -4303,7 +5200,7 @@ async def _build_head_unload_operation(payload: HeadUnloadRequest) -> dict[str, 
     confidence = head_state.get("source_confidence")
     if not current_source or confidence == "empty":
         raise HTTPException(status_code=409, detail=f"{head_id} has no loaded source")
-    if confidence in ("unknown", "failed", "exhausted"):
+    if confidence in ("unknown", "failed", "stale"):
         raise HTTPException(
             status_code=409,
             detail=f"{head_id} current source is {confidence}; recover before unloading")
@@ -4319,7 +5216,20 @@ async def _build_head_unload_operation(payload: HeadUnloadRequest) -> dict[str, 
     )
     if step is None:
         raise HTTPException(status_code=409, detail="current source cannot unload")
-    event = _source_action_event(index=0, action="unload", target=target, step=step)
+    retract = _native_retract_step_for_target(target, graph.get("profiles") or {})
+    if retract:
+        step["requires_toolhead_empty"] = False
+    if retract and _native_unload_is_at_retract_stage(head_state):
+        event = _source_action_event(
+            index=0, action="retract", target=target, step=retract)
+    else:
+        event = _source_action_event(index=0, action="unload", target=target, step=step)
+    if retract:
+        existing = {id(item) for item in event.get("steps") or []}
+        if id(retract) not in existing:
+            event["steps"].append(retract)
+            if retract.get("command"):
+                event["commands"].append(retract.get("command"))
     route_plan = {
         "version": 2,
         "source_graph_hash": meta.get("hash"),
@@ -4345,6 +5255,90 @@ async def _build_head_unload_operation(payload: HeadUnloadRequest) -> dict[str, 
         head=head_id,
         source=current_source,
         previous_source=current_source,
+        route_plan=route_plan,
+        execute=payload.execute,
+    )
+    return {
+        "ok": True,
+        "operation": _operation_public(job),
+        "target": target,
+        "event": event,
+        "route_plan": route_plan,
+    }
+
+def _loaded_heads_for_source(initial_state: dict, source_id: str) -> list[str]:
+    out = []
+    for head_id, head_state in ((initial_state.get("heads") or {}).items()):
+        if not isinstance(head_state, dict):
+            continue
+        if head_state.get("current_source") == source_id:
+            out.append(str(head_id))
+    return sorted(out)
+
+async def _build_source_full_unload_operation(
+        payload: SourceFullUnloadRequest,
+) -> dict[str, Any]:
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    source_id = str(payload.source or "").strip()
+    if source_id not in (graph.get("sources") or {}):
+        raise HTTPException(status_code=404, detail=f"unknown source {source_id!r}")
+    initial_state = _source_state_for_parsed(graph, parsed)
+    loaded_heads = _loaded_heads_for_source(initial_state, source_id)
+    if loaded_heads:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "%s is currently loaded in %s; unload the toolhead first"
+                % (source_id, ", ".join(loaded_heads))))
+    target = _target_for_source_slot_action(graph, source_id)
+    if target is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{source_id} has no enabled edge for full unload")
+    step = _profile_step(
+        target=target,
+        profiles=(graph.get("profiles") or {}),
+        action="full_unload",
+    )
+    if step is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{source_id} does not support full unload")
+    event = _source_action_event(
+        index=0,
+        action="full_unload",
+        target=target,
+        step=step,
+    )
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "initial_state": initial_state,
+        "events": [event],
+        "commands": event.get("commands") or [],
+    }
+    route_plan = _finalize_operation_route_plan(route_plan, graph)
+    current_sources = sg.runtime_sources(graph, parsed)
+    errors = _validate_operation_route_plan(
+        route_plan, graph, meta, initial_state, current_sources)
+    if errors:
+        raise HTTPException(status_code=409, detail="; ".join(errors))
+    job = await _start_operation_job(
+        kind="source_full_unload",
+        head=target.get("head_id"),
+        source=source_id,
+        previous_source=None,
         route_plan=route_plan,
         execute=payload.execute,
     )
@@ -4468,6 +5462,10 @@ async def operation_head_load(payload: HeadLoadRequest) -> dict:
 @app.post("/api/operation/head/unload")
 async def operation_head_unload(payload: HeadUnloadRequest) -> dict:
     return await _build_head_unload_operation(payload)
+
+@app.post("/api/source/full-unload")
+async def operation_source_full_unload(payload: SourceFullUnloadRequest) -> dict:
+    return await _build_source_full_unload_operation(payload)
 
 @app.post("/api/operation/ace/dry-start")
 async def operation_ace_dry_start(payload: AceDryStartRequest) -> dict:
@@ -5141,6 +6139,21 @@ def _reload_native_overrides_if_changed() -> None:
     _load_native_overrides_from_disk()
     _native_overrides_mtime = m
 
+def _native_override_meta_at(n: int) -> dict | None:
+    o = _native_overrides.get(str(n)) or _native_overrides.get(n)
+    if not isinstance(o, dict):
+        return None
+    mat = (o.get("material") or "").strip()
+    color = (o.get("color") or "").strip()
+    if not mat and not color:
+        return None
+    return {
+        "material": mat,
+        "sku": (o.get("subtype") or "").strip(),
+        "brand": (o.get("brand") or "").strip(),
+        "color": color.lower() if color else None,
+    }
+
 def _load_native_overrides_from_disk() -> None:
     global _native_overrides_mtime
     p = Path(NATIVE_OVERRIDE_FILE)
@@ -5729,7 +6742,7 @@ async def ws(websocket: WebSocket) -> None:
                     status = await _query_state()
                     cutoff_ts = _notification_cutoff_from_status(status)
                     await _prune_notifications_before(cutoff_ts)
-                    payload = _parse_state(status)
+                    payload = _parse_state(status, source_graph_overlay=True)
                     payload["type"] = "state"
                     payload["ts"] = now
                     payload["notification_cutoff_ts"] = max(

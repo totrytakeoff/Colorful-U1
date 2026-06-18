@@ -12,11 +12,13 @@ from pydantic import BaseModel
 
 STATE_PATH = Path("/data/state.json")
 GCODE_LOG = Path("/data/gcode.log")
+SCRIPT_CALLS_PATH = Path("/data/script_calls.json")
 CFG_PATH = Path("/data/ace.cfg")
 UPLOAD_DIR = Path("/data/uploaded")
 SLOT_OVERRIDE_PATH = Path("/data/slot_overrides.json")
 NATIVE_OVERRIDE_PATH = Path("/data/native_overrides.json")
 SOURCE_GRAPH_PATH = Path("/data/source_graph.json")
+HEAD_SOURCE_STATE_PATH = Path("/data/head_source_state.json")
 
 app = FastAPI(title="multiACE dry-run Moonraker")
 
@@ -113,6 +115,13 @@ def _default_state() -> dict[str, Any]:
             "info": {"total_layer": None, "current_layer": None},
         },
         "idle_timeout": {"state": "Idle", "printing_time": 0.0},
+        "toolhead": {"homed_axes": "xyz"},
+        "machine_state": {
+            "main_state": "IDLE",
+            "action_code": "IDLE",
+            "strict_transitions": False,
+            "linger_auto_unload_once": False,
+        },
     }
     # Seed one native head with a known filament so mixed native/ACE
     # preflight can be tested without touching hardware.
@@ -153,6 +162,7 @@ def _load_state() -> dict[str, Any]:
         return state
     state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     _apply_cfg_route(state)
+    state.setdefault("toolhead", {"homed_axes": "xyz"})
     return state
 
 
@@ -184,12 +194,25 @@ def _default_source_graph(ace_count: int) -> dict[str, Any]:
         sources[f"native:{head}"] = {
             "kind": "native_feeder",
             "head": head,
+            "module": _native_channel(head)["module"],
+            "channel": _native_channel(head)["channel"],
             "label": f"Native Slot {head + 1}",
             "material": "",
             "brand": "",
             "subtype": "",
             "color": "",
             "ready": False,
+            "execution": {
+                "preload_length_mm": 950,
+                "push_to_junction_length_mm": 0,
+                "load_to_toolhead_length_mm": 750,
+                "unload_to_junction_length_mm": 120,
+                "full_unload_length_mm": 950,
+                "toolhead_sync_retract_length_mm": 0,
+                "feed_speed_mm_s": 25,
+                "retract_speed_mm_s": 25,
+                "toolhead_sync_retract_speed_mm_s": 10,
+            },
             "execution_profile": "u1_native_feeder",
         }
         edges.append({
@@ -210,6 +233,15 @@ def _default_source_graph(ace_count: int) -> dict[str, Any]:
                 "subtype": "",
                 "color": "",
                 "ready": False,
+                "execution": {
+                    "preload_length_mm": 0,
+                    "push_to_junction_length_mm": 0,
+                    "load_to_toolhead_length_mm": 0,
+                    "unload_to_junction_length_mm": 0,
+                    "full_unload_length_mm": 0,
+                    "feed_speed_mm_s": 25,
+                    "retract_speed_mm_s": 25,
+                },
                 "execution_profile": "ace_v1_slot",
             }
     return {
@@ -220,6 +252,23 @@ def _default_source_graph(ace_count: int) -> dict[str, Any]:
         "profiles": {
             "ace_v1_slot": {
                 "kind": "ace_slot",
+                "load": {
+                    "command": "ACE_LOAD_HEAD HEAD={head} ACE={ace} SLOT={slot}",
+                    "requires_empty_head": True,
+                    "sets_current_source": True,
+                },
+                "unload": {
+                    "command": "ACE_UNLOAD_HEAD HEAD={head}",
+                    "requires_current_source": True,
+                    "clears_current_source": True,
+                },
+                "retract": None,
+                "full_unload": None,
+                "swap": {
+                    "command": "ACE_SWAP_HEAD HEAD={head} ACE={ace} SLOT={slot}",
+                    "requires_routed_edge": True,
+                    "sets_current_source": True,
+                },
                 "capabilities": {
                     "can_preload": True,
                     "can_swap_in_print": True,
@@ -228,6 +277,27 @@ def _default_source_graph(ace_count: int) -> dict[str, Any]:
             },
             "u1_native_feeder": {
                 "kind": "native_feeder",
+                "load": {
+                    "command": "FEED_AUTO MODULE={module} CHANNEL={channel} EXTRUDER={head} LOAD=1",
+                    "requires_empty_head": True,
+                    "sets_current_source": True,
+                },
+                "unload": {
+                    "command": "FEED_AUTO MODULE={module} CHANNEL={channel} EXTRUDER={head} UNLOAD=1",
+                    "requires_current_source": True,
+                    "clears_current_source": False,
+                },
+                "retract": {
+                    "command": "FEED_AUTO_RETRACT MODULE={module} CHANNEL={channel} EXTRUDER={head} LENGTH={unload_to_junction_length_mm} SPEED={retract_speed_mm_s} SYNC_LENGTH={toolhead_sync_retract_length_mm} SYNC_SPEED={toolhead_sync_retract_speed_mm_s}",
+                    "requires_current_source": True,
+                    "clears_current_source": True,
+                },
+                "full_unload": {
+                    "command": "FEED_AUTO_FULL_UNLOAD MODULE={module} CHANNEL={channel} EXTRUDER={head} LENGTH={full_unload_length_mm} SPEED={retract_speed_mm_s}",
+                    "requires_current_source": False,
+                    "clears_current_source": False,
+                },
+                "swap": None,
                 "capabilities": {
                     "can_preload": False,
                     "can_swap_in_print": False,
@@ -410,6 +480,53 @@ def _set_native_slot_preloaded(state: dict[str, Any], head: int) -> None:
     feed["channel_error"] = "ok"
 
 
+def _set_native_toolhead_unloaded(state: dict[str, Any], head: int) -> None:
+    state["ace"]["head_source"][str(head)] = None
+    module, key = _head_key(head)
+    feed = state[module][key]
+    feed["filament_detected"] = True
+    feed["filament_in_ace"] = False
+    feed["filament_in_toolhead"] = False
+    feed["filament_at_extruder"] = False
+    feed["channel_state"] = "unload_finish"
+    feed["channel_error"] = "ok"
+
+def _set_native_unload_finished_with_toolhead_filament(state: dict[str, Any], head: int) -> None:
+    state["ace"]["head_source"][str(head)] = None
+    module, key = _head_key(head)
+    feed = state[module][key]
+    feed["filament_detected"] = True
+    feed["filament_in_ace"] = False
+    feed["filament_in_toolhead"] = True
+    feed["filament_at_extruder"] = True
+    feed["channel_state"] = "unload_finish"
+    feed["channel_error"] = "ok"
+
+
+def _set_native_source_retracted(state: dict[str, Any], head: int) -> None:
+    state["ace"]["head_source"][str(head)] = None
+    module, key = _head_key(head)
+    feed = state[module][key]
+    feed["filament_detected"] = True
+    feed["filament_in_ace"] = False
+    feed["filament_in_toolhead"] = False
+    feed["filament_at_extruder"] = False
+    feed["channel_state"] = "preload_finish"
+    feed["channel_error"] = "ok"
+
+
+def _set_native_source_full_unloaded(state: dict[str, Any], head: int) -> None:
+    state["ace"]["head_source"][str(head)] = None
+    module, key = _head_key(head)
+    feed = state[module][key]
+    feed["filament_detected"] = False
+    feed["filament_in_ace"] = False
+    feed["filament_in_toolhead"] = False
+    feed["filament_at_extruder"] = False
+    feed["channel_state"] = "wait_insert"
+    feed["channel_error"] = "ok"
+
+
 def _set_head_empty(state: dict[str, Any], head: int) -> None:
     state["ace"]["head_source"][str(head)] = None
     module, key = _head_key(head)
@@ -474,6 +591,41 @@ def _source_graph_allows_ace(
     return False
 
 
+def _source_graph_allows_native(
+    graph: dict[str, Any], head: int, module: str, channel: int
+) -> bool:
+    sources = graph.get("sources") or {}
+    head_id = f"head:{head}"
+    if head_id not in (graph.get("heads") or {}):
+        return False
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("enabled", True) is False:
+            continue
+        if edge.get("head") != head_id:
+            continue
+        source = sources.get(edge.get("source")) or {}
+        if source.get("kind") != "native_feeder":
+            continue
+        src_module = source.get("module")
+        src_channel = source.get("channel")
+        try:
+            src_channel = int(src_channel)
+        except (TypeError, ValueError):
+            source_head = source.get("head")
+            try:
+                src_channel = int(_native_channel(int(source_head))["channel"])
+            except Exception:
+                continue
+        if src_module is None:
+            try:
+                src_module = _native_channel(int(source.get("head")))["module"]
+            except Exception:
+                continue
+        if str(src_module) == str(module) and int(src_channel) == int(channel):
+            return True
+    return False
+
+
 def _source_graph_has_ace_head(graph: dict[str, Any], head: int) -> bool:
     sources = graph.get("sources") or {}
     head_id = f"head:{head}"
@@ -486,6 +638,23 @@ def _source_graph_has_ace_head(graph: dict[str, Any], head: int) -> bool:
         if source.get("kind") == "ace_slot":
             return True
     return False
+
+
+def _prune_stale_head_sources_for_graph(state: dict[str, Any]) -> None:
+    graph = _read_source_graph()
+    head_source = state["ace"].get("head_source") or {}
+    for raw_head, src in list(head_source.items()):
+        if src is None:
+            continue
+        try:
+            head = int(raw_head)
+            ace = int(src.get("ace_index"))
+            slot = int(src.get("slot"))
+        except Exception:
+            head_source[str(raw_head)] = None
+            continue
+        if not _source_graph_allows_ace(graph, head, ace, slot):
+            head_source[str(head)] = None
 
 
 def _parse_args(line: str) -> tuple[str, dict[str, str]]:
@@ -566,26 +735,67 @@ def _apply_script(script: str) -> None:
             head = int(args.get("EXTRUDER", "0"))
             module = args.get("MODULE", "")
             channel = int(args.get("CHANNEL", "0"))
-            expected_module, expected_key = _head_key(head)
-            expected_channel = {
-                0: 1,
-                1: 0,
-                2: 0,
-                3: 1,
-            }.get(head)
-            if f"filament_feed {module}" != expected_module or channel != expected_channel:
+            graph = _read_source_graph()
+            if not _source_graph_allows_native(graph, head, module, channel):
                 raise ValueError(
                     f"FEED_AUTO route mismatch for T{head}: "
                     f"MODULE={module} CHANNEL={channel}")
-            head_modes = (state["ace"].get("route", {}) or {}).get("head_modes", {}) or {}
-            if head_modes.get(str(head)) != "native":
-                raise ValueError(f"FEED_AUTO dry-run direct path is only for native T{head}")
             if int(args.get("LOAD", "0") or 0) == 1:
+                machine = state.setdefault("machine_state", {})
+                if (machine.get("strict_transitions")
+                        and machine.get("main_state") == "AUTO_UNLOAD"):
+                    raise ValueError(
+                        "Failed to change state: Invalid state transition "
+                        "from AUTO_UNLOAD to AUTO_LOAD")
+                machine["main_state"] = "AUTO_LOAD"
+                machine["action_code"] = "AUTO_LOADING"
                 _set_native_head_loaded(state, head)
+                machine["main_state"] = "IDLE"
+                machine["action_code"] = "IDLE"
             elif int(args.get("UNLOAD", "0") or 0) == 1:
-                _set_head_empty(state, head)
+                machine = state.setdefault("machine_state", {})
+                machine["main_state"] = "AUTO_UNLOAD"
+                machine["action_code"] = "AUTO_UNLOADING"
+                if machine.get("linger_auto_unload_once"):
+                    machine["linger_auto_unload_once"] = False
+                    _set_native_unload_finished_with_toolhead_filament(state, head)
+                else:
+                    _set_native_toolhead_unloaded(state, head)
+                    machine["main_state"] = "IDLE"
+                    machine["action_code"] = "IDLE"
             else:
                 raise ValueError("FEED_AUTO dry-run supports LOAD=1 or UNLOAD=1")
+        elif cmd == "FEED_AUTO_RETRACT":
+            head = int(args.get("EXTRUDER", "0"))
+            module = args.get("MODULE", "")
+            channel = int(args.get("CHANNEL", "0"))
+            graph = _read_source_graph()
+            if not _source_graph_allows_native(graph, head, module, channel):
+                raise ValueError(
+                    f"FEED_AUTO_RETRACT route mismatch for T{head}: "
+                    f"MODULE={module} CHANNEL={channel}")
+            _set_native_source_retracted(state, head)
+        elif cmd == "FEED_AUTO_FULL_UNLOAD":
+            head = int(args.get("EXTRUDER", "0"))
+            module = args.get("MODULE", "")
+            channel = int(args.get("CHANNEL", "0"))
+            graph = _read_source_graph()
+            if not _source_graph_allows_native(graph, head, module, channel):
+                raise ValueError(
+                    f"FEED_AUTO_FULL_UNLOAD route mismatch for T{head}: "
+                    f"MODULE={module} CHANNEL={channel}")
+            _set_native_source_full_unloaded(state, head)
+        elif cmd == "G28":
+            axes = str(args.get("AXES", "") or args.get("AXIS", "") or "").strip().lower()
+            if not axes:
+                state["toolhead"] = {"homed_axes": "xyz"}
+            else:
+                if axes in ("x", "y", "z"):
+                    current = set(str((state.get("toolhead") or {}).get("homed_axes") or "").lower())
+                    current.update(list(axes))
+                    state["toolhead"] = {"homed_axes": "".join(sorted(current))}
+                else:
+                    state["toolhead"] = {"homed_axes": "xyz"}
         elif cmd == "SAVE_VARIABLE":
             var = args.get("VARIABLE")
             val = args.get("VALUE", "")
@@ -600,7 +810,7 @@ def _apply_script(script: str) -> None:
                 ptc["filament_sub_type"][head] = args.get("FILAMENT_SUBTYPE", "").strip('"')
                 ptc["filament_color_rgba"][head] = args.get("FILAMENT_COLOR_RGBA", "FFFFFFFF")
         elif cmd == "MULTIACE_REFRESH_SOURCE_GRAPH":
-            pass
+            _prune_stale_head_sources_for_graph(state)
     _save_state(state)
 
 
@@ -634,6 +844,11 @@ class DryRunHeadSource(BaseModel):
     load_failed: bool = False
     sensor_loaded: bool = False
 
+class DryRunUnknownLoadedHead(BaseModel):
+    head: int
+    channel_state: str = "load_finish"
+    channel_error: str = "ok"
+
 class DryRunScenario(BaseModel):
     ace_device_count: int = 1
     head_modes: dict[str, str] | None = None
@@ -641,6 +856,12 @@ class DryRunScenario(BaseModel):
     native_heads: list[DryRunNativeHead] = []
     slots: list[DryRunSlot] = []
     head_sources: list[DryRunHeadSource] = []
+    unknown_loaded_heads: list[DryRunUnknownLoadedHead] = []
+    strict_machine_transitions: bool = False
+    linger_auto_unload_once: bool = False
+    homed_axes: str = "xyz"
+    print_state: str = "standby"
+    idle_state: str = "Idle"
 
 
 @app.get("/server/info")
@@ -665,6 +886,14 @@ async def objects_list() -> dict[str, Any]:
 
 @app.post("/printer/gcode/script")
 async def gcode_script(payload: ScriptPayload) -> dict[str, Any]:
+    calls = []
+    if SCRIPT_CALLS_PATH.exists():
+        try:
+            calls = json.loads(SCRIPT_CALLS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            calls = []
+    calls.append({"ts": time.time(), "script": payload.script})
+    SCRIPT_CALLS_PATH.write_text(json.dumps(calls, indent=2), encoding="utf-8")
     try:
         _apply_script(payload.script)
     except ValueError as exc:
@@ -728,6 +957,17 @@ async def gcode_log() -> JSONResponse:
     return JSONResponse({"lines": GCODE_LOG.read_text(encoding="utf-8").splitlines()})
 
 
+@app.get("/dry-run/script-calls")
+async def script_calls() -> JSONResponse:
+    if not SCRIPT_CALLS_PATH.exists():
+        return JSONResponse({"calls": []})
+    try:
+        calls = json.loads(SCRIPT_CALLS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        calls = []
+    return JSONResponse({"calls": calls})
+
+
 @app.get("/dry-run/uploaded/{name:path}")
 async def uploaded_file(name: str) -> JSONResponse:
     safe_name = Path(name or "").name
@@ -751,7 +991,9 @@ async def reset() -> dict[str, Any]:
     _save_state(state)
     if GCODE_LOG.exists():
         GCODE_LOG.unlink()
-    for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
+    if SCRIPT_CALLS_PATH.exists():
+        SCRIPT_CALLS_PATH.unlink()
+    for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH, HEAD_SOURCE_STATE_PATH):
         if p.exists():
             p.unlink()
     if UPLOAD_DIR.exists():
@@ -786,6 +1028,13 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
     CFG_PATH.write_text("\n".join(cfg_lines) + "\n", encoding="utf-8")
     _apply_cfg_route(state)
     _write_source_graph_from_route(state)
+    state["machine_state"]["strict_transitions"] = bool(
+        payload.strict_machine_transitions)
+    state["machine_state"]["linger_auto_unload_once"] = bool(
+        payload.linger_auto_unload_once)
+    state["toolhead"] = {"homed_axes": payload.homed_axes}
+    state["print_stats"]["state"] = payload.print_state
+    state["idle_timeout"]["state"] = payload.idle_state
 
     for h in range(4):
         _set_head_empty(state, h)
@@ -848,12 +1097,30 @@ async def scenario(payload: DryRunScenario) -> dict[str, Any]:
             feed["filament_in_toolhead"] = True
             feed["filament_at_extruder"] = True
 
+    for unknown in payload.unknown_loaded_heads:
+        head = int(unknown.head)
+        if head < 0 or head >= 4:
+            raise HTTPException(status_code=400, detail=f"invalid unknown loaded head {head}")
+        module, key = _head_key(head)
+        feed = state[module][key]
+        feed["filament_detected"] = True
+        feed["filament_in_ace"] = False
+        feed["filament_in_toolhead"] = True
+        feed["filament_at_extruder"] = True
+        feed["channel_state"] = unknown.channel_state
+        feed["channel_action_state"] = unknown.channel_state
+        feed["channel_error"] = unknown.channel_error
+        feed["channel_error_state"] = (
+            "none" if unknown.channel_error in ("", "ok") else unknown.channel_state)
+
     _save_state(state)
-    for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH):
+    for p in (SLOT_OVERRIDE_PATH, NATIVE_OVERRIDE_PATH, HEAD_SOURCE_STATE_PATH):
         if p.exists():
             p.unlink()
     if GCODE_LOG.exists():
         GCODE_LOG.unlink()
+    if SCRIPT_CALLS_PATH.exists():
+        SCRIPT_CALLS_PATH.unlink()
     if UPLOAD_DIR.exists():
         for p in UPLOAD_DIR.iterdir():
             if p.is_file():

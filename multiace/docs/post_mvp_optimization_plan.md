@@ -316,6 +316,23 @@ purge/prime: 35s
 - 不允许在 `head_source` 不可信时跳过 unload/load。
 - 不允许把 native head 纳入 ACE recovery 猜测。
 
+### 2026-06-16 安全阻塞
+
+实机多色打印测试中出现过旧料未真正退出但系统继续触发下一次 ACE slot 进料的
+异常。该问题解决前，暂停所有以“提高换料效率”为目标的优化，包括缩短等待、
+提前换料调度、减少 purge、放宽 retry 和弱化检测。
+
+当前优先级固定为：
+
+1. 不误判 unload/load 成功。
+2. 不在路径未确认清空时推进新料。
+3. 不在失败、暂停、打印结束或手动中断后保留不可控 transport/feed assist。
+4. 不污染 `head_source/current_source`。
+
+换料静止阶段的明显抖动目前只能作为待验证推测记录，不能定性为单一根因。后续需要
+通过更细日志和停机边界验证确认是否与 feed assist / transport 残留、V2 速度追踪、
+工具头保持动作或挤出机微动有关。
+
 ## Phase 3：高级路由能力
 
 目标：扩展硬件路由模型，但仍保持显式配置和可验证 source map。

@@ -3,6 +3,10 @@ const { createApp, ref, reactive, computed, onMounted, watch, nextTick } = Vue;
 const BASE = location.pathname.startsWith("/multiace/") ? "/multiace" : "";
 const API = `${BASE}/api`;
 const SCREEN = "/screen";
+const DEFAULT_MATERIAL_OPTIONS = [
+  "PLA", "PLA+", "PETG", "PETG-HF", "ABS", "ASA",
+  "TPU", "PA", "PA-CF", "PC", "PVA",
+];
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value ?? null));
@@ -76,9 +80,19 @@ createApp({
     const sourceGraph = ref({ version: 1, heads: {}, sources: {}, edges: [], profiles: {} });
     const sourceGraphMeta = reactive({ hash: "", source: "", path: "", errors: [], warnings: [] });
     const sourceState = ref({ version: 1, source_graph_hash: "", heads: {}, meta: {} });
+    const materialOptions = ref(DEFAULT_MATERIAL_OPTIONS.slice());
     const graphJson = ref("");
     const selectedHead = ref("head:0");
     const sourceFilter = ref("all");
+    const sourceExecutionFields = [
+      { key: "preload_length_mm", label: "Preload", min: 0, max: 3000, step: 1 },
+      { key: "push_to_junction_length_mm", label: "To 4-way", min: 0, max: 3000, step: 1 },
+      { key: "load_to_toolhead_length_mm", label: "To head", min: 0, max: 3000, step: 1 },
+      { key: "unload_to_junction_length_mm", label: "Retract", min: 0, max: 3000, step: 1 },
+      { key: "full_unload_length_mm", label: "Full unload", min: 0, max: 3000, step: 1 },
+      { key: "feed_speed_mm_s", label: "Feed mm/s", min: 1, max: 120, step: 1 },
+      { key: "retract_speed_mm_s", label: "Retract mm/s", min: 1, max: 120, step: 1 },
+    ];
 
     async function api(path, options = {}) {
       const init = { ...options, headers: { ...(options.headers || {}) } };
@@ -137,6 +151,15 @@ createApp({
     async function reloadState() { applyState(await api("/state")); }
     async function reloadSourceGraph() { applySourceGraph(await api("/source-graph")); }
     async function reloadSourceState() { sourceState.value = await api("/source-state"); }
+    async function loadMaterials() {
+      try {
+        const payload = await api("/materials");
+        const materials = Array.isArray(payload.materials) ? payload.materials : [];
+        materialOptions.value = materials.length ? materials : DEFAULT_MATERIAL_OPTIONS.slice();
+      } catch (_) {
+        materialOptions.value = DEFAULT_MATERIAL_OPTIONS.slice();
+      }
+    }
 
     async function refreshAll() {
       busy.refresh = true;
@@ -301,6 +324,8 @@ createApp({
         const current = runtime.current_source || "";
         const material = materialBySource.value[current] || {};
         const sources = graphSources.value.filter((source) => source.heads.includes(head.id));
+        const loadedKnown = !!current && runtime.source_confidence === "known";
+        const materialLabel = material.material || (loadedKnown ? "未设置耗材" : "未装载");
         return {
           ...head,
           label: head.label || `T${displayIndex(head.index)}`,
@@ -310,6 +335,7 @@ createApp({
           last_error: runtime.last_error || "",
           sources,
           material,
+          display_material: materialLabel,
         };
       });
     });
@@ -555,6 +581,12 @@ createApp({
     function allowedSourcesForHead(headId) {
       return graphSources.value.filter((source) => source.heads.includes(headId));
     }
+    function headBlocksLoad(head) {
+      return ["unknown", "stale", "failed", "exhausted"].includes(head?.confidence);
+    }
+    function headBlocksUnload(head) {
+      return ["unknown", "stale", "failed"].includes(head?.confidence);
+    }
     function openHeadPanel(headId) {
       headPanel.head = headId || graphHeads.value[0]?.id || "head:0";
       headPanel.targetSource = allowedSourcesForHead(headPanel.head)[0]?.id || "";
@@ -569,6 +601,11 @@ createApp({
     }
     async function runHeadLoadNow() {
       if (!headPanel.head || !headPanel.targetSource) return;
+      const head = headCards.value.find((item) => item.id === headPanel.head);
+      if (headBlocksLoad(head)) {
+        globalError.value = `${head?.label || headPanel.head} 当前状态为 ${head?.confidence}，需要先恢复后再装载`;
+        return;
+      }
       headPanel.status = "执行装载...";
       const source = graphSources.value.find((item) => item.id === headPanel.targetSource);
       const payload = await runOperation("/operation/head/load", {
@@ -584,6 +621,10 @@ createApp({
         globalError.value = `${head?.label || headId} 当前没有已知已装载 source`;
         return;
       }
+      if (headBlocksUnload(head)) {
+        globalError.value = `${head?.label || headId} 当前状态为 ${head?.confidence}，不能自动退料，请先恢复`;
+        return;
+      }
       if (headPanel.open && headPanel.head === headId) headPanel.status = "执行退料...";
       const payload = await runOperation("/operation/head/unload", {
         head: headId,
@@ -591,23 +632,22 @@ createApp({
       }, `${head?.label || headId} 退料`);
       if (headPanel.open && headPanel.head === headId) headPanel.status = payload ? "退料完成" : "";
     }
-    async function runSourceLoadNow(sourceId) {
+    async function runSourceFullUnloadNow(sourceId) {
       const source = graphSources.value.find((item) => item.id === sourceId);
-      const heads = source?.heads || [];
-      if (!source || !heads.length) return;
+      if (!source) return;
+      const loadedHead = headCards.value.find((head) => head.current_source === sourceId);
+      if (loadedHead) {
+        globalError.value = `${source.label} 当前装载在 ${loadedHead.label}，请先从工具头执行退料`;
+        return;
+      }
       if (source.ready === false) {
         globalError.value = `${source.label} 当前不可用：${source.ready_reason || "source not ready"}`;
         return;
       }
-      if (heads.length > 1) {
-        globalError.value = `${source.label} 绑定了多个工具头，请打开目标工具头详情后选择该 source 装载。`;
-        return;
-      }
-      await runOperation("/operation/head/load", {
-        head: heads[0],
+      await runOperation("/source/full-unload", {
         source: sourceId,
         execute: true,
-      }, `${headLabelById(heads[0])} 装载 ${source.label}`);
+      }, `${source.label} 完全退料`);
     }
     function humanPlanSummary(plan) {
       if (!plan) return "";
@@ -636,7 +676,11 @@ createApp({
     function openRecovery(headId) {
       const head = headCards.value.find((item) => item.id === headId);
       recovery.head = headId;
-      recovery.message = `${head?.label || headId} 当前状态为 ${head?.confidence || "unknown"}。自动动作已阻止，请检查物理耗材路径，必要时先预览退料或手动清理后再恢复。`;
+      if (head?.confidence === "exhausted" && head.current_source) {
+        recovery.message = `${head?.label || headId} 当前 source 标记为 exhausted，但工具头仍检测到耗材。非打印状态下应先执行退料恢复，把工具头内余料退出后再继续。`;
+      } else {
+        recovery.message = `${head?.label || headId} 当前状态为 ${head?.confidence || "unknown"}。自动装载已阻止，请检查物理耗材路径，必要时手动清理后再恢复。`;
+      }
       recovery.open = true;
     }
 
@@ -662,9 +706,9 @@ createApp({
       materialEditor.ace = source.ace ?? null;
       materialEditor.slot = source.slot ?? null;
       materialEditor.head = source.head ?? null;
-      materialEditor.material = source.material || "PLA";
-      materialEditor.brand = source.brand || "Generic";
-      materialEditor.subtype = source.subtype || "Basic";
+      materialEditor.material = source.material || "";
+      materialEditor.brand = source.brand || "";
+      materialEditor.subtype = source.subtype || "";
       materialEditor.color = validHex(source.color) ? source.color : "#ffffff";
       materialEditor.rfid = source.rfid || null;
     }
@@ -676,7 +720,7 @@ createApp({
       if (rfid.sku) materialEditor.subtype = rfid.sku;
       if (validHex(rfid.color)) materialEditor.color = rfid.color;
     }
-    async function saveMaterialEditor(loadAfter = false) {
+    async function saveMaterialEditor() {
       const body = {
         material: materialEditor.material || "",
         brand: materialEditor.brand || "",
@@ -695,10 +739,13 @@ createApp({
             body: { head: materialEditor.head, ...body },
           });
         }
-        await refreshAll();
         setToast("耗材信息已保存");
-        if (loadAfter) await runSourceLoadNow(materialEditor.source);
         closeMaterialEditor();
+        Promise.allSettled([
+          reloadState(),
+          reloadSourceState(),
+          reloadSourceGraph(),
+        ]);
       } catch (error) {
         globalError.value = error.message || String(error);
       }
@@ -1484,9 +1531,25 @@ createApp({
       }
       return `可用 · ${target.ready_reason || target.state || "ready"}`;
     }
+    function sourceReadyLabel(source) {
+      if (!source || source.ready == null) return "未知";
+      return source.ready ? "可用" : "不可用";
+    }
     function sourceStatusClass(source) {
       if (!source || source.ready == null) return "unknown";
       return source.ready ? "ok" : "failed";
+    }
+    function headConfidenceLabel(head) {
+      const confidence = head?.confidence || "unknown";
+      const labels = {
+        known: "已装载",
+        empty: "未装载",
+        unknown: "未知来源",
+        stale: "状态过期",
+        failed: "异常",
+        exhausted: "耗尽",
+      };
+      return labels[confidence] || confidence;
     }
     function yesNo(value) {
       if (value == null) return "-";
@@ -1637,6 +1700,7 @@ createApp({
 
     onMounted(async () => {
       await loadVersion();
+      await loadMaterials();
       await refreshAll();
       await Promise.allSettled([loadConfig(), refreshDebugState()]);
       startScreenPolling();
@@ -1659,15 +1723,17 @@ createApp({
       sourceOptionsForHead, edgeEnabled, edgePriority, setEdgeEnabled, setEdgePriority,
       setHeadSourceBinding, bindingLabel,
       sourceExecutionValue, setSourceExecutionValue,
+      sourceExecutionFields,
       syncGraphJson, applyGraphJson, saveSourceGraph,
       currentOperation, operationBusy, operationLabel, reloadOperation,
       confirmUnloadAll,
       dryerCfg, dryStart, dryStop,
       headPanel, activeHeadCard, allowedSourcesForHead,
-      openHeadPanel, closeHeadPanel, runHeadLoadNow, runHeadUnloadNow, runSourceLoadNow,
+      openHeadPanel, closeHeadPanel, runHeadLoadNow, runHeadUnloadNow, runSourceFullUnloadNow,
       humanPlanSummary,
       recovery, openRecovery,
-      materialEditor, openMaterialEditor, closeMaterialEditor, readMaterialFromRfid, saveMaterialEditor,
+      materialEditor, materialOptions,
+      openMaterialEditor, closeMaterialEditor, readMaterialFromRfid, saveMaterialEditor,
       snapshots, selectedSnapshot, saveSnapshot, applySnapshot, deleteSnapshot,
       screenAvailable, screenCanvas, floatScreenCanvas, screenPopout, screenFps,
       screenDown, screenMove, screenUp, toggleScreenPopout,
@@ -1683,7 +1749,8 @@ createApp({
       handleFileInput, handleDrop, autoValidateRoutePlan, remapRoutePlan,
       checkClass, mappingLabel, mappingCommands, assignSelectedTool,
       targetCardForTool, sourceCardLabel, sourceStatusLabel,
-      sourceStatusClass, sourceRuntimeDetail,
+      sourceReadyLabel, sourceStatusClass, headConfidenceLabel,
+      sourceRuntimeDetail,
       targetRouteLabel, printRoutePlan,
     };
   },

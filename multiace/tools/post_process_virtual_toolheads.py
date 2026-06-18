@@ -277,6 +277,66 @@ def _commands_for_tool_event(t_index, cursor, ace_targets=None, tool_targets=Non
             'ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d'
             % (head, target['ace'], target['slot'])]
 
+def _force_physical_heater_t(line, ace_targets=None, tool_targets=None,
+                             route_plan=None, strict=False):
+    """Rewrite M104/M109 T references to physical heads and force A0.
+
+    Snapmaker's stock Klipper handlers remap heater commands through
+    print_task_config unless A0 is present.  Route-plan output is already
+    physical, so every rewritten heater command with an explicit T must
+    carry A0 or native/ACE mixed prints can heat the wrong toolhead.
+    """
+    if not re.match(r'^\s*M10[49]\b', line):
+        return line
+    newline = ''
+    body = line
+    if body.endswith('\r\n'):
+        body, newline = body[:-2], '\r\n'
+    elif body.endswith('\n'):
+        body, newline = body[:-1], '\n'
+    elif body.endswith('\r'):
+        body, newline = body[:-1], '\r'
+
+    amap = re.search(r'(?<![A-Za-z])A([-+]?\d+(?:\.\d+)?)\b', body)
+    t_values = []
+    for match in re.finditer(r'(?<![A-Za-z])T(1[0-5]|[0-9])\b', body):
+        try:
+            t_values.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            pass
+    if (amap is not None and amap.group(1) == '0'
+            and t_values and all(0 <= t <= 3 for t in t_values)):
+        return body + newline
+
+    saw_t = False
+
+    def _replace_t(match):
+        nonlocal saw_t
+        saw_t = True
+        head = _target_for_tool(
+            int(match.group(1)), ace_targets, tool_targets,
+            route_plan=route_plan, strict=strict)['head']
+        return 'T%d' % head
+
+    body = re.sub(r'(?<![A-Za-z])T(1[0-5]|[0-9])\b', _replace_t, body)
+    if not saw_t:
+        return body + newline
+
+    if re.search(r'(?<![A-Za-z])A[-+]?\d+(?:\.\d+)?\b', body):
+        body = re.sub(r'(?<![A-Za-z])A[-+]?\d+(?:\.\d+)?\b', 'A0', body)
+        return body + newline
+
+    comment_idx = body.find(';')
+    if comment_idx >= 0:
+        code = body[:comment_idx].rstrip()
+        comment = body[comment_idx:]
+        body = code + ' A0'
+        if comment:
+            body += ' ' + comment
+    else:
+        body = body.rstrip() + ' A0'
+    return body + newline
+
 def _target_for_tool(t_index, ace_targets=None, tool_targets=None,
                      route_plan=None, strict=False):
     route_targets = _normalize_route_plan_targets(route_plan)
@@ -318,11 +378,8 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     route_strict = bool(route_cursor.get('strict'))
 
     def _fix_m104(m):
-        return re.sub(r'T(1[0-5]|[0-9])',
-                      lambda t: 'T%d' % _target_for_tool(
-                          int(t.group(1)), ace_targets, tool_targets,
-                          strict=route_strict)['head'],
-                      m.group(0))
+        return _force_physical_heater_t(
+            m.group(0), ace_targets, tool_targets, strict=route_strict)
     gcode = re.sub(r'^M10[49][^\n]*',
                    _fix_m104, gcode, flags=re.MULTILINE)
 
@@ -2022,11 +2079,8 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
 
     def fix_m104(line):
-        return re.sub(r'T(1[0-5]|[0-9])',
-                      lambda t: 'T%d' % _target_for_tool(
-                          int(t.group(1)), ace_targets, tool_targets,
-                          strict=route_strict)['head'],
-                      line)
+        return _force_physical_heater_t(
+            line, ace_targets, tool_targets, strict=route_strict)
 
     in_body = False
     head_loaded = {}

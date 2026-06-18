@@ -8,6 +8,9 @@
 前端重构总体方案见：
 `multiace/docs/frontend_ui_rewrite_plan.md`。
 
+进退料执行语义见：
+`multiace/docs/unified_slot_toolhead_flow.md`。
+
 ## 核心原则
 
 - source graph 是配置事实来源。
@@ -75,12 +78,21 @@
 
 ### Source Execution
 
-每个 source 可带 `execution` 对象。当前已支持：
+每个 source 可带 `execution` 对象。当前已经落地的是 `preload_length_mm`；
+后续统一 slot/toolhead flow 需要扩展为同一套 per-source 执行参数：
 
 ```json
 {
   "execution": {
-    "preload_length_mm": 950
+    "preload_length_mm": 950,
+    "push_to_junction_length_mm": 0,
+    "load_to_toolhead_length_mm": 750,
+    "unload_to_junction_length_mm": 120,
+    "full_unload_length_mm": 950,
+    "toolhead_sync_retract_length_mm": 0,
+    "feed_speed_mm_s": 25,
+    "retract_speed_mm_s": 25,
+    "toolhead_sync_retract_speed_mm_s": 10
   }
 }
 ```
@@ -89,11 +101,23 @@
 
 - `preload_length_mm` 是 source slot 从入口预进料到四通/目标路径入口的长度，
   单位 mm。
+- `push_to_junction_length_mm` 是 source 从预进料终点推到四通/路径入口的长度。
+- `load_to_toolhead_length_mm` 是 source 从四通/路径入口推到工具头附近的长度。
+- `unload_to_junction_length_mm` 是 toolhead unload 时 source 侧回抽到四通外的
+  长度。
+- `full_unload_length_mm` 是 source 完全退回入口外的长度。
+- `feed_speed_mm_s` / `retract_speed_mm_s` 是 source slot 侧进退速度。
+- `toolhead_sync_retract_length_mm` / `toolhead_sync_retract_speed_mm_s` 是
+  source 回抽阶段可选的工具头挤出机同步反抽参数。默认长度为 `0`，表示保持
+  旧行为；当 native feeder 机械结构支持可靠反向夹持后，可配置该值来实现
+  toolhead 与 source slot 协同退料。
 - `native:<n>` 和 `ace:<ace>:<slot>` 都按 source 独立配置。
-- 合法范围为 `0..3000`。
+- 长度合法范围建议为 `0..3000` mm；速度合法范围由后端 schema 明确限制。
 - 对 ACE source，`0` 表示禁用 ACE 自动预进料。
 - 该字段是 source 状态/执行参数，不代表工具头已经 loaded；工具头是否 loaded
   仍只由 `source-state.heads[head:N].current_source/source_confidence` 判断。
+- 字段名必须跨 native slot 和 ACE slot 保持一致；adapter 可以选择内部不使用
+  某个字段，但不能另起一套仅 ACE 或仅 native 的字段名。
 
 ## Source State
 
@@ -114,6 +138,16 @@
 - `empty`：可执行 load。
 - `unknown` / `stale` / `failed`：必须恢复后重新 preflight。
 - `exhausted`：ACE slot 已 empty 但路径可能有余料，必须走断料/余料恢复流程。
+
+前端和后端必须区分：
+
+- `sources[source_id].slot_state/path_position`：source slot 状态，只表达耗材来源
+  自身是否 ready、是否在预进料位、是否正在回抽或完全退料。
+- `heads[head_id].current_source/source_confidence`：toolhead 装载状态，是判断
+  工具头是否 loaded 的唯一软件事实来源。
+
+`preload_finish`、source `ready` 或 source `path_position=preload_done` 都不能
+推断工具头已进料。
 
 ## 手动动作预览
 
@@ -140,6 +174,57 @@
 - 只预览。
 - 不发送 G-code。
 - 不改变硬件状态。
+
+## 手动动作执行边界
+
+后续真实硬件动作应收口到统一 operation API。当前已存在的 `/api/operation/*`
+入口必须按以下边界继续收敛：
+
+### Toolhead 主流程
+
+- `POST /api/operation/load`
+  - 输入：`head_id`、`source_id`。
+  - 后端执行 source push/load、toolhead step-in 和 loaded commit。
+- `POST /api/operation/unload`
+  - 输入：`head_id`。
+  - 后端必须从 `head.current_source` 找到 source，不允许前端选择 unload source。
+  - 后端执行 toolhead unload、source retract-to-junction 和 empty commit。
+- `POST /api/operation/swap`
+  - 输入：`head_id`、`target_source_id`。
+  - 后端组合 unload current source 与 load target source。
+
+### Source 自身动作
+
+- `POST /api/source/full-unload`
+  - 输入：`source_id`。
+  - 只允许 source 不属于任何 head 的 `current_source` 时执行。
+  - 用于把耗材完全退回入口外，不得替代 toolhead unload。
+- `POST /api/operation/recover`
+  - 输入：`head_id` / `source_id`、`reason` 和用户确认。
+  - 只处理 `unknown/stale/failed/exhausted` 等异常恢复。
+
+执行不变量：
+
+- 同一时刻只允许一个 active operation。
+- 普通动作不得由前端可见队列驱动；多阶段动作必须由后端作为一个复合 operation
+  执行。
+- 每个阶段必须 post-check；失败时进入 `failed`，不得提交 loaded/empty。
+- `full-unload` 禁止作用于任何 head 当前已装载的 source。
+
+## Route Plan 资源约束
+
+当前资源约束：
+
+- 同一个 `source_id` 只能在一个 route plan 中映射到一个 `head`。
+- 同一台 ACE 可以在一个 route plan 中服务多个 head，前提是不同 head 使用不同
+  ACE slot/source。
+- 硬件动作仍按 route plan 顺序执行，不允许并发 ACE swap。
+- 这个约束允许 `1+1+2+2` 测试拓扑：
+  - `native:0 -> head:0`
+  - `native:1 -> head:1`
+  - `ace:0:0/ace:0:1 -> head:2`
+  - `ace:0:2/ace:0:3 -> head:3`
+- 该拓扑不应生成 native `FEED_AUTO_RETRACT`，因为 native head 不参与同 head 换料。
 
 ## 打印发送流程
 
