@@ -518,6 +518,7 @@ def save_graph(path: str | Path, graph: dict[str, Any]) -> dict[str, Any]:
     tmp.write_text(json.dumps(normalized, indent=2, sort_keys=True) + "\n",
                    encoding="utf-8")
     tmp.replace(p)
+    p.chmod(0o644)
     return {
         "path": str(p),
         "source": "file",

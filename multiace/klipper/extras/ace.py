@@ -4521,6 +4521,11 @@ class MultiAce:
                         'FORCE=1' % (
                             head, fallback_type, fallback_color, fallback_brand))
             else:
+                if not self._head_has_ace_display_route(head):
+                    logging.info(
+                        '[multiACE] _push_rfid_info: head %d is not ACE-routed; '
+                        'skipping display clear' % head)
+                    continue
                 logging.info(
                     '[multiACE] _push_rfid_info: head %d - empty routed '
                     'head, clearing display' % head)
@@ -4535,6 +4540,17 @@ class MultiAce:
                     'FORCE=1' % head)
         if lines:
             self.gcode.run_script_from_command('\n'.join(lines))
+
+    def _head_has_ace_display_route(self, head):
+        try:
+            h = int(head)
+        except Exception:
+            return False
+        if self._source_graph_loaded():
+            return self._head_has_ace_source_graph_edge(h)
+        return (
+            h < len(self._head_modes)
+            and self._head_modes[h] == 'ace')
 
     cmd_MULTIACE_REFRESH_OVERRIDES_help = (
         '[multiACE] Reload slot_overrides.json and push to display')

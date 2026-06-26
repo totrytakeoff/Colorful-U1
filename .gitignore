@@ -1,0 +1,8 @@
+.playwright-mcp/
+.tmp_logs/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+multiace/tools/multiace_postprocess.log
