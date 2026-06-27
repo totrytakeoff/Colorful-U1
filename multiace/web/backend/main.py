@@ -3418,11 +3418,14 @@ _GCODE_DANGEROUS_COMMANDS = {
 }
 _GCODE_COMMAND_RE = re.compile(r"^\s*([GMT]\d+(?:\.\d+)?)\b", re.I)
 
-def _validate_web_gcode_safety_text(gcode: str, *, filename: str = "") -> dict:
+def _validate_web_gcode_safety_lines(lines, *, filename: str = "") -> dict:
     errors: list[dict[str, Any]] = []
     machine_signature = ""
     dangerous: list[dict[str, Any]] = []
-    for line_no, raw in enumerate(gcode.splitlines(), start=1):
+    for line_no, raw in enumerate(lines, start=1):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        raw = str(raw).rstrip("\r\n")
         line = raw.strip()
         if line_no <= 500:
             for pattern in _GCODE_MACHINE_BLOCKERS:
@@ -3462,9 +3465,17 @@ def _validate_web_gcode_safety_text(gcode: str, *, filename: str = "") -> dict:
         "errors": errors,
     }
 
+def _validate_web_gcode_safety_text(gcode: str, *, filename: str = "") -> dict:
+    return _validate_web_gcode_safety_lines(
+        gcode.splitlines(), filename=filename)
+
 def _validate_web_gcode_safety_bytes(data: bytes, *, filename: str = "") -> dict:
-    text = data.decode("utf-8", errors="replace")
-    return _validate_web_gcode_safety_text(text, filename=filename)
+    return _validate_web_gcode_safety_lines(
+        data.splitlines(), filename=filename)
+
+def _validate_web_gcode_safety_file(path: Path, *, filename: str = "") -> dict:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return _validate_web_gcode_safety_lines(fh, filename=filename)
 
 def _raise_gcode_safety_error(validation: dict) -> None:
     if validation.get("ok"):
@@ -3586,30 +3597,42 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         raise HTTPException(status_code=400, detail="invalid filename")
     if not safe_name.lower().endswith((".gcode", ".gco", ".g")):
         raise HTTPException(status_code=400, detail="not a g-code file")
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty file")
-    if len(data) > _PREFLIGHT_MAX_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=(f"gcode too large for in-printer preflight "
-                    f"({len(data)//1024//1024} MB > "
-                    f"{_PREFLIGHT_MAX_SIZE//1024//1024} MB limit). "
-                    f"Bypass: upload directly via Moonraker's normal "
-                    f"upload endpoint, or raise the limit via "
-                    f"MULTIACE_PREFLIGHT_MAX_MB env."))
-    _raise_gcode_safety_error(
-        _validate_web_gcode_safety_bytes(data, filename=safe_name))
-
     _cleanup_preflight_dir()
     _PREFLIGHT_DIR.mkdir(parents=True, exist_ok=True)
     import uuid as _uuid
     token = _uuid.uuid4().hex
-    upload_size = len(data)
     src_path = _PREFLIGHT_DIR / (token + ".gcode")
-    src_path.write_bytes(data)
+    upload_size = 0
+    with open(src_path, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            upload_size += len(chunk)
+            if upload_size > _PREFLIGHT_MAX_SIZE:
+                try:
+                    src_path.unlink()
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=(f"gcode too large for in-printer preflight "
+                            f"({upload_size//1024//1024} MB > "
+                            f"{_PREFLIGHT_MAX_SIZE//1024//1024} MB limit). "
+                            f"Bypass: upload directly via Moonraker's normal "
+                            f"upload endpoint, or raise the limit via "
+                            f"MULTIACE_PREFLIGHT_MAX_MB env."))
+            out.write(chunk)
+    await file.close()
+    if upload_size <= 0:
+        try:
+            src_path.unlink()
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="empty file")
+    _raise_gcode_safety_error(
+        _validate_web_gcode_safety_file(src_path, filename=safe_name))
     (_PREFLIGHT_DIR / (token + ".name")).write_text(safe_name, encoding="utf-8")
-    del data
 
     pp = _load_post_processor()
 
@@ -3936,10 +3959,8 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                 _prepend_print_prefs, str(cur), str(nxt))
             cur, nxt = nxt, cur
 
-        final_validation = _validate_web_gcode_safety_text(
-            cur.read_text(encoding="utf-8", errors="replace"),
-            filename=safe_name,
-        )
+        final_validation = _validate_web_gcode_safety_file(
+            cur, filename=safe_name)
         if not final_validation.get("ok"):
             blocked = []
             for item in (final_validation.get("errors") or [])[:6]:
