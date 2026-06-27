@@ -6,6 +6,7 @@ USER_NAME="root"
 MOONRAKER_PORT="7125"
 REMOTE_KLIPPER="/home/lava/klipper/klippy"
 REMOTE_WEB="/home/lava/multiace_web"
+REMOTE_TOOLS="/home/lava/printer_data/config/tools"
 REMOTE_MULTIACE_CFG="/home/lava/printer_data/config/extended/multiace"
 DEPLOY_WEB=1
 RESTART_KLIPPER=1
@@ -131,6 +132,7 @@ ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "
   cp '${REMOTE_KLIPPER}/kinematics/extruder_ace.py' '${REMOTE_BACKUP}/kinematics/extruder_ace.py' 2>/dev/null || true
   cp '${REMOTE_KLIPPER}/kinematics/extruder.py' '${REMOTE_BACKUP}/kinematics/extruder.py' 2>/dev/null || true
   cp '${REMOTE_MULTIACE_CFG}/ace_mode_switch.sh' '${REMOTE_BACKUP}/config/ace_mode_switch.sh' 2>/dev/null || true
+  cp '${REMOTE_TOOLS}/post_process_virtual_toolheads.py' '${REMOTE_BACKUP}/config/post_process_virtual_toolheads.py' 2>/dev/null || true
   if [ -d '${REMOTE_WEB}' ]; then
     mkdir -p '${REMOTE_BACKUP}/web'
     cp -a '${REMOTE_WEB}/.' '${REMOTE_BACKUP}/web/' 2>/dev/null || true
@@ -155,6 +157,9 @@ scp "${SSH_OPTS[@]}" multiace/klipper/kinematics/extruder_ace.py \
   "${SSH_TARGET}:${REMOTE_KLIPPER}/kinematics/extruder_ace.py"
 scp "${SSH_OPTS[@]}" multiace/config/extended/multiace/ace_mode_switch.sh \
   "${SSH_TARGET}:${REMOTE_MULTIACE_CFG}/ace_mode_switch.sh"
+ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "mkdir -p '${REMOTE_TOOLS}'"
+scp "${SSH_OPTS[@]}" multiace/tools/post_process_virtual_toolheads.py \
+  "${SSH_TARGET}:${REMOTE_TOOLS}/post_process_virtual_toolheads.py"
 
 echo "== Activating Colorful-U1 Klipper modules =="
 ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "
@@ -168,6 +173,7 @@ ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "
     '${REMOTE_KLIPPER}/extras/filament_switch_sensor_ace.py' \
     '${REMOTE_KLIPPER}/kinematics/extruder_ace.py'
   chmod 755 '${REMOTE_MULTIACE_CFG}/ace_mode_switch.sh'
+  chmod 644 '${REMOTE_TOOLS}/post_process_virtual_toolheads.py'
   cp '${REMOTE_KLIPPER}/extras/filament_feed_ace.py' '${REMOTE_KLIPPER}/extras/filament_feed.py'
   cp '${REMOTE_KLIPPER}/extras/filament_switch_sensor_ace.py' '${REMOTE_KLIPPER}/extras/filament_switch_sensor.py'
   cp '${REMOTE_KLIPPER}/kinematics/extruder_ace.py' '${REMOTE_KLIPPER}/kinematics/extruder.py'
@@ -175,7 +181,7 @@ ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "
     '${REMOTE_KLIPPER}/extras/filament_feed.py' \
     '${REMOTE_KLIPPER}/extras/filament_switch_sensor.py' \
     '${REMOTE_KLIPPER}/kinematics/extruder.py'
-  rm -rf '${REMOTE_KLIPPER}/extras/__pycache__' '${REMOTE_KLIPPER}/kinematics/__pycache__'
+  rm -rf '${REMOTE_KLIPPER}/extras/__pycache__' '${REMOTE_KLIPPER}/kinematics/__pycache__' '${REMOTE_TOOLS}/__pycache__'
 "
 
 if [[ "${DEPLOY_WEB}" -eq 1 ]]; then
@@ -190,6 +196,7 @@ if [[ "${DEPLOY_WEB}" -eq 1 ]]; then
         mkdir -p '${REMOTE_WEB}'
         rm -rf '${REMOTE_WEB}/backend' '${REMOTE_WEB}/frontend'
         tar -xf - -C '${REMOTE_WEB}'
+        rm -rf '${REMOTE_WEB}/backend/__pycache__'
       "
   scp "${SSH_OPTS[@]}" multiace/web/deploy/S98multiace-web \
     "${SSH_TARGET}:/etc/init.d/S98multiace-web" || \
@@ -242,6 +249,8 @@ ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "
   cmp -s '${REMOTE_KLIPPER}/extras/filament_feed_ace.py' '${REMOTE_KLIPPER}/extras/filament_feed.py'
   cmp -s '${REMOTE_KLIPPER}/extras/filament_switch_sensor_ace.py' '${REMOTE_KLIPPER}/extras/filament_switch_sensor.py'
   cmp -s '${REMOTE_KLIPPER}/kinematics/extruder_ace.py' '${REMOTE_KLIPPER}/kinematics/extruder.py'
+  grep -q 'COLORFUL_U1_ROUTE_SELECT' '${REMOTE_KLIPPER}/extras/ace.py'
+  grep -q 'COLORFUL_U1_ROUTE_SELECT' '${REMOTE_TOOLS}/post_process_virtual_toolheads.py'
   grep -q 'not ace_routed' '${REMOTE_KLIPPER}/extras/filament_feed.py'
   grep -q '_pending_load_source' '${REMOTE_KLIPPER}/extras/filament_feed.py'
   echo 'Active Klipper module files match Colorful-U1 ACE files.'
