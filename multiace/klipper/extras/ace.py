@@ -756,6 +756,9 @@ class MultiAce:
             'ACE_SWAP_HEAD', self.cmd_ACE_SWAP_HEAD,
             desc=self.cmd_ACE_SWAP_HEAD_help)
         self.gcode.register_command(
+            'COLORFUL_U1_ROUTE_SELECT', self.cmd_COLORFUL_U1_ROUTE_SELECT,
+            desc=self.cmd_COLORFUL_U1_ROUTE_SELECT_help)
+        self.gcode.register_command(
             'ACE_HEAD_STATUS', self.cmd_ACE_HEAD_STATUS,
             desc=self.cmd_ACE_HEAD_STATUS_help)
         self.gcode.register_command(
@@ -6208,6 +6211,70 @@ class MultiAce:
         self._set_active_idx(ace_index)
         self._audit_state('SWITCH_TARGET', {'target_ace': ace_index})
         return True
+
+    cmd_COLORFUL_U1_ROUTE_SELECT_help = (
+        '[Colorful-U1] Object-aware route tool/source select. '
+        'Usage: COLORFUL_U1_ROUTE_SELECT TOOL=0 HEAD=0 [ACE=0 SLOT=0] '
+        '[OBJECT_HEX=<utf8-hex>]')
+    def _route_object_from_gcmd(self, gcmd):
+        object_hex = str(gcmd.get('OBJECT_HEX', '') or '').strip()
+        if object_hex:
+            try:
+                return bytes.fromhex(object_hex).decode('utf-8', 'replace')
+            except Exception as e:
+                logging.info(
+                    '[Colorful-U1] invalid OBJECT_HEX=%s: %s'
+                    % (object_hex, e))
+                return ''
+        return str(gcmd.get('OBJECT', '') or '').strip()
+
+    def _route_object_is_excluded(self, object_name):
+        if not object_name:
+            return False
+        exclude_obj = self.printer.lookup_object('exclude_object', None)
+        if exclude_obj is None:
+            return False
+        try:
+            status = exclude_obj.get_status(0) or {}
+        except Exception as e:
+            logging.info(
+                '[Colorful-U1] exclude_object status unavailable: %s' % e)
+            return False
+        excluded = (
+            status.get('excluded_objects')
+            or status.get('excluded')
+            or status.get('objects_excluded')
+            or [])
+        if isinstance(excluded, dict):
+            excluded_names = set(str(k) for k in excluded.keys())
+        else:
+            excluded_names = set(str(v) for v in excluded)
+        return str(object_name) in excluded_names
+
+    def cmd_COLORFUL_U1_ROUTE_SELECT(self, gcmd):
+        head = gcmd.get_int('HEAD')
+        ace_index = gcmd.get_int('ACE', None)
+        slot = gcmd.get_int('SLOT', None)
+        object_name = self._route_object_from_gcmd(gcmd)
+        if self._route_object_is_excluded(object_name):
+            logging.info(
+                '[Colorful-U1] route select skipped for excluded object '
+                '%r: HEAD=%d ACE=%s SLOT=%s'
+                % (object_name, head, ace_index, slot))
+            return
+
+        logging.info(
+            '[Colorful-U1] route select executing: object=%r HEAD=%d '
+            'ACE=%s SLOT=%s' % (object_name, head, ace_index, slot))
+        self.gcode.run_script_from_command('T%d' % head)
+        if ace_index is not None or slot is not None:
+            if ace_index is None or slot is None:
+                raise gcmd.error(
+                    '[Colorful-U1] COLORFUL_U1_ROUTE_SELECT requires both '
+                    'ACE and SLOT for ACE source routes')
+            self.gcode.run_script_from_command(
+                'ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d'
+                % (head, ace_index, slot))
 
     cmd_ACE_HEAD_STATUS_help = '[multiACE] Show active ACE, detected devices, and head-to-ACE/slot mapping'
     def cmd_ACE_HEAD_STATUS(self, gcmd):

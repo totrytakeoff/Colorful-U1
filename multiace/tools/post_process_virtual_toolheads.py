@@ -277,6 +277,120 @@ def _commands_for_tool_event(t_index, cursor, ace_targets=None, tool_targets=Non
             'ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d'
             % (head, target['ace'], target['slot'])]
 
+def _object_name_from_exclude_start(line):
+    m = re.match(r'^\s*EXCLUDE_OBJECT_START\s+(.*)$', str(line).strip())
+    if not m:
+        return None
+    params = m.group(1)
+    m_name = re.search(r'(?<![A-Za-z])NAME=("[^"]*"|[^ \t;]+)', params)
+    if not m_name:
+        return None
+    name = m_name.group(1)
+    if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+        name = name[1:-1]
+    return name
+
+def _line_is_exclude_end(line):
+    return bool(re.match(r'^\s*EXCLUDE_OBJECT_END\b', str(line).strip()))
+
+def _object_context_after_text(text):
+    current = None
+    for line in str(text or '').splitlines():
+        object_start = _object_name_from_exclude_start(line)
+        if object_start is not None:
+            current = object_start
+        elif _line_is_exclude_end(line):
+            current = None
+    return current
+
+def _object_hex(object_name):
+    if object_name is None:
+        return ''
+    return str(object_name).encode('utf-8', 'replace').hex()
+
+def _route_select_command(head, ace=None, slot=None, object_name=None,
+                          slicer_tool=None):
+    parts = ['COLORFUL_U1_ROUTE_SELECT']
+    if slicer_tool is not None:
+        parts.append('TOOL=%d' % int(slicer_tool))
+    parts.append('HEAD=%d' % int(head))
+    if ace is not None or slot is not None:
+        if ace is None or slot is None:
+            raise ValueError('ACE route requires both ace and slot')
+        parts.append('ACE=%d' % int(ace))
+        parts.append('SLOT=%d' % int(slot))
+    obj_hex = _object_hex(object_name)
+    if obj_hex:
+        parts.append('OBJECT_HEX=%s' % obj_hex)
+    return ' '.join(parts)
+
+def _wrap_route_commands(commands, slicer_tool=None, object_name=None):
+    """Replace the final T/head + ACE swap pair with an object-aware macro.
+
+    Earlier commands in the same route event (native unload, feeder retract,
+    etc.) remain explicit and keep their original order.  The macro owns only
+    the final physical head selection and optional ACE slot swap, so excluded
+    object skips cannot corrupt the printer's active route state.
+    """
+    out = []
+    pending_head = None
+    for cmd in commands or []:
+        stripped = str(cmd).strip()
+        if not stripped:
+            continue
+        m_t = re.match(r'^T([0-3])$', stripped)
+        if m_t:
+            if pending_head is not None:
+                out.append(_route_select_command(
+                    pending_head, object_name=object_name,
+                    slicer_tool=slicer_tool))
+            pending_head = int(m_t.group(1))
+            continue
+        m_swap = re.match(
+            r'^ACE_SWAP_HEAD\s+HEAD=(\d+)\s+ACE=(\d+)\s+SLOT=(\d+)$',
+            stripped)
+        if m_swap and pending_head is not None:
+            head = int(m_swap.group(1))
+            if head == pending_head:
+                out.append(_route_select_command(
+                    head, ace=int(m_swap.group(2)),
+                    slot=int(m_swap.group(3)),
+                    object_name=object_name, slicer_tool=slicer_tool))
+                pending_head = None
+                continue
+        if pending_head is not None:
+            out.append(_route_select_command(
+                pending_head, object_name=object_name,
+                slicer_tool=slicer_tool))
+            pending_head = None
+        out.append(stripped)
+    if pending_head is not None:
+        out.append(_route_select_command(
+            pending_head, object_name=object_name,
+            slicer_tool=slicer_tool))
+    return out
+
+def _parse_ace_route_command(cmd):
+    stripped = str(cmd).strip()
+    m_swap = re.match(
+        r'^ACE_SWAP_HEAD\s+HEAD=(\d+)\s+ACE=(\d+)\s+SLOT=(\d+)$',
+        stripped)
+    if m_swap:
+        return (int(m_swap.group(1)), int(m_swap.group(2)),
+                int(m_swap.group(3)))
+    m_route = re.match(r'^COLORFUL_U1_ROUTE_SELECT\b(.*)$', stripped)
+    if not m_route:
+        return None
+    params = {}
+    for key, value in re.findall(r'([A-Z_]+)=([^ \t;]+)', m_route.group(1)):
+        params[key] = value
+    if not all(k in params for k in ('HEAD', 'ACE', 'SLOT')):
+        return None
+    try:
+        return (int(params['HEAD']), int(params['ACE']), int(params['SLOT']))
+    except (TypeError, ValueError):
+        return None
+
 def _force_physical_heater_t(line, ace_targets=None, tool_targets=None,
                              route_plan=None, strict=False):
     """Rewrite M104/M109 T references to physical heads and force A0.
@@ -426,8 +540,14 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
         r'^;\s*Change Tool\s*(\d+)\s*->\s*Tool\s*(\d+)')
     pending_route_tool = None
     current_route_tool = None
+    current_object = _object_context_after_text(pre)
     body_lines = []
     for line in body.splitlines():
+        object_start = _object_name_from_exclude_start(line)
+        if object_start is not None:
+            current_object = object_start
+        elif _line_is_exclude_end(line):
+            current_object = None
         m_change = change_target_re.match(line.strip())
         if m_change:
             from_tool = int(m_change.group(1))
@@ -448,17 +568,23 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
                 tool = pending_route_tool
                 pending_route_tool = None
                 current_route_tool = tool
-                body_lines.extend(_commands_for_tool_event(
-                    tool, route_cursor, ace_targets, tool_targets))
+                body_lines.extend(_wrap_route_commands(
+                    _commands_for_tool_event(
+                        tool, route_cursor, ace_targets, tool_targets),
+                    slicer_tool=tool, object_name=current_object))
             elif route_strict and current_route_tool is not None:
                 target = _target_for_tool(
                     current_route_tool, ace_targets, tool_targets,
                     strict=True)
-                body_lines.append('T%d' % target['head'])
+                body_lines.append(_route_select_command(
+                    target['head'], object_name=current_object,
+                    slicer_tool=current_route_tool))
             else:
                 tool = int(m_tool.group(1))
-                body_lines.extend(_commands_for_tool_event(
-                    tool, route_cursor, ace_targets, tool_targets))
+                body_lines.extend(_wrap_route_commands(
+                    _commands_for_tool_event(
+                        tool, route_cursor, ace_targets, tool_targets),
+                    slicer_tool=tool, object_name=current_object))
             continue
         body_lines.append(line)
     body = '\n'.join(body_lines)
@@ -477,11 +603,9 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
             filtered_lines.append(line)
             i += 1
             continue
-        m_s = re.match(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$', line)
-        if m_s:
-            head = int(m_s.group(1))
-            ace = int(m_s.group(2))
-            slot = int(m_s.group(3))
+        route = _parse_ace_route_command(line)
+        if route is not None:
+            head, ace, slot = route
             key = (ace, slot)
             if head_loaded.get(head) == key:
                 filtered_lines.append('; %s  ; skipped (already loaded)' % line)
@@ -495,7 +619,10 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     if pre and body and not pre.endswith(('\n', '\r')):
         pre += '\n'
 
-    total_active = len([l for l in filtered_lines if l.startswith('ACE_SWAP_HEAD')])
+    total_active = len([
+        l for l in filtered_lines
+        if _parse_ace_route_command(l) is not None
+    ])
     return pre + body, total_active, skipped, swapbacks
 
 def parse_toolchanges(gcode):
@@ -2093,6 +2220,7 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
     consumed_initial_tools = set()
     pending_route_tool = None
     current_route_tool = None
+    current_object = None
 
     total = os.path.getsize(in_path) or 1
     seen = 0
@@ -2127,19 +2255,20 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
             fout.write(b)
         pending_blanks.clear()
 
-    def emit_route_commands(fout, commands):
+    def emit_route_commands(fout, commands, slicer_tool=None,
+                            object_name=None):
         nonlocal active, skipped
-        for cmd in commands:
+        for cmd in _wrap_route_commands(
+                commands, slicer_tool=slicer_tool,
+                object_name=object_name):
             stripped_cmd = str(cmd).strip()
             if not stripped_cmd:
                 continue
-            m_cmd = swap_re.match(stripped_cmd)
-            if not m_cmd:
+            route = _parse_ace_route_command(stripped_cmd)
+            if route is None:
                 fout.write(stripped_cmd + '\n')
                 continue
-            head = int(m_cmd.group(1))
-            ace = int(m_cmd.group(2))
-            slot = int(m_cmd.group(3))
+            head, ace, slot = route
             key = (ace, slot)
             if head_loaded.get(head) == key:
                 fout.write('; ' + stripped_cmd + '  ; skipped (already loaded)\n')
@@ -2154,6 +2283,11 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
         for line in fin:
             seen += len(line.encode('utf-8', errors='ignore'))
             stripped = line.rstrip('\r\n')
+            object_start = _object_name_from_exclude_start(stripped)
+            if object_start is not None:
+                current_object = object_start
+            elif _line_is_exclude_end(stripped):
+                current_object = None
 
             if m104_re.match(stripped):
                 if pending_head is not None:
@@ -2251,18 +2385,22 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
                     emit_route_commands(
                         fout,
                         _commands_for_tool_event(
-                            tool, route_cursor, ace_targets, tool_targets))
+                            tool, route_cursor, ace_targets, tool_targets),
+                        slicer_tool=tool, object_name=current_object)
                 elif route_strict and current_route_tool is not None:
                     target = _target_for_tool(
                         current_route_tool, ace_targets, tool_targets,
                         strict=True)
-                    fout.write('T%d\n' % target['head'])
+                    fout.write(_route_select_command(
+                        target['head'], object_name=current_object,
+                        slicer_tool=current_route_tool) + '\n')
                 else:
                     tool = int(m.group(1))
                     emit_route_commands(
                         fout,
                         _commands_for_tool_event(
-                            tool, route_cursor, ace_targets, tool_targets))
+                            tool, route_cursor, ace_targets, tool_targets),
+                        slicer_tool=tool, object_name=current_object)
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 

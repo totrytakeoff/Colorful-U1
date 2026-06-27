@@ -1618,8 +1618,38 @@ class PrinterExtruder:
 
                 gcmd.respond_info("Activating extruder %s" % (self.name,))
                 toolhead.flush_step_generation()
+                abs_extrude_before_set = gcode_move.absolute_extrude
                 toolhead.set_extruder(self, self.last_position)
+                if 'saved_states' in locals():
+                    gcode_move.absolute_extrude = saved_states['absolute_extrude']
+                    gcode_move.absolute_coord = saved_states['absolute_coord']
+                    logging.info(
+                        "[Colorful-U1] restored gcode move state after "
+                        "set_extruder: target=%s abs_e_before_set=%s "
+                        "abs_e_restored=%s base_e=%.6f last_e=%.6f",
+                        self.name,
+                        abs_extrude_before_set,
+                        gcode_move.absolute_extrude,
+                        gcode_move.base_position[3],
+                        gcode_move.last_position[3])
                 self.printer.send_event("extruder:activate_extruder")
+                if 'saved_states' in locals():
+                    event_abs_extrude = gcode_move.absolute_extrude
+                    event_absolute_coord = gcode_move.absolute_coord
+                    gcode_move.absolute_extrude = saved_states['absolute_extrude']
+                    gcode_move.absolute_coord = saved_states['absolute_coord']
+                    if (event_abs_extrude != gcode_move.absolute_extrude
+                            or event_absolute_coord != gcode_move.absolute_coord):
+                        logging.info(
+                            "[Colorful-U1] restored gcode move state after "
+                            "activate event: target=%s event_abs_e=%s "
+                            "restored_abs_e=%s event_abs_coord=%s "
+                            "restored_abs_coord=%s",
+                            self.name,
+                            event_abs_extrude,
+                            gcode_move.absolute_extrude,
+                            event_absolute_coord,
+                            gcode_move.absolute_coord)
 
                 self.active_binding_probe()
                 self.active_binding_fan()

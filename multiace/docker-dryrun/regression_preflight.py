@@ -515,6 +515,22 @@ def uploaded_content(filename: str) -> str:
     return uploaded.get("content") or ""
 
 
+def route_select(head: int, ace: int | None = None, slot: int | None = None,
+                 tool: int | None = None, obj: str | None = None) -> str:
+    parts = ["COLORFUL_U1_ROUTE_SELECT"]
+    if tool is not None:
+        parts.append(f"TOOL={tool}")
+    parts.append(f"HEAD={head}")
+    if ace is not None or slot is not None:
+        assert_true(ace is not None and slot is not None,
+                    "route_select requires both ace and slot")
+        parts.append(f"ACE={ace}")
+        parts.append(f"SLOT={slot}")
+    if obj:
+        parts.append("OBJECT_HEX=" + obj.encode("utf-8").hex())
+    return " ".join(parts)
+
+
 def load_postprocessor():
     path = Path(__file__).resolve().parents[1] / "tools" / "post_process_virtual_toolheads.py"
     spec = importlib.util.spec_from_file_location("multiace_postprocess_test", path)
@@ -648,8 +664,9 @@ def test_mixed_native_ace_print() -> None:
     assert_true(final_stats.get("active_ace_swaps") == 1,
                 f"final source map lost swap stats: {final_stats}")
     content = uploaded_content(started["filename"])
-    assert_true("T1" in content, "rewritten upload missing native T1")
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+    assert_true(route_select(1, tool=0) in content,
+                "rewritten upload missing native route select")
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in content,
                 "rewritten upload missing ACE slot1 swap")
     assert_true("M104 S210 T1 A0" in content,
                 "rewritten upload should heat native physical T1 with A0")
@@ -754,9 +771,9 @@ def test_single_ace_head_print() -> None:
                 f"single ACE preload candidates should be analysis-only: {preload}")
     started = start_print(report)
     content = uploaded_content(wait_job(started["job_id"])["filename"])
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0" in content,
+    assert_true(route_select(0, ace=0, slot=0, tool=0) in content,
                 "single ACE upload missing slot0 swap")
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in content,
                 "single ACE upload missing slot1 swap")
 
 
@@ -851,9 +868,9 @@ def test_one_plus_one_plus_two_plus_two_print() -> None:
     ], f"1+1+2+2 route commands mismatch: {events}")
     started = post_json(f"{WEB}/route-plan/print", {"token": report["token"]})
     content = uploaded_content(wait_job(started["job_id"])["filename"])
-    assert_true("ACE_SWAP_HEAD HEAD=2 ACE=0 SLOT=0" in content,
+    assert_true(route_select(2, ace=0, slot=0, tool=2) in content,
                 "1+1+2+2 upload missing ACE 0 slot0 swap")
-    assert_true("ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=2" in content,
+    assert_true(route_select(3, ace=0, slot=2, tool=3) in content,
                 "1+1+2+2 upload missing ACE 0 slot2 swap")
     assert_true("FEED_AUTO_RETRACT" not in content,
                 "1+1+2+2 plan should not inject native retracts")
@@ -887,7 +904,7 @@ def test_route_plan_preview_and_print_api() -> None:
         "token": report["token"],
     })
     content = uploaded_content(wait_job(started["job_id"])["filename"])
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in content,
                 "route-plan print API upload missing ACE swap")
 
 
@@ -972,7 +989,7 @@ def test_route_plan_rewrite_uses_change_comment_target_not_bare_physical_t() -> 
     assert_true(not status.get("error"),
                 f"physical T0 after Change Tool target should not fail rewrite: {status}")
     content = uploaded_content(status["filename"])
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in content,
                 f"Change Tool target T1 should drive ACE swap despite bare T0: {content}")
 
 
@@ -1005,7 +1022,7 @@ def test_route_plan_rewrite_ignores_repeated_physical_t_after_change() -> None:
     assert_true(not status.get("error"),
                 f"repeated physical T0 after Change Tool should not fail rewrite: {status}")
     content = uploaded_content(status["filename"])
-    assert_true(content.count("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1") == 1,
+    assert_true(content.count(route_select(0, ace=0, slot=1, tool=1)) == 1,
                 f"repeated physical T0 should not consume extra route events: {content}")
 
 
@@ -1039,7 +1056,7 @@ def test_route_plan_rewrite_ignores_noop_change_tool_marker() -> None:
     assert_true(not status.get("error"),
                 f"no-op Change Tool marker should not fail rewrite: {status}")
     content = uploaded_content(status["filename"])
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in content,
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in content,
                 f"real Change Tool target T1 should still emit ACE swap: {content}")
 
 
@@ -2503,7 +2520,10 @@ def test_route_plan_rewrite_native_to_ace_transition() -> None:
         "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
     ], f"native -> ACE transition commands mismatch: {commands}")
     content = uploaded_content(status["filename"])
-    assert_true(_content_contains_in_order(content, commands),
+    runtime_commands = commands[:2] + [
+        route_select(0, ace=0, slot=1, tool=1),
+    ]
+    assert_true(_content_contains_in_order(content, runtime_commands),
                 f"rewritten upload missing native -> ACE order: {content}")
 
 
@@ -2558,7 +2578,8 @@ def test_route_plan_rewrite_ace_to_ace_transition() -> None:
     content = uploaded_content(status["filename"])
     assert_true("ACE_UNLOAD_HEAD HEAD=0" not in content,
                 f"ACE -> ACE rewrite should not emit separate ACE unload: {content}")
-    assert_true(_content_contains_in_order(content, commands),
+    assert_true(_content_contains_in_order(
+        content, [route_select(0, ace=0, slot=1, tool=1)]),
                 f"rewritten upload missing ACE -> ACE order: {content}")
 
 
@@ -2615,7 +2636,11 @@ def test_route_plan_rewrite_native_to_native_transition() -> None:
         "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1",
     ], f"native -> native transition commands mismatch: {commands}")
     content = uploaded_content(status["filename"])
-    assert_true(_content_contains_in_order(content, commands),
+    runtime_commands = commands[:2] + [
+        route_select(0, tool=1),
+        commands[3],
+    ]
+    assert_true(_content_contains_in_order(content, runtime_commands),
                 f"rewritten upload missing native -> native order: {content}")
 
 
@@ -2709,13 +2734,14 @@ def test_route_plan_rewrite_repeated_tool_sequence() -> None:
     ], f"native -> native repeated transition mismatch: {route_events[3]}")
     content = uploaded_content(status["filename"])
     assert_true(_content_contains_in_order(content, [
-        "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+        route_select(0, ace=0, slot=1, tool=1),
         "ACE_UNLOAD_HEAD HEAD=0",
+        route_select(0, tool=0),
         "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 LOAD=1",
     ]), f"rewritten upload missing repeated transition order: {content}")
     assert_true(_content_has_order_before(content, [
         "FEED_AUTO MODULE=left CHANNEL=0 EXTRUDER=0 UNLOAD=1",
-        "T0",
+        route_select(0, tool=2),
     ], "FEED_AUTO MODULE=right CHANNEL=0 EXTRUDER=0 LOAD=1"),
         f"rewritten upload missing final native unload/select/load order: {content}")
 
@@ -3181,12 +3207,86 @@ def test_route_plan_only_rewrite() -> None:
         """,
     )
     out, active, _skipped, _swapbacks = pp.rewrite(src, route_plan=route_plan)
-    assert_true("T1" in out, f"route-plan rewrite missing native T1: {out}")
-    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" in out,
-                f"route-plan rewrite missing ACE swap: {out}")
+    assert_true("T1" in out, f"route-plan rewrite missing initial native T1: {out}")
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in out,
+                f"route-plan rewrite missing ACE route select: {out}")
     assert_true("M117 ROUTE_EVENT_T1" in out,
                 f"route-plan rewrite should consume event commands: {out}")
     assert_true(active == 1, f"route-plan rewrite active swap mismatch: {active}")
+
+
+def test_route_plan_rewrite_wraps_object_route_select() -> None:
+    pp = load_postprocessor()
+    object_name = "2.0-腿L.stl_id_1_copy_0"
+    route_plan = {
+        "version": 2,
+        "events": [
+            {
+                "index": 0,
+                "event_type": "tool_select",
+                "slicer_tool": 0,
+                "source": "ace:0:0",
+                "head": "head:0",
+                "steps": [
+                    {"kind": "select_head", "head": "head:0", "command": "T0"},
+                    {
+                        "kind": "swap_source",
+                        "source": "ace:0:0",
+                        "head": "head:0",
+                        "ace": 0,
+                        "slot": 0,
+                        "command": "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=0",
+                    },
+                ],
+                "target": {
+                    "kind": "ace", "head": 0, "source": "ace:0:0",
+                    "ace": 0, "slot": 0,
+                },
+            },
+            {
+                "index": 1,
+                "event_type": "tool_select",
+                "slicer_tool": 1,
+                "source": "ace:0:1",
+                "head": "head:0",
+                "steps": [
+                    {"kind": "select_head", "head": "head:0", "command": "T0"},
+                    {
+                        "kind": "swap_source",
+                        "source": "ace:0:1",
+                        "head": "head:0",
+                        "ace": 0,
+                        "slot": 1,
+                        "command": "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+                    },
+                ],
+                "target": {
+                    "kind": "ace", "head": 0, "source": "ace:0:1",
+                    "ace": 0, "slot": 1,
+                },
+            },
+        ],
+    }
+    src = gcode(
+        "PLA;PETG",
+        "#dc2828;#1e78dc",
+        f"""
+        T0
+        EXCLUDE_OBJECT_START NAME={object_name}
+        ; Change Tool 0 -> Tool 1
+        T1
+        G1 X10 Y10 E1
+        EXCLUDE_OBJECT_END NAME={object_name}
+        """,
+    )
+    out, active, _skipped, _swapbacks = pp.rewrite(src, route_plan=route_plan)
+    expected = route_select(
+        0, ace=0, slot=1, tool=1, obj=object_name)
+    assert_true(expected in out,
+                f"object-scoped route select missing OBJECT_HEX: {out}")
+    assert_true("ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1" not in out,
+                f"runtime object route must not emit bare ACE_SWAP_HEAD: {out}")
+    assert_true(active == 1, f"object route active swap mismatch: {active}")
 
 
 def test_route_plan_rewrite_forces_physical_heater_map() -> None:
@@ -3649,6 +3749,7 @@ def main() -> int:
         test_empty_load_failed_head_can_load_again,
         test_native_slot_empty_when_head_current_source_is_ace,
         test_route_plan_only_rewrite,
+        test_route_plan_rewrite_wraps_object_route_select,
         test_route_plan_rewrite_forces_physical_heater_map,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,
