@@ -74,7 +74,20 @@ start() {
             cd '$DAEMON_DIR' || exit 1;
             exec $DAEMON $ARGS >>'$LOGFILE' 2>&1
         "
-    echo "OK (waited ${n}s for Moonraker)"
+    i=0
+    while [ "$i" -lt 10 ]; do
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
+                && wget -q --spider --timeout=2 \
+                    "http://127.0.0.1:${PORT}/api/state" 2>/dev/null; then
+            echo "OK (waited ${n}s for Moonraker, ${i}s for backend)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "FAIL (backend did not become healthy on port $PORT)"
+    tail -n 40 "$LOGFILE" 2>/dev/null || true
+    return 1
 }
 
 stop() {
@@ -110,7 +123,9 @@ case "$1" in
     stop)         stop;;
     restart|reload) restart;;
     status)
-        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
+                && wget -q --spider --timeout=2 \
+                    "http://127.0.0.1:${PORT}/api/state" 2>/dev/null; then
             echo "$NAME running (pid $(cat "$PIDFILE"))"
         else
             echo "$NAME not running"
