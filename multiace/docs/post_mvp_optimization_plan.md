@@ -96,7 +96,7 @@ Phase 4: 切片软件集成
 3. 打印发送前展示最终命令意图：
 
    ```text
-   Slicer T0 -> Native T0
+   Slicer T0 -> Native Slot 0 -> T0
    Slicer T1 -> T3 + ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=1
    ```
 

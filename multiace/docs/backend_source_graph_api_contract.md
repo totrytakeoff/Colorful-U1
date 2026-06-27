@@ -23,6 +23,20 @@
 - 手动硬件动作必须使用显式 `HEAD/ACE/SLOT` 或 source graph profile 生成的命令。
 - 打印阶段不能再接受 `tool_targets` 覆盖；所有人工映射修改必须先更新 route plan。
 
+## 编号规则
+
+Colorful-U1 从本阶段开始全链路统一使用 0-based 编号：
+
+- 工具头：`head:0..3`，UI 文案为 `T0..T3`。
+- Native source：`native:0..3`，UI 文案为 `Native Slot 0..3`。
+- ACE source：`ace:<ace>:<slot>`，UI 文案为 `ACE <ace> Slot <slot>`。
+- API、`source_graph.json`、`save_variables`、日志、前端展示、route plan 中的
+  head/ace/slot 编号都必须保持 0-based。
+- `display_index_base` 已废弃；后端可为兼容旧前端返回 `0`，但不得再允许用户配置
+  或用它改变显示编号。
+- 禁止任何 `head index -> ACE slot index` 的隐式推断。ACE 动作必须从 source graph
+  或显式参数解析出 `ace` 和 `slot`，缺失时应拒绝执行。
+
 ## Dashboard 状态
 
 ### `GET /api/state`
@@ -224,7 +238,8 @@
   - `native:1 -> head:1`
   - `ace:0:0/ace:0:1 -> head:2`
   - `ace:0:2/ace:0:3 -> head:3`
-- 该拓扑不应生成 native `FEED_AUTO_RETRACT`，因为 native head 不参与同 head 换料。
+- 该拓扑不应生成 native `FEED_AUTO_RETRACT`，因为 native source 不参与同一
+  head 内的换料。
 
 ## 打印发送流程
 

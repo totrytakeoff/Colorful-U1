@@ -174,8 +174,24 @@ def _normalize_source_graph_for_hash(graph):
                         'channel', SOURCE_GRAPH_NATIVE_CHANNELS[head]['channel'])
                 legacy = 'Native T%d' % head if head is not None else None
                 current = str(source.get('label') or '').strip()
-                if head is not None and (not current or current == legacy):
-                    source['label'] = 'Native Slot %d' % (head + 1)
+                one_based = 'Native Slot %d' % (head + 1) if head is not None else None
+                if head is not None and (not current or current in (legacy, one_based)):
+                    source['label'] = 'Native Slot %d' % head
+            elif kind == 'ace_slot':
+                try:
+                    parts = str(source_id).split(':')
+                    ace = int(source.get('ace', parts[1]))
+                    slot = int(source.get('slot', parts[2]))
+                except Exception:
+                    ace = None
+                    slot = None
+                current = str(source.get('label') or '').strip()
+                if ace is not None and slot is not None:
+                    one_based = 'ACE %d Slot %d' % (ace + 1, slot + 1)
+                    compact_one_based = 'ACE %d S%d' % (ace + 1, slot + 1)
+                    if (not current
+                            or current in (one_based, compact_one_based)):
+                        source['label'] = 'ACE %d Slot %d' % (ace, slot)
             defaults = SOURCE_GRAPH_DEFAULT_EXECUTION.get(kind)
             if defaults is not None:
                 source['execution'] = _source_graph_merge_defaults(
@@ -537,8 +553,11 @@ class MultiAce:
             'web_dir', '/home/lava/multiace_web')
 
         self._language = config.get('language', 'en')
-        self._display_index_base = config.getint(
-            'display_index_base', 0, minval=0, maxval=1)
+        if config.get('display_index_base', None) not in (None, '0', 0):
+            logging.info(
+                '[multiACE] display_index_base is obsolete and ignored; '
+                'Colorful-U1 uses 0-based ACE/head/slot indexes everywhere')
+        self._display_index_base = 0
 
         i18n_primary = '/home/lava/printer_data/config/extended/multiace/i18n'
         i18n_fallback = os.path.join(self._web_dir, 'i18n')
@@ -1241,11 +1260,11 @@ class MultiAce:
         }
 
     def _disp(self, idx):
-        """Apply display_index_base offset for log messages."""
+        """Return the canonical 0-based index for log/user messages."""
         if idx is None:
             return '–'
         try:
-            return int(idx) + getattr(self, '_display_index_base', 0)
+            return int(idx)
         except (TypeError, ValueError):
             return idx
 
@@ -2343,6 +2362,14 @@ class MultiAce:
         slot_repr = params.get('index', params.get('slot', '?'))
         len_repr = params.get('length', '?')
         speed_repr = params.get('speed', '?')
+        if method in (
+                'feed_filament', 'unwind_filament', 'start_feed_assist',
+                'stop_feed_assist', 'stop_feed_filament',
+                'update_feeding_speed'):
+            logging.info(
+                '[multiACE] ACE transport request: ace=%d method=%s '
+                'slot=%s length=%s speed=%s'
+                % (idx, method, slot_repr, len_repr, speed_repr))
 
         trace_request = method != 'get_status'
         if trace_request:
@@ -5712,8 +5739,31 @@ class MultiAce:
                 'the dashboard, then restart the print.' % head)
 
         source = self._head_source.get(head)
+        source_ace = None
+        source_slot = None
+        sensor_obj = self.printer.lookup_object(
+            'filament_motion_sensor e%d_filament' % head, None)
+        sensor_present = (sensor_obj is not None and
+                          sensor_obj.get_status(0)['filament_detected'])
+        if source is not None:
+            try:
+                if 'ace_index' not in source or 'slot' not in source:
+                    raise KeyError('ace_index/slot')
+                source_ace = int(source.get('ace_index'))
+                source_slot = int(source.get('slot'))
+            except Exception as e:
+                raise gcmd.error(
+                    '[multiACE] SWAP refused: head %d has invalid ACE '
+                    'head_source=%s (%s). Refusing to infer ACE slot from '
+                    'the toolhead index.' % (head, source, e))
+        elif sensor_present:
+            raise gcmd.error(
+                '[multiACE] SWAP refused: head %d has filament at the '
+                'toolhead sensor but no ACE head_source mapping. Refusing '
+                'to infer ACE slot from the toolhead index; recover/unload '
+                'this head first.' % head)
         self._ensure_xyz_homed_for_ace_motion(gcmd, 'ACE_SWAP_HEAD')
-        if (source and source['ace_index'] == ace_index and source['slot'] == slot
+        if (source and source_ace == ace_index and source_slot == slot
                 and not source.get('load_failed')):
             logging.info('[multiACE] Swap: HEAD %d already on ACE %d / Slot %d - skipping' % (
                 head, ace_index, slot))
@@ -5785,9 +5835,9 @@ class MultiAce:
         load_end_ts = None
         swap_status = 'ok'
         swap_completed = False
-        prev_source = self._head_source.get(head)
-        prev_ace_src = prev_source['ace_index'] if prev_source else None
-        prev_slot_src = prev_source['slot'] if prev_source else None
+        prev_source = source
+        prev_ace_src = source_ace
+        prev_slot_src = source_slot
 
         self._swap_in_progress = True
 
@@ -5845,10 +5895,6 @@ class MultiAce:
 
             self.gcode.run_script_from_command('M83')
 
-            sensor_obj = self.printer.lookup_object(
-                'filament_motion_sensor e%d_filament' % head, None)
-            sensor_present = (sensor_obj is not None and
-                              sensor_obj.get_status(0)['filament_detected'])
             empty_head = (not sensor_present) and (prev_source is None)
 
             if empty_head:
@@ -5863,12 +5909,13 @@ class MultiAce:
                 logging.info('[multiACE] Swap: delegating unload to ACE_UNLOAD_HEAD')
                 unload_start_ts = time.monotonic()
                 if prev_source:
-                    _src_ace = int(prev_source.get('ace_index',
-                                                   self._active_device_index))
-                    _src_slot = int(prev_source.get('slot', head))
+                    _src_ace = prev_ace_src
+                    _src_slot = prev_slot_src
                 else:
-                    _src_ace = self._active_device_index
-                    _src_slot = head
+                    raise gcmd.error(
+                        '[multiACE] SWAP refused: head %d is not empty but '
+                        'has no previous ACE source. Refusing to infer ACE '
+                        'slot from the toolhead index.' % head)
                 swap_rl = self.get_swap_retract_length(_src_ace, _src_slot)
                 if swap_rl > 0:
                     self.gcode.run_script_from_command(

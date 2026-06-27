@@ -783,8 +783,8 @@ class FilamentFeed:
 
     def _ace_route_for_channel(self, ch):
         head_idx = self.filament_ch[ch]
-        ace_idx = self.ace._active_device_index
-        slot_idx = head_idx
+        ace_idx = None
+        slot_idx = None
         source = None
         if self.ace is not None:
             pending = getattr(self.ace, '_pending_load_source', {}) or {}
@@ -793,14 +793,17 @@ class FilamentFeed:
                 source = self.ace._head_source.get(head_idx)
             if source is not None:
                 try:
-                    ace_idx = int(source.get('ace_index', ace_idx))
-                    slot_idx = int(source.get('slot', slot_idx))
-                except Exception:
+                    if 'ace_index' not in source or 'slot' not in source:
+                        raise KeyError('ace_index/slot')
+                    ace_idx = int(source.get('ace_index'))
+                    slot_idx = int(source.get('slot'))
+                except Exception as e:
                     raise ValueError(
                         '[multiACE] invalid ACE route for T%d. '
                         'Use ACE_LOAD_HEAD HEAD=%d ACE=<n> SLOT=<n> for ACE '
-                        'loads; refusing to guess slot=%d from the toolhead index.'
-                        % (head_idx, head_idx, head_idx))
+                        'loads; refusing to infer an ACE slot from the '
+                        'toolhead index. source=%s error=%s'
+                        % (head_idx, head_idx, source, e))
             else:
                 raise ValueError(
                     '[multiACE] missing ACE source for T%d. '
@@ -808,9 +811,9 @@ class FilamentFeed:
                     'loads; raw FEED_AUTO without head_source remains a '
                     'native feeder operation.'
                     % (head_idx, head_idx))
-        if slot_idx < 0 or slot_idx > 3:
+        if ace_idx is None or slot_idx is None or slot_idx < 0 or slot_idx > 3:
             raise ValueError(
-                '[multiACE] invalid ACE route: head=%d ace=%d slot=%d'
+                '[multiACE] invalid ACE route: head=%d ace=%s slot=%s'
                 % (head_idx, ace_idx, slot_idx))
         return head_idx, ace_idx, slot_idx, source
 

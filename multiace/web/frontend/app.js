@@ -196,7 +196,7 @@ createApp({
       if (index == null || index === "") return "-";
       const match = String(index).match(/-?\d+$/);
       const value = match ? Number(match[0]) : Number(index);
-      return Number.isFinite(value) ? value + Number(state.display_index_base || 0) : "-";
+      return Number.isFinite(value) ? value : "-";
     }
     function displayAce(index) { return index == null ? "-" : `ACE ${displayIndex(index)}`; }
     function shortHash(hash) { return hash ? hash.replace(/^sha256:/, "").slice(0, 12) : "-"; }
@@ -929,7 +929,6 @@ createApp({
       swap_purge_length: "",
       dryer_temp: "",
       dryer_duration: "",
-      display_index_base: 0,
       load_retry: "",
       extrusion_retry: "",
       unload_retry: "",
@@ -974,7 +973,6 @@ createApp({
       configForm.swap_purge_length = numOrEmpty(params.swap_purge_length);
       configForm.dryer_temp = numOrEmpty(params.dryer_temp);
       configForm.dryer_duration = numOrEmpty(params.dryer_duration);
-      configForm.display_index_base = numOrEmpty(params.display_index_base);
       configForm.load_retry = numOrEmpty(params.load_retry);
       configForm.extrusion_retry = numOrEmpty(params.extrusion_retry);
       configForm.unload_retry = numOrEmpty(params.unload_retry);
@@ -1023,7 +1021,6 @@ createApp({
         swap_purge_length: configForm.swap_purge_length,
         dryer_temp: configForm.dryer_temp,
         dryer_duration: configForm.dryer_duration,
-        display_index_base: configForm.display_index_base,
         load_retry: configForm.load_retry,
         extrusion_retry: configForm.extrusion_retry,
         unload_retry: configForm.unload_retry,

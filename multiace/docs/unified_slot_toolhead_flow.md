@@ -63,8 +63,9 @@
 2. 所有耗材入口都是 source slot。
 
    `native:<n>`、`ace:<ace>:<slot>` 以及后续新增外部送料器都属于同一层级。
-   UI 文案可显示为 `Native Slot 1`、`ACE 1 Slot 1`，不要再用 `native T3`
-   这种容易和工具头混淆的名字。
+   UI 文案必须显示为 0-based `Native Slot <n>`、`ACE <ace> Slot <slot>`，
+   不要再用 `native T3` 这种容易和工具头混淆的名字，也不要再做 UI 1-based
+   偏移。
 
 3. `preload_finish` 不是 `load_finish`。
 
@@ -466,7 +467,7 @@ native 有另一套字段的情况。
 
 显示：
 
-- source id 和用户友好名称，例如 `Native Slot 4`、`ACE 1 Slot 2`。
+- source id 和用户友好名称，例如 `Native Slot 3`、`ACE 0 Slot 1`。
 - 材料、颜色、品牌、预设。
 - source presence、slot_state、path_position。
 - 可达 heads。

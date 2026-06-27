@@ -122,7 +122,7 @@ def source_graph_for(payload: dict[str, Any]) -> dict[str, Any]:
             "head": head,
             "module": channels[head]["module"],
             "channel": channels[head]["channel"],
-            "label": f"Native Slot {head + 1}",
+            "label": f"Native Slot {head}",
             "material": "",
             "brand": "",
             "subtype": "",
@@ -142,7 +142,7 @@ def source_graph_for(payload: dict[str, Any]) -> dict[str, Any]:
                 "kind": "ace_slot",
                 "ace": ace,
                 "slot": slot,
-                "label": f"ACE {ace + 1} Slot {slot + 1}",
+                "label": f"ACE {ace} Slot {slot}",
                 "material": "",
                 "brand": "",
                 "subtype": "",
@@ -3562,6 +3562,28 @@ def test_route_plan_validate_rejects_tampered_execution() -> None:
                 f"tampered execution error mismatch: {validation}")
 
 
+def test_no_implicit_ace_slot_from_head_fallback() -> None:
+    """ACE routing must never fall back from toolhead index to ACE slot index."""
+    root = Path(__file__).resolve().parents[1]
+    files = [
+        root / "klipper" / "extras" / "ace.py",
+        root / "klipper" / "extras" / "filament_feed_ace.py",
+    ]
+    forbidden = [
+        "slot_idx = head_idx",
+        "_src_slot = head",
+        "get('slot', head)",
+        'get("slot", head)',
+    ]
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for fragment in forbidden:
+            assert_true(
+                fragment not in text,
+                f"{path.relative_to(root)} contains forbidden ACE slot fallback: {fragment}",
+            )
+
+
 def main() -> int:
     tests = [
         test_mixed_native_ace_print,
@@ -3635,6 +3657,7 @@ def main() -> int:
         test_route_plan_validate_rejects_tampered_profile_command,
         test_route_plan_validate_rejects_tampered_resources,
         test_route_plan_validate_rejects_tampered_execution,
+        test_no_implicit_ace_slot_from_head_fallback,
     ]
     for test in tests:
         test()

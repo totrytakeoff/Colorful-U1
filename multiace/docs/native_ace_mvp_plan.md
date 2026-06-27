@@ -114,9 +114,9 @@ print source:
 示例：
 
 ```text
-Slicer T0 -> native T0
+Slicer T0 -> Native Slot 0 -> T0
 Slicer T1 -> ACE0 Slot2 -> physical T3
-Slicer T2 -> native T1
+Slicer T2 -> Native Slot 1 -> T1
 Slicer T3 -> ACE0 Slot0 -> physical T3
 ```
 
@@ -259,7 +259,7 @@ Dashboard 继续作为工具头模式配置主入口：
 
 ```text
 Slicer Tool | Material | Color | Target
-T0          | PLA      | red   | Native T0
+T0          | PLA      | red   | Native Slot 0 -> T0
 T1          | PETG     | blue  | ACE0 Slot2 -> T3
 ```
 
@@ -268,7 +268,7 @@ T1          | PETG     | blue  | ACE0 Slot2 -> T3
 发送前展示最终命令意图：
 
 ```text
-T0 -> native T0
+T0 -> Native Slot 0 -> T0
 T1 -> ACE_SWAP_HEAD HEAD=3 ACE=0 SLOT=2
 ```
 
@@ -306,13 +306,13 @@ dry-run 验收：
 - postprocess rewrite 支持 mixed targets：
   - native target 输出普通 `T<head>`。
   - ACE target 输出 `T<head>` + `ACE_SWAP_HEAD HEAD=<head> ACE=<ace> SLOT=<slot>`。
-- Web preflight 表格能显示 `Native Tn` 和 `ACE n Slot m -> Tn`。
+- Web preflight 表格能显示 `Native Slot n -> Tn` 和 `ACE n Slot m -> Tn`。
 - docker dry-run mock 增加一个有料 native head，便于无硬件验证。
 
 dry-run 结果：
 
 ```text
-Slicer T0 -> Native T1
+Slicer T0 -> Native Slot 1 -> T1
 Slicer T1 -> ACE0 Slot1 -> T0
 ```
 
@@ -402,10 +402,10 @@ ACE0 -> T3
 实机预检曾返回如下 mixed mapping：
 
 ```text
-Slicer T0 -> native T0
+Slicer T0 -> Native Slot 0 -> T0
 Slicer T1 -> ACE0 Slot1 -> T3
-Slicer T2 -> native T1
-Slicer T3 -> native T2
+Slicer T2 -> Native Slot 1 -> T1
+Slicer T3 -> Native Slot 2 -> T2
 ```
 
 实际打印测试结果：

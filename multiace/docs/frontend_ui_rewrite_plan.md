@@ -59,8 +59,10 @@
   - Source 卡片只做耗材信息、source 状态、执行参数、完全退料。
   - Toolhead 卡片才负责 Load / Unload / Swap 主流程。
   - Unload 不允许选择 source，只能退当前 head 的 `current_source`。
-  - `native:<n>` 在 UI 中应显示为 `Native Slot N`，不能显示成容易和工具头混淆的
-    `native Tn`。
+  - `native:<n>` 在 UI 中应显示为 0-based `Native Slot <n>`，不能显示成容易和
+    工具头混淆的 `native Tn`。
+  - `head:<n>`、`native:<n>`、`ace:<ace>:<slot>` 在 UI、日志、API、配置中都
+    使用 0-based 编号，不再提供 `display_index_base` 之类的显示偏移开关。
 - 上传页还需要继续增强 G-code 被安全校验拒绝、route plan stale、source graph
   hash 变化等状态的视觉提示。
 - 自动 resolver 无法匹配全部 slicer tools 时，不能让 `route_plan=null` 表现得像
@@ -307,7 +309,6 @@ slot 不再表达“归属哪个头”，而表达：
 
 示例：
 
-- display index base。
 - 默认温度。
 - 默认换料参数。
 - 通知设置。

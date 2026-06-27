@@ -4287,19 +4287,13 @@ def _read_cfg_scalars() -> dict:
     return main
 
 def _read_display_index_base() -> int:
-    """ace.cfg is the source of truth, with the env-var (passed by the
-    Klipper-side spawn) as a fallback for setups where multiace-web
-    was started by /etc/init.d/S98multiace-web (which doesn't forward
-    the cfg value) instead of by ace.py's _spawn_multiace_web."""
-    scalars = _read_cfg_scalars()
-    raw = scalars.get("display_index_base")
-    if raw is None:
-        raw = os.environ.get("MULTIACE_DISPLAY_INDEX_BASE", "0")
-    try:
-        v = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return 0
-    return 0 if v < 0 else (1 if v > 1 else v)
+    """Colorful-U1 uses 0-based ACE/head/slot indexes everywhere.
+
+    Older multiACE configs allowed a display_index_base toggle, but keeping
+    that user-facing offset active is exactly how head/slot ambiguity leaks
+    back into source graph routing and logs.
+    """
+    return 0
 
 def _read_update_cfg() -> dict[str, str]:
     """Pull update_repo, update_prerelease and update_url_base from

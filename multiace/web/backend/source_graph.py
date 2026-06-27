@@ -207,7 +207,7 @@ def default_graph(ace_count: int = 1,
             "head": head,
             "module": NATIVE_CHANNELS[head]["module"],
             "channel": NATIVE_CHANNELS[head]["channel"],
-            "label": f"Native Slot {head + 1}",
+            "label": f"Native Slot {head}",
             "material": "",
             "brand": "",
             "subtype": "",
@@ -234,7 +234,7 @@ def default_graph(ace_count: int = 1,
                 "kind": "ace_slot",
                 "ace": ace,
                 "slot": slot,
-                "label": f"ACE {ace + 1} Slot {slot + 1}",
+                "label": f"ACE {ace} Slot {slot}",
                 "material": "",
                 "brand": "",
                 "subtype": "",
@@ -285,16 +285,28 @@ def _normalize_source_labels(sources: dict[str, Any]) -> None:
     for source_id, source in sources.items():
         if not isinstance(source, dict):
             continue
-        if source.get("kind") != "native_feeder":
-            continue
-        try:
-            head = int(source.get("head", str(source_id).split(":")[1]))
-        except (TypeError, ValueError, IndexError):
-            continue
         current = str(source.get("label") or "").strip()
-        legacy = "Native " + f"T{head}"
-        if not current or current == legacy:
-            source["label"] = f"Native Slot {head + 1}"
+        if source.get("kind") == "native_feeder":
+            try:
+                head = int(source.get("head", str(source_id).split(":")[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            legacy = "Native " + f"T{head}"
+            one_based = f"Native Slot {head + 1}"
+            if not current or current in (legacy, one_based):
+                source["label"] = f"Native Slot {head}"
+            continue
+        if source.get("kind") == "ace_slot":
+            try:
+                parts = str(source_id).split(":")
+                ace = int(source.get("ace", parts[1]))
+                slot = int(source.get("slot", parts[2]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            one_based = f"ACE {ace + 1} Slot {slot + 1}"
+            compact_one_based = f"ACE {ace + 1} S{slot + 1}"
+            if not current or current in (one_based, compact_one_based):
+                source["label"] = f"ACE {ace} Slot {slot}"
 
 
 def normalize_graph(graph: dict[str, Any]) -> dict[str, Any]:

@@ -254,7 +254,6 @@
               <h3>Printer wide</h3>
               <div class="settings-grid">
                 <label>ACE count<select v-model.number="configForm.ace_device_count"><option v-for="n in 8" :value="n">{{ n }}</option></select></label>
-                <label>Display index base<select v-model.number="configForm.display_index_base"><option :value="0">0 based</option><option :value="1">1 based</option></select></label>
                 <label>Feed speed<input type="number" v-model.number="configForm.feed_speed"></label>
                 <label>Retract speed<input type="number" v-model.number="configForm.retract_speed"></label>
                 <label>Load length<input type="number" v-model.number="configForm.load_length"></label>
