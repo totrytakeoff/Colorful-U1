@@ -3115,6 +3115,35 @@ def test_empty_load_failed_head_can_load_again() -> None:
                 f"load preview should target ACE slot after recovery: {load}")
 
 
+def test_stale_head_recover_clears_mapping() -> None:
+    set_scenario({
+        "head_modes": {"0": "ace", "1": "native", "2": "native", "3": "native"},
+        "ace_targets": {"0": 0},
+        "slots": [
+            {"ace": 0, "slot": 1, "material": "PETG", "color": "#1e78dc"},
+        ],
+        "head_sources": [
+            {
+                "head": 0, "ace": 0, "slot": 1, "material": "PETG",
+                "color": "1E78DC",
+            },
+        ],
+    })
+    state = request("GET", f"{WEB}/source-state")
+    head0 = (state.get("heads") or {}).get("head:0") or {}
+    assert_true(head0.get("source_confidence") == "stale",
+                f"stale setup should be detected as stale: {state}")
+    recover = post_json(f"{WEB}/operation/head/recover", {
+        "head": "head:0",
+        "execute": False,
+    })
+    operation = recover.get("operation") or {}
+    assert_true(operation.get("status") == "preview",
+                f"stale head recovery should preview successfully: {recover}")
+    assert_true(operation.get("commands") == ["ACE_CLEAR_HEADS HEAD=0"],
+                f"stale recovery command mismatch: {recover}")
+
+
 def test_native_slot_empty_when_head_current_source_is_ace() -> None:
     scenario = {
         "head_modes": {"0": "native", "1": "native", "2": "native", "3": "ace"},
@@ -3747,6 +3776,7 @@ def main() -> int:
         test_route_plan_rejects_target_source_not_ready,
         test_source_state_marks_loaded_empty_ace_slot_exhausted,
         test_empty_load_failed_head_can_load_again,
+        test_stale_head_recover_clears_mapping,
         test_native_slot_empty_when_head_current_source_is_ace,
         test_route_plan_only_rewrite,
         test_route_plan_rewrite_wraps_object_route_select,

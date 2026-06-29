@@ -778,6 +778,10 @@ class HeadUnloadRequest(BaseModel):
     head: str | int
     execute: bool = True
 
+class HeadRecoverRequest(BaseModel):
+    head: str | int
+    execute: bool = True
+
 class SourceFullUnloadRequest(BaseModel):
     source: str
     execute: bool = True
@@ -1747,6 +1751,19 @@ def _head_source_records_for_state(graph: dict, parsed: dict) -> dict[str, Any]:
         if head_id not in graph_heads:
             out.pop(head_id, None)
             continue
+        try:
+            head_idx = int(str(head_id).split(":", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            head_idx = None
+        if head_idx is not None:
+            feed = _feed_status_for_head(parsed, head_idx)
+            sensor = (
+                bool(feed.get("filament_in_toolhead"))
+                or bool(feed.get("filament_at_extruder"))
+            )
+            if not sensor:
+                out.pop(head_id, None)
+                continue
         source_id = (out.get(head_id) or {}).get("source")
         if source_id and source_id not in graph_sources:
             out.pop(head_id, None)
@@ -2921,13 +2938,15 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
                           % (idx, slicer_tool))
         source_id = event.get("source")
         head_id = event.get("head")
-        if not source_id or source_id not in sources:
+        event_action = event.get("action")
+        recover_event = event_action == "recover"
+        if (not recover_event) and (not source_id or source_id not in sources):
             errors.append("route event[%d] references unknown source %r"
                           % (idx, source_id))
         if not head_id or head_id not in heads:
             errors.append("route event[%d] references unknown head %r"
                           % (idx, head_id))
-        if source_id and head_id and (source_id, head_id) not in enabled_edges:
+        if (not recover_event) and source_id and head_id and (source_id, head_id) not in enabled_edges:
             errors.append("route event[%d] has no enabled edge %s -> %s"
                           % (idx, source_id, head_id))
         target = event.get("target") if isinstance(event.get("target"), dict) else {}
@@ -2977,7 +2996,8 @@ def _validate_route_plan_for_graph(route_plan: dict, graph: dict, meta: dict) ->
             if step.get("head") and step.get("head") != head_id:
                 errors.append("route event[%d] step[%d] head mismatch"
                               % (idx, step_idx))
-            if step_source and head_id and (step_source, head_id) not in enabled_edges:
+            if ((not recover_event) and step_source and head_id
+                    and (step_source, head_id) not in enabled_edges):
                 errors.append("route event[%d] step[%d] has no enabled edge %s -> %s"
                               % (idx, step_idx, step_source, head_id))
             action = step.get("profile_action")
@@ -3419,6 +3439,27 @@ def _route_plan_unload_only_head(route_plan: dict, head_id: str) -> bool:
             return False
     return saw_unload
 
+def _route_plan_recover_only_head(route_plan: dict, head_id: str) -> bool:
+    saw_recover = False
+    for event in route_plan.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        for step in event.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            step_head = _normalize_route_head_id({
+                "head": step.get("head") or event.get("head")
+            })
+            if step_head != head_id:
+                continue
+            action = step.get("profile_action")
+            kind = step.get("kind")
+            if action == "recover" or kind == "recover_head":
+                saw_recover = True
+                continue
+            return False
+    return saw_recover
+
 def _validate_route_plan_runtime_state(route_plan: dict,
                                        current_state: dict,
                                        current_sources: dict | None = None,
@@ -3480,14 +3521,26 @@ def _validate_route_plan_runtime_state(route_plan: dict,
             and live_conf == "exhausted"
             and _route_plan_unload_only_head(route_plan, head_id)
         )
+        recover_recovery = (
+            operation_mode
+            and planned_conf in ("unknown", "stale", "failed", "exhausted")
+            and live_conf in ("unknown", "stale", "failed", "exhausted")
+            and _route_plan_recover_only_head(route_plan, head_id)
+        )
         if planned_conf not in actionable and not unload_recovery:
-            errors.append(
-                "route plan initial_state[%s] is %s; recover head state and rerun preflight"
-                % (head_id, planned_conf or "unknown"))
+            if recover_recovery:
+                pass
+            else:
+                errors.append(
+                    "route plan initial_state[%s] is %s; recover head state and rerun preflight"
+                    % (head_id, planned_conf or "unknown"))
         if live_conf not in actionable and not unload_recovery:
-            errors.append(
-                "current source state[%s] is %s; recover head state before print"
-                % (head_id, live_conf or "unknown"))
+            if recover_recovery:
+                pass
+            else:
+                errors.append(
+                    "current source state[%s] is %s; recover head state before print"
+                    % (head_id, live_conf or "unknown"))
         if planned.get("current_source") != live.get("current_source"):
             errors.append(
                 "route plan initial_state[%s] stale: initial=%r current=%r"
@@ -3497,6 +3550,8 @@ def _validate_route_plan_runtime_state(route_plan: dict,
             errors.append(
                 "route plan initial_state[%s] confidence changed: initial=%s current=%s"
                 % (head_id, planned_conf, live_conf))
+        if recover_recovery:
+            continue
     ready_sources = None
     if operation_mode:
         ready_sources = _route_plan_operation_ready_sources(route_plan)
@@ -5563,6 +5618,33 @@ def _postcheck_head_unloaded(
             % (head_id, live_head.get("source_confidence")))
     return live_head
 
+def _postcheck_head_recovered(
+        *,
+        graph: dict,
+        parsed: dict,
+        head_id: str,
+) -> dict:
+    head_idx = _head_index_from_id(head_id)
+    if head_idx is None:
+        raise RuntimeError("invalid head for post-check: %s" % head_id)
+    feed = _feed_status_for_head(parsed, head_idx)
+    if bool(feed.get("filament_at_extruder")):
+        raise RuntimeError(
+            "%s recover completed but toolhead sensor still detects filament"
+            % head_id)
+    if bool(feed.get("filament_detected")):
+        raise RuntimeError(
+            "%s recover completed but source sensor still detects filament"
+            % head_id)
+    _record_head_source(head_id, None, reason="operation_recover")
+    current_state = _source_state_for_parsed(graph, parsed)
+    live_head = (current_state.get("heads") or {}).get(head_id) or {}
+    if live_head.get("source_confidence") not in ("empty",):
+        raise RuntimeError(
+            "%s recover post-check confidence is %s"
+            % (head_id, live_head.get("source_confidence")))
+    return live_head
+
 def _postcheck_source_retracted(
         *,
         graph: dict,
@@ -5675,6 +5757,12 @@ async def _postcheck_operation_step(
             head_id=head_id,
             source_id=source_id,
             clear_current_source=bool(step.get("clears_current_source", True)),
+        )
+    if action == "recover" or kind == "recover_head":
+        return _postcheck_head_recovered(
+            graph=graph,
+            parsed=parsed,
+            head_id=head_id,
         )
     if action == "full_unload" or kind == "full_unload_source":
         return _postcheck_source_full_unloaded(
@@ -5951,6 +6039,75 @@ async def _build_head_unload_operation(payload: HeadUnloadRequest) -> dict[str, 
         "route_plan": route_plan,
     }
 
+async def _build_head_recover_operation(payload: HeadRecoverRequest) -> dict[str, Any]:
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    graph, meta = _load_source_graph(parsed)
+    head_idx = _head_index_from_id(payload.head)
+    if head_idx is None:
+        raise HTTPException(status_code=400, detail="invalid head")
+    head_id = f"head:{head_idx}"
+    initial_state = _source_state_for_parsed(graph, parsed)
+    head_state = (initial_state.get("heads") or {}).get(head_id) or {}
+    confidence = head_state.get("source_confidence")
+    sensor = bool(head_state.get("sensor_filament"))
+    if confidence != "stale":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{head_id} current source is {confidence}; "
+                "only stale empty-head recovery can clear mappings"))
+    if sensor:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{head_id} still detects filament; unload before recovery")
+    route_plan = {
+        "version": 2,
+        "source_graph_hash": meta.get("hash"),
+        "source_graph": {
+            "hash": meta.get("hash"),
+            "source": meta.get("source"),
+            "path": meta.get("path"),
+            "errors": meta.get("errors", []),
+            "warnings": meta.get("warnings", []),
+        },
+        "initial_state": initial_state,
+        "events": [{
+            "index": 0,
+            "event_type": "hardware_operation",
+            "action": "recover",
+            "head": head_id,
+            "steps": [{
+                "kind": "recover_head",
+                "head": head_id,
+                "command": "ACE_CLEAR_HEADS HEAD=%d" % head_idx,
+            }],
+            "commands": ["ACE_CLEAR_HEADS HEAD=%d" % head_idx],
+        }],
+        "commands": ["ACE_CLEAR_HEADS HEAD=%d" % head_idx],
+    }
+    route_plan = _finalize_operation_route_plan(route_plan, graph)
+    current_sources = sg.runtime_sources(graph, parsed)
+    errors = _validate_operation_route_plan(
+        route_plan, graph, meta, initial_state, current_sources)
+    if errors:
+        raise HTTPException(status_code=409, detail="; ".join(errors))
+    job = await _start_operation_job(
+        kind="recover_head",
+        head=head_id,
+        source=None,
+        previous_source=head_state.get("current_source"),
+        route_plan=route_plan,
+        execute=payload.execute,
+    )
+    return {
+        "ok": True,
+        "operation": _operation_public(job),
+        "route_plan": route_plan,
+    }
+
 def _loaded_heads_for_source(initial_state: dict, source_id: str) -> list[str]:
     out = []
     for head_id, head_state in ((initial_state.get("heads") or {}).items()):
@@ -6147,6 +6304,10 @@ async def operation_head_load(payload: HeadLoadRequest) -> dict:
 @app.post("/api/operation/head/unload")
 async def operation_head_unload(payload: HeadUnloadRequest) -> dict:
     return await _build_head_unload_operation(payload)
+
+@app.post("/api/operation/head/recover")
+async def operation_head_recover(payload: HeadRecoverRequest) -> dict:
+    return await _build_head_recover_operation(payload)
 
 @app.post("/api/source/full-unload")
 async def operation_source_full_unload(payload: SourceFullUnloadRequest) -> dict:

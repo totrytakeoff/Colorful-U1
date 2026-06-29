@@ -658,6 +658,22 @@ createApp({
       }, `${head?.label || headId} 退料`);
       if (headPanel.open && headPanel.head === headId) headPanel.status = payload ? "退料完成" : "";
     }
+    async function runHeadRecoverNow(headId) {
+      const head = headCards.value.find((item) => item.id === headId);
+      if (!head) return;
+      if (head.confidence === "stale" && head.current_source) {
+        const payload = await runOperation("/operation/head/recover", {
+          head: headId,
+          execute: true,
+        }, `${head.label || headId} 恢复`);
+        if (headPanel.open && headPanel.head === headId) headPanel.status = payload ? "恢复完成" : "";
+        return;
+      }
+      if (head.confidence === "exhausted" && head.current_source) {
+        return runHeadUnloadNow(headId);
+      }
+      globalError.value = `${head.label || headId} 当前状态为 ${head.confidence}，请先按提示处理物理料路后刷新状态`;
+    }
     async function runSourceFullUnloadNow(sourceId) {
       const source = graphSources.value.find((item) => item.id === sourceId);
       if (!source) return;
@@ -702,7 +718,9 @@ createApp({
     function openRecovery(headId) {
       const head = headCards.value.find((item) => item.id === headId);
       recovery.head = headId;
-      if (head?.confidence === "exhausted" && head.current_source) {
+      if (head?.confidence === "stale" && head.current_source) {
+        recovery.message = `${head?.label || headId} 当前状态为 stale，说明传感器已空但旧映射还残留。应先执行恢复清映射，再按需要重新装载。`;
+      } else if (head?.confidence === "exhausted" && head.current_source) {
         recovery.message = `${head?.label || headId} 当前 source 标记为 exhausted，但工具头仍检测到耗材。非打印状态下应先执行退料恢复，把工具头内余料退出后再继续。`;
       } else {
         recovery.message = `${head?.label || headId} 当前状态为 ${head?.confidence || "unknown"}。自动装载已阻止，请检查物理耗材路径，必要时手动清理后再恢复。`;
@@ -1935,6 +1953,7 @@ createApp({
       openHeadPanel, closeHeadPanel, runHeadLoadNow, runHeadUnloadNow, runSourceFullUnloadNow,
       humanPlanSummary,
       recovery, openRecovery,
+      runHeadRecoverNow,
       materialEditor, materialOptions,
       openMaterialEditor, closeMaterialEditor, readMaterialFromRfid, saveMaterialEditor,
       snapshots, selectedSnapshot, saveSnapshot, applySnapshot, deleteSnapshot,

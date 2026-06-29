@@ -692,7 +692,7 @@
   <modal-panel v-if="recovery.open" title="恢复指引" @close="recovery.open = false">
     <p class="notice warn">{{ recovery.message }}</p>
     <div class="card-actions right">
-      <button @click="runHeadUnloadNow(recovery.head); recovery.open = false" :disabled="operationBusy">执行退料恢复</button>
+      <button @click="runHeadRecoverNow(recovery.head); recovery.open = false" :disabled="operationBusy">执行恢复</button>
       <button @click="recovery.open = false">关闭</button>
     </div>
   </modal-panel>

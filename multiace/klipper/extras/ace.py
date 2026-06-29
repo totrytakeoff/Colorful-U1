@@ -590,6 +590,7 @@ class MultiAce:
 
         self._ghost_heads = set()
         self._hotplug_gone = {}
+        self._stale_head_prune_last = 0.0
 
         self._serial_failed = False
         self._serial_failed_at = 0.0
@@ -1112,6 +1113,50 @@ class MultiAce:
             % (', '.join(str(h) for h in stale_heads), reason or 'source graph'))
         self._audit_state('PRUNE_STALE_HEAD_SOURCE', {
             'reason': reason or 'source graph',
+            'heads': stale_heads,
+        })
+        return stale_heads
+
+    def _prune_stale_head_sources_if_idle(self, reason=''):
+        if self._swap_in_progress or self._in_internal_load_head:
+            return []
+        if self._auto_feed_enabled and self._fa_context == 'print':
+            return []
+        if self._active_device_index is None:
+            return []
+        now = time.monotonic()
+        if now - self._stale_head_prune_last < 2.0:
+            return []
+        self._stale_head_prune_last = now
+        stale_heads = []
+        for head, source in self._head_source.items():
+            if source is None:
+                continue
+            sensor = self.printer.lookup_object(
+                'filament_motion_sensor e%d_filament' % head, None)
+            if sensor is None:
+                continue
+            try:
+                detected = bool(sensor.get_status(0)['filament_detected'])
+            except Exception:
+                continue
+            if detected:
+                continue
+            stale_heads.append(head)
+            self._head_source[head] = None
+            self._clear_filament_display(head)
+        if not stale_heads:
+            return []
+        try:
+            self._save_head_source()
+        except Exception as e:
+            logging.info(
+                '[multiACE] stale head_source idle prune save failed: %s' % e)
+        self.log_always(
+            '[multiACE] Auto-cleared stale head_source for T%s (%s)'
+            % (', '.join(str(h) for h in stale_heads), reason or 'idle sensor sync'))
+        self._audit_state('PRUNE_STALE_HEAD_SOURCE', {
+            'reason': reason or 'idle sensor sync',
             'heads': stale_heads,
         })
         return stale_heads
@@ -7612,6 +7657,7 @@ class MultiAce:
             logging.info('[multiACE] telemetry %s failed: %s' % (event, e))
 
     def get_status(self, eventtime=None):
+        self._prune_stale_head_sources_if_idle('get_status')
 
         aces = []
         for i in range(len(self._ace_devices)):

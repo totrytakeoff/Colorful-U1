@@ -704,6 +704,12 @@ def _apply_script(script: str) -> None:
             for h in range(4):
                 _set_head_empty(state, h)
             state["ace"]["ghost_heads"] = []
+        elif cmd == "ACE_CLEAR_HEADS":
+            if "HEAD" in args:
+                _set_head_empty(state, int(args.get("HEAD", "0")))
+            else:
+                for h in range(4):
+                    _set_head_empty(state, h)
         elif cmd == "PRINT_START":
             graph = _read_source_graph()
             ghost_heads = []

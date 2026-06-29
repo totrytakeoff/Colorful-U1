@@ -206,6 +206,13 @@ Colorful-U1 从本阶段开始全链路统一使用 0-based 编号：
 - `POST /api/operation/swap`
   - 输入：`head_id`、`target_source_id`。
   - 后端组合 unload current source 与 load target source。
+- `POST /api/operation/head/recover`
+  - 输入：`head`、`execute`。
+  - 只处理 `source_confidence=stale` 且工具头传感器确认无料的 head。
+  - 该入口用于清除人工拔料、异常中断或旧缓存导致的 head-source 映射残留。
+  - 后端生成 `ACE_CLEAR_HEADS HEAD=<n>`，执行后必须重新读取状态并确认该 head
+    回到 `source_confidence=empty`。
+  - 如果工具头传感器仍有料，必须拒绝 recover，要求先走退料/物理清理。
 
 ### Source 自身动作
 
@@ -213,9 +220,8 @@ Colorful-U1 从本阶段开始全链路统一使用 0-based 编号：
   - 输入：`source_id`。
   - 只允许 source 不属于任何 head 的 `current_source` 时执行。
   - 用于把耗材完全退回入口外，不得替代 toolhead unload。
-- `POST /api/operation/recover`
-  - 输入：`head_id` / `source_id`、`reason` 和用户确认。
-  - 只处理 `unknown/stale/failed/exhausted` 等异常恢复。
+- 后续如需支持更宽泛的异常恢复，应新增明确类型的 operation，不要把
+  `unknown/stale/failed/exhausted` 混成一个无 post-check 的通用按钮。
 
 执行不变量：
 
