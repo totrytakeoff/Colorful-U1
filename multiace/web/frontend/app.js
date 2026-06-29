@@ -3,6 +3,8 @@ const { createApp, ref, reactive, computed, onMounted, watch, nextTick } = Vue;
 const BASE = location.pathname.startsWith("/multiace/") ? "/multiace" : "";
 const API = `${BASE}/api`;
 const SCREEN = "/screen";
+const GCODE_PREVIEW_BYTES = 16 * 1024 * 1024;
+const GCODE_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MATERIAL_OPTIONS = [
   "PLA", "PLA+", "PETG", "PETG-HF", "ABS", "ASA",
   "TPU", "PA", "PA-CF", "PC", "PVA",
@@ -203,6 +205,30 @@ createApp({
     function swatchStyle(color) { return { background: validHex(color) ? color : "#d9dbe1" }; }
     function ringStyle(color) { return { "--ring": validHex(color) ? color : "#d9dbe1" }; }
     function pretty(value) { return JSON.stringify(value, null, 2); }
+    function formatBytes(value) {
+      const size = Number(value || 0);
+      if (!Number.isFinite(size) || size <= 0) return "0 B";
+      const units = ["B", "KB", "MB", "GB"];
+      let n = size;
+      let i = 0;
+      while (n >= 1024 && i < units.length - 1) {
+        n /= 1024;
+        i += 1;
+      }
+      return `${n >= 10 || i === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[i]}`;
+    }
+    function formatHistoryTime(value) {
+      const ts = Number(value || 0);
+      if (!Number.isFinite(ts) || ts <= 0) return "-";
+      return new Date(ts * 1000).toLocaleString();
+    }
+    function historySummary(entry) {
+      const summary = entry?.summary || {};
+      const tools = Array.isArray(summary.used_tools) ? summary.used_tools.length : 0;
+      const events = Number(summary.route_events || 0);
+      const swaps = Number(summary.active_ace_swaps || 0);
+      return `${tools} tools · ${events} events · ${swaps} swaps`;
+    }
     function dryerLabel(ace) {
       const dryer = ace?.dryer || {};
       return dryer.status && dryer.status !== "stop" ? dryer.status : "idle";
@@ -1249,28 +1275,135 @@ createApp({
       if (!b) return "-";
       return `X ${b.minX.toFixed(1)}-${b.maxX.toFixed(1)}, Y ${b.minY.toFixed(1)}-${b.maxY.toFixed(1)}, Z ${b.minZ.toFixed(2)}-${b.maxZ.toFixed(2)}`;
     });
-    const preflight = reactive({ report: null, validation: null, job: null, setPrefs: false });
+    const preflight = reactive({
+      report: null,
+      validation: null,
+      job: null,
+      previewJob: null,
+      historyEntry: null,
+    });
+    const preflightHistory = reactive({ entries: [], loading: false, error: "" });
     const manualTargets = reactive({});
     const selectedTool = ref("");
+    function applyPreflightReport(report) {
+      preflight.report = report;
+      selectedTool.value = report.slicer_colors?.[0] ? String(report.slicer_colors[0].t) : "";
+      const targets = report.tool_targets || {};
+      for (const tool of report.slicer_colors || []) {
+        manualTargets[String(tool.t)] = targetKey(targets[String(tool.t)] || {});
+      }
+    }
+    function resetPreflightReport() {
+      preflight.report = null;
+      preflight.validation = null;
+      preflight.job = null;
+      preflight.previewJob = null;
+      preflight.historyEntry = null;
+      for (const key of Object.keys(manualTargets)) delete manualTargets[key];
+    }
+    function fileClientMtime(file) {
+      const value = Number(file?.lastModified || 0);
+      return Number.isFinite(value) && value > 0 ? value : null;
+    }
+    async function loadRoutePlanHistory() {
+      preflightHistory.loading = true;
+      preflightHistory.error = "";
+      try {
+        const payload = await api("/route-plan/history");
+        preflightHistory.entries = Array.isArray(payload.entries) ? payload.entries : [];
+      } catch (error) {
+        preflightHistory.error = error.message || String(error);
+      } finally {
+        preflightHistory.loading = false;
+      }
+    }
+    async function matchRoutePlanHistory(file) {
+      const params = new URLSearchParams({
+        filename: file.name,
+        size: String(file.size),
+      });
+      const mtime = fileClientMtime(file);
+      if (mtime != null) params.set("client_mtime", String(mtime));
+      return api(`/route-plan/history/match?${params.toString()}`);
+    }
+    async function restoreRoutePlanHistory(entry, { quiet = false } = {}) {
+      if (!entry?.token) return false;
+      const report = await api(`/route-plan/history/report?token=${encodeURIComponent(entry.token)}`);
+      applyPreflightReport(report);
+      preflight.historyEntry = entry;
+      preflight.previewJob = {
+        kind: "route_preview_history",
+        stage: "history",
+        percent: 100,
+        done: true,
+        error: null,
+        filename: report.filename,
+        token: report.token,
+      };
+      if ((report.resolve_errors || []).length) {
+        preflight.validation = {
+          ok: false,
+          errors: ["耗材映射未完成，请先为未映射的 slicer tool 选择 source。"],
+        };
+      } else {
+        await autoValidateRoutePlan();
+      }
+      if (!quiet) setToast("已从历史恢复分析，未重复上传");
+      return true;
+    }
+    async function restoreRoutePlanHistoryFromClick(entry) {
+      if (!entry?.token || busy.preview || busy.print) return;
+      busy.preview = true;
+      globalError.value = "";
+      try {
+        await restoreRoutePlanHistory(entry);
+      } catch (error) {
+        globalError.value = error.message || String(error);
+      } finally {
+        busy.preview = false;
+      }
+    }
     async function handleFile(file) {
       if (!file) return;
       busy.preview = true;
       globalError.value = "";
-      preflight.report = null;
-      preflight.validation = null;
-      preflight.job = null;
-      for (const key of Object.keys(manualTargets)) delete manualTargets[key];
+      resetPreflightReport();
       try {
-        const text = await file.text();
+        const text = await file.slice(0, GCODE_PREVIEW_BYTES).text();
         parseGcodePreview(text, file.name);
         await nextTick(drawGcodePreview);
-        const form = new FormData();
-        form.append("file", file);
-        const report = await api("/route-plan/preview", { method: "POST", body: form });
-        preflight.report = report;
-        selectedTool.value = report.slicer_colors?.[0] ? String(report.slicer_colors[0].t) : "";
-        const targets = report.tool_targets || {};
-        for (const tool of report.slicer_colors || []) manualTargets[String(tool.t)] = targetKey(targets[String(tool.t)] || {});
+        try {
+          const matched = await matchRoutePlanHistory(file);
+          if (matched?.matched && matched.entry?.available) {
+            if (matched.entry.match_confidence === "exact") {
+              try {
+                await restoreRoutePlanHistory(matched.entry, { quiet: true });
+                setToast("已从历史恢复分析（文件信息完全匹配），未重复上传");
+                await loadRoutePlanHistory();
+                return;
+              } catch (restoreError) {
+                preflightHistory.error = restoreError.message || String(restoreError);
+              }
+            }
+            preflight.previewJob = {
+              kind: "route_preview_history_candidate",
+              stage: "history candidate",
+              percent: 100,
+              done: true,
+              error: null,
+              filename: file.name,
+              token: matched.entry.token,
+            };
+            await loadRoutePlanHistory();
+            setToast("找到同名同大小历史；如确认是同一文件，可从历史中恢复，避免重新上传分析");
+            return;
+          }
+        } catch (historyError) {
+          preflightHistory.error = historyError.message || String(historyError);
+        }
+        const started = await uploadRoutePlanPreview(file);
+        const report = await pollRoutePlanPreview(started.job_id);
+        applyPreflightReport(report);
         if ((report.resolve_errors || []).length) {
           preflight.validation = {
             ok: false,
@@ -1279,11 +1412,65 @@ createApp({
         } else {
           await autoValidateRoutePlan();
         }
+        await loadRoutePlanHistory();
         setToast("G-code 已分析");
       } catch (error) {
         globalError.value = error.message || String(error);
       } finally {
         busy.preview = false;
+      }
+    }
+    async function uploadRoutePlanPreview(file) {
+      const started = await api("/route-plan/preview/upload/start", {
+        method: "POST",
+        body: {
+          filename: file.name,
+          size: file.size,
+          client_mtime: fileClientMtime(file),
+        },
+      });
+      let offset = Number(started.offset || 0);
+      preflight.previewJob = {
+        kind: "route_preview_upload",
+        stage: "upload",
+        percent: file.size ? Math.round((offset / file.size) * 1000) / 10 : 0,
+        done: false,
+        error: null,
+        filename: file.name,
+        token: started.token,
+      };
+      while (offset < file.size) {
+        const end = Math.min(file.size, offset + GCODE_UPLOAD_CHUNK_BYTES);
+        const form = new FormData();
+        form.append("file", file.slice(offset, end), file.name);
+        const chunk = await api(
+          `/route-plan/preview/upload/chunk?token=${encodeURIComponent(started.token)}&offset=${offset}`,
+          { method: "POST", body: form },
+        );
+        offset = Number(chunk.offset || end);
+        preflight.previewJob = {
+          ...preflight.previewJob,
+          stage: "upload",
+          percent: file.size ? Math.round((offset / file.size) * 1000) / 10 : 0,
+        };
+      }
+      const job = await api("/route-plan/preview/upload/commit", {
+        method: "POST",
+        body: { token: started.token },
+      });
+      preflight.previewJob = job;
+      return job;
+    }
+    async function pollRoutePlanPreview(jobId) {
+      if (!jobId) throw new Error("preview job missing");
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const job = await api(`/route-plan/preview/status?job_id=${encodeURIComponent(jobId)}`);
+        preflight.previewJob = job;
+        if (!job.done) continue;
+        if (job.error) throw new Error(job.error);
+        if (!job.result) throw new Error("preview completed without result");
+        return job.result;
       }
     }
     function handleFileInput(event) {
@@ -1667,7 +1854,7 @@ createApp({
       try {
         const job = await api("/route-plan/print", {
           method: "POST",
-          body: { token: preflight.report.token, set_prefs: !!preflight.setPrefs },
+          body: { token: preflight.report.token },
         });
         preflight.job = job;
         pollPrintJob(job.job_id);
@@ -1677,14 +1864,31 @@ createApp({
       }
     }
     async function pollPrintJob(jobId) {
+      let failures = 0;
       try {
         while (jobId) {
           await new Promise((resolve) => setTimeout(resolve, 1000));
-          const job = await api(`/preflight/print/status?job_id=${encodeURIComponent(jobId)}`);
+          let job = null;
+          try {
+            job = await api(`/preflight/print/status?job_id=${encodeURIComponent(jobId)}`);
+            failures = 0;
+          } catch (pollError) {
+            failures += 1;
+            preflight.job = {
+              ...(preflight.job || {}),
+              job_id: jobId,
+              stage: preflight.job?.stage || "status_retry",
+              error: `状态连接重试中 (${failures}/5): ${pollError.message || pollError}`,
+              done: false,
+            };
+            if (failures < 5) continue;
+            throw pollError;
+          }
           preflight.job = job;
           if (job.done) {
             if (job.error) globalError.value = job.error;
             else setToast("打印任务已发送到 Moonraker");
+            await loadRoutePlanHistory();
             break;
           }
         }
@@ -1700,6 +1904,7 @@ createApp({
       await loadMaterials();
       await refreshAll();
       await Promise.allSettled([loadConfig(), refreshDebugState()]);
+      await loadRoutePlanHistory();
       startScreenPolling();
       setInterval(() => {
         if (!busy.refresh) Promise.allSettled([reloadState(), reloadSourceState(), reloadOperation()]);
@@ -1717,6 +1922,7 @@ createApp({
       headCards, sourceAlerts, filteredSources,
       refreshAll, reloadSourceGraph, displayIndex, displayAce, shortHash,
       swatchStyle, ringStyle, dryerLabel, pretty,
+      formatBytes, formatHistoryTime, historySummary,
       sourceOptionsForHead, edgeEnabled, edgePriority, setEdgeEnabled, setEdgePriority,
       setHeadSourceBinding, bindingLabel,
       sourceExecutionValue, setSourceExecutionValue,
@@ -1739,11 +1945,12 @@ createApp({
       debugState, updateState, debugEnable, debugDisable, updateCheck, updateApply,
       profileCommandPreview,
       fileInput, gcodeCanvas, gcodePreview, gcodeBoundsLabel,
-      preflight, manualTargets, selectedTool, usedTools, preflightTargets,
+      preflight, preflightHistory, manualTargets, selectedTool, usedTools, preflightTargets,
       preflightErrors, manualMappingTools, preflightStatus, mappingCheckLabel,
       canValidateRoutePlan, canApplyMapping,
       canPrintRoutePlan, swapSummary, routePlanSummary,
       handleFileInput, handleDrop, autoValidateRoutePlan, remapRoutePlan,
+      loadRoutePlanHistory, restoreRoutePlanHistoryFromClick,
       checkClass, mappingLabel, mappingCommands, assignSelectedTool,
       targetCardForTool, sourceCardLabel, sourceStatusLabel,
       sourceReadyLabel, sourceStatusClass, headConfidenceLabel,

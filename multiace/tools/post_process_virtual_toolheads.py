@@ -162,6 +162,26 @@ def _route_plan_event_cursor(route_plan=None):
         'strict': bool(events),
     }
 
+def _route_plan_managed_tools(route_plan=None, tool_targets=None):
+    """Return the slicer tool ids owned by the source-graph route plan.
+
+    Snapmaker start gcode often contains physical T0..T3 selections for
+    heating/probing before the first slicer tool-change marker.  In strict
+    route-plan mode only slicer tools present in the route contract should
+    consume route events; unmanaged physical T commands must pass through.
+    """
+    out = set()
+    for t in _normalize_route_plan_targets(route_plan):
+        out.add(int(t))
+    for t in _normalize_tool_targets(tool_targets):
+        out.add(int(t))
+    for event in _route_plan_events(route_plan):
+        try:
+            out.add(int(event.get('slicer_tool')))
+        except (TypeError, ValueError):
+            pass
+    return out
+
 def _commands_from_route_event(event):
     if not isinstance(event, dict):
         return []
@@ -392,7 +412,8 @@ def _parse_ace_route_command(cmd):
         return None
 
 def _force_physical_heater_t(line, ace_targets=None, tool_targets=None,
-                             route_plan=None, strict=False):
+                             route_plan=None, strict=False,
+                             managed_tools=None):
     """Rewrite M104/M109 T references to physical heads and force A0.
 
     Snapmaker's stock Klipper handlers remap heater commands through
@@ -422,18 +443,26 @@ def _force_physical_heater_t(line, ace_targets=None, tool_targets=None,
             and t_values and all(0 <= t <= 3 for t in t_values)):
         return body + newline
 
+    managed = set(int(t) for t in (managed_tools or set()))
     saw_t = False
+    rewrote_t = False
 
     def _replace_t(match):
-        nonlocal saw_t
+        nonlocal saw_t, rewrote_t
         saw_t = True
+        tool = int(match.group(1))
+        if strict and managed and tool not in managed:
+            return match.group(0)
         head = _target_for_tool(
-            int(match.group(1)), ace_targets, tool_targets,
+            tool, ace_targets, tool_targets,
             route_plan=route_plan, strict=strict)['head']
+        rewrote_t = True
         return 'T%d' % head
 
     body = re.sub(r'(?<![A-Za-z])T(1[0-5]|[0-9])\b', _replace_t, body)
     if not saw_t:
+        return body + newline
+    if strict and managed and not rewrote_t:
         return body + newline
 
     if re.search(r'(?<![A-Za-z])A[-+]?\d+(?:\.\d+)?\b', body):
@@ -490,19 +519,26 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
         tool_targets = route_plan_targets
     route_cursor = _route_plan_event_cursor(route_plan)
     route_strict = bool(route_cursor.get('strict'))
+    managed_tools = _route_plan_managed_tools(route_plan, tool_targets)
 
     def _fix_m104(m):
         return _force_physical_heater_t(
-            m.group(0), ace_targets, tool_targets, strict=route_strict)
+            m.group(0), ace_targets, tool_targets, strict=route_strict,
+            managed_tools=managed_tools)
     gcode = re.sub(r'^M10[49][^\n]*',
                    _fix_m104, gcode, flags=re.MULTILINE)
 
+    def _fix_preextrude(m):
+        tool = int(m.group(1))
+        if route_strict and managed_tools and tool not in managed_tools:
+            return m.group(0)
+        return 'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=%d' % _target_for_tool(
+            tool, ace_targets, tool_targets,
+            strict=route_strict)['head']
+
     gcode = re.sub(
         r'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=(1[0-5]|[0-9])',
-        lambda m: 'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=%d'
-        % _target_for_tool(
-            int(m.group(1)), ace_targets, tool_targets,
-            strict=route_strict)['head'],
+        _fix_preextrude,
         gcode)
 
     split_re = re.compile(r'^;\s*Change Tool\s*\d+\s*->\s*Tool\s*\d+',
@@ -517,6 +553,8 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
 
     def _expand_initial(m):
         tool = int(m.group(1))
+        if route_strict and managed_tools and tool not in managed_tools:
+            return m.group(0)
         if (route_strict and tool not in consumed_initial_tools
                 and not _route_has_event_for_tool(route_cursor, tool)):
             raise _missing_route_event_error(
@@ -2201,13 +2239,15 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
         tool_targets = route_plan_targets
     route_cursor = _route_plan_event_cursor(route_plan)
     route_strict = bool(route_cursor.get('strict'))
+    managed_tools = _route_plan_managed_tools(route_plan, tool_targets)
     bare_hi   = re.compile(r'^T(1[0-5]|[0-9])\s*$')
     bare_lo   = re.compile(r'^T([0-3])\s*$')
     swap_re   = re.compile(r'^ACE_SWAP_HEAD HEAD=(\d+) ACE=(\d+) SLOT=(\d+)$')
 
     def fix_m104(line):
         return _force_physical_heater_t(
-            line, ace_targets, tool_targets, strict=route_strict)
+            line, ace_targets, tool_targets, strict=route_strict,
+            managed_tools=managed_tools)
 
     in_body = False
     head_loaded = {}
@@ -2300,11 +2340,15 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
             if m_pre:
                 if pending_head is not None:
                     flush_pending_unmatched(fout)
-                target = _target_for_tool(
-                    int(m_pre.group(2)), ace_targets, tool_targets,
-                    strict=route_strict)
-                head = target['head']
-                fout.write('%s%d%s\n' % (m_pre.group(1), head, m_pre.group(3)))
+                tool = int(m_pre.group(2))
+                if route_strict and managed_tools and tool not in managed_tools:
+                    fout.write(line if line.endswith('\n') else (line + '\n'))
+                else:
+                    target = _target_for_tool(
+                        tool, ace_targets, tool_targets,
+                        strict=route_strict)
+                    head = target['head']
+                    fout.write('%s%d%s\n' % (m_pre.group(1), head, m_pre.group(3)))
                 last_pr = _emit_progress(progress, seen, total, last_pr)
                 continue
 
@@ -2329,6 +2373,10 @@ def rewrite_to_file(in_path, out_path, progress=None, ace_targets=None,
                 m = bare_hi.match(stripped)
                 if m:
                     tool = int(m.group(1))
+                    if route_strict and managed_tools and tool not in managed_tools:
+                        fout.write(line if line.endswith('\n') else (line + '\n'))
+                        last_pr = _emit_progress(progress, seen, total, last_pr)
+                        continue
                     if (route_strict and tool not in consumed_initial_tools
                             and not _route_has_event_for_tool(
                                 route_cursor, tool)):

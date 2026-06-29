@@ -444,6 +444,48 @@ textarea {
 .drop-zone input { display: none; }
 .drop-zone h2 { margin: 0; font-size: 28px; letter-spacing: 0; }
 .drop-zone p { max-width: 320px; margin: 8px 0 14px; color: var(--muted); }
+.muted-line { margin: 0; color: var(--muted); }
+.history-card { overflow: hidden; }
+.history-list {
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+}
+.history-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+.history-row.active {
+  border-color: var(--accent);
+  background: #e8f2ff;
+}
+.history-row.unavailable {
+  opacity: .68;
+}
+.history-row strong,
+.history-row small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.history-row small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.history-error {
+  color: var(--red) !important;
+}
+.chip.bad {
+  color: var(--red);
+  background: var(--red-bg);
+}
 .preview-card { overflow: hidden; }
 .gcode-canvas {
   width: 100%;

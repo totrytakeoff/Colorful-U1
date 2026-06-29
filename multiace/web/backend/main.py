@@ -15,11 +15,14 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
 import re
+import shutil
 import sys
+import threading
 import time
 import uuid
 from collections import deque
@@ -75,6 +78,10 @@ MULTIACE_SOURCE_GRAPH_PATH = os.environ.get(
 MULTIACE_HEAD_SOURCE_STATE_PATH = os.environ.get(
     "MULTIACE_HEAD_SOURCE_STATE_PATH",
     "/home/lava/printer_data/config/extended/multiace/head_source_state.json",
+)
+MULTIACE_PREFLIGHT_HISTORY_FILE = os.environ.get(
+    "MULTIACE_PREFLIGHT_HISTORY_FILE",
+    "/home/lava/printer_data/config/extended/multiace/preflight_history.json",
 )
 DEFAULT_MATERIALS = [
     "PLA", "PLA+", "PLA-CF",
@@ -1247,6 +1254,13 @@ _PREFLIGHT_SOURCE_MAP_VERSION = 1
 
 _PREFLIGHT_MAX_SIZE = int(os.environ.get(
     "MULTIACE_PREFLIGHT_MAX_MB", "200")) * 1024 * 1024
+_PREFLIGHT_MAX_CACHE_SIZE = int(os.environ.get(
+    "MULTIACE_PREFLIGHT_CACHE_MAX_MB", "260")) * 1024 * 1024
+_PREFLIGHT_MIN_FREE_SIZE = int(os.environ.get(
+    "MULTIACE_PREFLIGHT_MIN_FREE_MB", "160")) * 1024 * 1024
+_PREFLIGHT_HISTORY_MAX_ITEMS = int(os.environ.get(
+    "MULTIACE_PREFLIGHT_HISTORY_MAX_ITEMS", "80"))
+_PREFLIGHT_HISTORY_LOCK = threading.Lock()
 
 _pp_module = None
 _pp_module_src: str | None = None
@@ -1296,6 +1310,318 @@ def _cleanup_preflight_dir() -> None:
                 p.unlink()
         except Exception:
             pass
+    _prune_preflight_cache()
+
+def _preflight_token_files() -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
+    if not _PREFLIGHT_DIR.is_dir():
+        return groups
+    for p in _PREFLIGHT_DIR.iterdir():
+        if not p.is_file():
+            continue
+        token = p.name.split(".", 1)[0]
+        if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+            continue
+        groups.setdefault(token, []).append(p)
+    return groups
+
+def _preflight_cache_bytes(groups: dict[str, list[Path]] | None = None) -> int:
+    total = 0
+    for files in (groups or _preflight_token_files()).values():
+        for p in files:
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+def _preflight_report_path(token: str) -> Path:
+    return _PREFLIGHT_DIR / (token + ".report.json")
+
+def _save_preflight_report(report: dict) -> None:
+    token = str((report or {}).get("token") or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return
+    _preflight_report_path(token).write_text(
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+def _load_preflight_report(token: str) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return {}
+    p = _preflight_report_path(token)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _preflight_token_available(token: str) -> bool:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return False
+    return (
+        (_PREFLIGHT_DIR / (token + ".gcode")).is_file()
+        and _preflight_report_path(token).is_file()
+    )
+
+def _preflight_name_for_token(token: str) -> str:
+    p = _PREFLIGHT_DIR / (token + ".name")
+    if not p.is_file():
+        return token + ".gcode"
+    try:
+        return p.read_text(encoding="utf-8").strip() or (token + ".gcode")
+    except Exception:
+        return token + ".gcode"
+
+def _preflight_history_path() -> Path:
+    return Path(MULTIACE_PREFLIGHT_HISTORY_FILE)
+
+def _read_preflight_history_unlocked() -> dict:
+    path = _preflight_history_path()
+    if not path.is_file():
+        return {"version": 1, "entries": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "entries": []}
+    if not isinstance(data, dict):
+        return {"version": 1, "entries": []}
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    return {"version": 1, "entries": entries}
+
+def _write_preflight_history_unlocked(history: dict) -> None:
+    entries = history.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    path = _preflight_history_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps({
+            "version": 1,
+            "entries": entries[:_PREFLIGHT_HISTORY_MAX_ITEMS],
+            "updated_at": time.time(),
+        }, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+def _history_entry_summary(report: dict) -> dict:
+    route_plan = (report or {}).get("route_plan") or {}
+    source_map = (report or {}).get("source_map") or {}
+    stats = route_plan.get("stats") or source_map.get("swap_stats") or {}
+    return {
+        "used_tools": route_plan.get("used_tools")
+            or sorted([int(i.get("t")) for i in (report.get("slicer_colors") or [])
+                       if isinstance(i, dict) and str(i.get("t", "")).isdigit()]),
+        "route_events": len(route_plan.get("events") or []),
+        "resolve_errors": len(report.get("resolve_errors") or []),
+        "active_ace_swaps": stats.get("active_ace_swaps", 0),
+        "estimated_swap_seconds_min": stats.get("estimated_swap_seconds_min", 0),
+        "estimated_swap_seconds_max": stats.get("estimated_swap_seconds_max", 0),
+    }
+
+def _record_preflight_history(report: dict, *,
+                              client_mtime: int | float | None = None,
+                              file_hash: str | None = None) -> None:
+    token = str((report or {}).get("token") or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return
+    now = time.time()
+    filename = str(report.get("filename") or _preflight_name_for_token(token))
+    size = int(report.get("size") or 0)
+    summary = _history_entry_summary(report)
+    with _PREFLIGHT_HISTORY_LOCK:
+        history = _read_preflight_history_unlocked()
+        entries = []
+        previous: dict | None = None
+        for raw in history.get("entries") or []:
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("token") == token:
+                previous = raw
+                continue
+            if (raw.get("filename") == filename
+                    and int(raw.get("size") or -1) == size
+                    and client_mtime is not None
+                    and raw.get("client_mtime") == client_mtime):
+                continue
+            entries.append(raw)
+        if client_mtime is None and previous is not None:
+            client_mtime = previous.get("client_mtime")
+        if file_hash is None and previous is not None:
+            file_hash = previous.get("file_hash")
+        entry = {
+            "token": token,
+            "filename": filename,
+            "size": size,
+            "client_mtime": client_mtime,
+            "file_hash": file_hash,
+            "created_at": report.get("created_at") or now,
+            "analyzed_at": now,
+            "source_graph_hash": (
+                (report.get("route_plan") or {}).get("source_graph_hash")
+                or (report.get("source_map") or {}).get("source_graph_hash")
+                or ""
+            ),
+            "summary": summary,
+        }
+        entries.insert(0, entry)
+        history["entries"] = entries
+        _write_preflight_history_unlocked(history)
+
+def _update_preflight_print_history(token: str, *,
+                                    job_id: str | None = None,
+                                    status: str | None = None,
+                                    moonraker: dict | None = None,
+                                    error: str | None = None) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return
+    now = time.time()
+    with _PREFLIGHT_HISTORY_LOCK:
+        history = _read_preflight_history_unlocked()
+        changed = False
+        for entry in history.get("entries") or []:
+            if not isinstance(entry, dict) or entry.get("token") != token:
+                continue
+            entry["last_print_at"] = now
+            if job_id:
+                entry["last_print_job_id"] = job_id
+            if status:
+                entry["last_print_status"] = status
+            if moonraker is not None:
+                entry["last_moonraker"] = moonraker
+            if error:
+                entry["last_print_error"] = error
+            elif status == "done":
+                entry.pop("last_print_error", None)
+            changed = True
+            break
+        if changed:
+            _write_preflight_history_unlocked(history)
+
+def _history_entry_public(entry: dict) -> dict:
+    token = str(entry.get("token") or "")
+    out = {
+        "token": token,
+        "filename": entry.get("filename") or _preflight_name_for_token(token),
+        "size": entry.get("size") or 0,
+        "client_mtime": entry.get("client_mtime"),
+        "file_hash": entry.get("file_hash"),
+        "created_at": entry.get("created_at"),
+        "analyzed_at": entry.get("analyzed_at"),
+        "source_graph_hash": entry.get("source_graph_hash") or "",
+        "summary": entry.get("summary") or {},
+        "last_print_at": entry.get("last_print_at"),
+        "last_print_job_id": entry.get("last_print_job_id"),
+        "last_print_status": entry.get("last_print_status"),
+        "last_print_error": entry.get("last_print_error"),
+        "available": _preflight_token_available(token),
+    }
+    return out
+
+def _preflight_history_entries() -> list[dict]:
+    with _PREFLIGHT_HISTORY_LOCK:
+        history = _read_preflight_history_unlocked()
+        entries = [
+            _history_entry_public(entry)
+            for entry in history.get("entries") or []
+            if isinstance(entry, dict)
+        ]
+    return entries
+
+def _preflight_history_match(filename: str, size: int,
+                             client_mtime: int | float | None = None) -> dict | None:
+    safe_name = _validate_preflight_filename(filename)
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        return None
+    entries = _preflight_history_entries()
+    exact: list[dict] = []
+    fallback: list[dict] = []
+    for entry in entries:
+        if not entry.get("available"):
+            continue
+        if entry.get("filename") != safe_name:
+            continue
+        if int(entry.get("size") or -1) != size:
+            continue
+        if client_mtime is not None and entry.get("client_mtime") == client_mtime:
+            exact.append(entry)
+        elif client_mtime is None:
+            fallback.append(entry)
+        else:
+            fallback.append(entry)
+    candidates = exact or fallback
+    if not candidates:
+        return None
+    found = sorted(candidates, key=lambda e: e.get("analyzed_at") or 0,
+                   reverse=True)[0]
+    found = dict(found)
+    found["match_confidence"] = "exact" if found in exact else "filename_size"
+    return found
+
+def _unlink_preflight_token(token: str) -> None:
+    for p in _preflight_token_files().get(token, []):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+def _prune_preflight_cache(required_free: int = 0,
+                           protected_token: str | None = None) -> None:
+    if not _PREFLIGHT_DIR.is_dir():
+        return
+    groups = _preflight_token_files()
+    def free_ok() -> bool:
+        if required_free <= 0:
+            return True
+        try:
+            usage = shutil.disk_usage(_PREFLIGHT_DIR)
+            return usage.free >= required_free
+        except OSError:
+            return True
+    total = _preflight_cache_bytes(groups)
+    if total <= _PREFLIGHT_MAX_CACHE_SIZE and free_ok():
+        return
+    ordered: list[tuple[float, str]] = []
+    for token, files in groups.items():
+        if token == protected_token:
+            continue
+        mtimes = []
+        for p in files:
+            try:
+                mtimes.append(p.stat().st_mtime)
+            except OSError:
+                pass
+        ordered.append((min(mtimes) if mtimes else 0.0, token))
+    for _, token in sorted(ordered):
+        _unlink_preflight_token(token)
+        groups.pop(token, None)
+        total = _preflight_cache_bytes(groups)
+        if total <= _PREFLIGHT_MAX_CACHE_SIZE and free_ok():
+            break
+
+def _raise_preflight_no_space() -> None:
+    raise HTTPException(
+        status_code=507,
+        detail=("not enough temporary space for G-code preflight; old "
+                "preflight files were cleaned, retry the upload"))
+
+def _validate_preflight_filename(raw_name: str) -> str:
+    safe_name = os.path.basename(raw_name or "")
+    if (not safe_name or safe_name in (".", "..") or "/" in safe_name
+            or "\\" in safe_name):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not safe_name.lower().endswith((".gcode", ".gco", ".g")):
+        raise HTTPException(status_code=400, detail="not a g-code file")
+    return safe_name
 
 async def _live_slots_async() -> list[dict]:
     status = await _query_state()
@@ -3590,39 +3916,49 @@ def _complete_route_tool_events(events: list[int] | tuple[int, ...] | None,
         out = [int(t) for t in sorted(used_tools)]
     return out
 
-async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
-    raw_name = file.filename or ""
-    safe_name = os.path.basename(raw_name)
-    if not safe_name or safe_name in (".", "..") or "/" in safe_name or "\\" in safe_name:
-        raise HTTPException(status_code=400, detail="invalid filename")
-    if not safe_name.lower().endswith((".gcode", ".gco", ".g")):
-        raise HTTPException(status_code=400, detail="not a g-code file")
+async def _save_preflight_upload_file(file: UploadFile) -> tuple[str, str, int]:
+    safe_name = _validate_preflight_filename(file.filename or "")
     _cleanup_preflight_dir()
     _PREFLIGHT_DIR.mkdir(parents=True, exist_ok=True)
     import uuid as _uuid
     token = _uuid.uuid4().hex
     src_path = _PREFLIGHT_DIR / (token + ".gcode")
     upload_size = 0
-    with open(src_path, "wb") as out:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            upload_size += len(chunk)
-            if upload_size > _PREFLIGHT_MAX_SIZE:
-                try:
-                    src_path.unlink()
-                except Exception:
-                    pass
-                raise HTTPException(
-                    status_code=413,
-                    detail=(f"gcode too large for in-printer preflight "
-                            f"({upload_size//1024//1024} MB > "
-                            f"{_PREFLIGHT_MAX_SIZE//1024//1024} MB limit). "
-                            f"Bypass: upload directly via Moonraker's normal "
-                            f"upload endpoint, or raise the limit via "
-                            f"MULTIACE_PREFLIGHT_MAX_MB env."))
-            out.write(chunk)
+    try:
+        _prune_preflight_cache(
+            required_free=min(_PREFLIGHT_MAX_SIZE + _PREFLIGHT_MIN_FREE_SIZE,
+                              _PREFLIGHT_MAX_CACHE_SIZE + _PREFLIGHT_MIN_FREE_SIZE),
+            protected_token=token,
+        )
+        with open(src_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                upload_size += len(chunk)
+                if upload_size > _PREFLIGHT_MAX_SIZE:
+                    try:
+                        src_path.unlink()
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(f"gcode too large for in-printer preflight "
+                                f"({upload_size//1024//1024} MB > "
+                                f"{_PREFLIGHT_MAX_SIZE//1024//1024} MB limit). "
+                                f"Bypass: upload directly via Moonraker's normal "
+                                f"upload endpoint, or raise the limit via "
+                                f"MULTIACE_PREFLIGHT_MAX_MB env."))
+                out.write(chunk)
+    except OSError as exc:
+        try:
+            src_path.unlink()
+        except Exception:
+            pass
+        if exc.errno == errno.ENOSPC:
+            _prune_preflight_cache(protected_token=token)
+            _raise_preflight_no_space()
+        raise
     await file.close()
     if upload_size <= 0:
         try:
@@ -3630,11 +3966,34 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="empty file")
+    (_PREFLIGHT_DIR / (token + ".name")).write_text(safe_name, encoding="utf-8")
+    _prune_preflight_cache(protected_token=token)
+    return token, safe_name, upload_size
+
+async def _build_route_plan_preview_from_saved(token: str, safe_name: str,
+                                               upload_size: int) -> dict:
+    src_path = _PREFLIGHT_DIR / (token + ".gcode")
+    if not src_path.is_file():
+        raise HTTPException(status_code=404,
+                            detail="route plan token expired or unknown")
+    try:
+        parsed = _parse_state(await _query_state())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"moonraker: {e}")
+    return await asyncio.to_thread(
+        _build_route_plan_preview_from_saved_sync,
+        token, safe_name, upload_size, parsed)
+
+def _build_route_plan_preview_from_saved_sync(token: str, safe_name: str,
+                                              upload_size: int,
+                                              parsed: dict) -> dict:
+    pp = _load_post_processor()
+    src_path = _PREFLIGHT_DIR / (token + ".gcode")
+    if not src_path.is_file():
+        raise HTTPException(status_code=404,
+                            detail="route plan token expired or unknown")
     _raise_gcode_safety_error(
         _validate_web_gcode_safety_file(src_path, filename=safe_name))
-    (_PREFLIGHT_DIR / (token + ".name")).write_text(safe_name, encoding="utf-8")
-
-    pp = _load_post_processor()
 
     plan_keep_re = re.compile(
         r'^(;\s*Change Tool|;\s*LAYER_CHANGE|;\s*filament\b|T\d{1,2}\s*$)',
@@ -3674,7 +4033,6 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         slicer_colors = {t: c for t, c in slicer_colors.items() if t in used}
         slicer_types  = {t: m for t, m in slicer_types.items() if t in used}
 
-    parsed = _parse_state(await _query_state())
     failed = _load_failed_toolheads(parsed)
     if failed:
         raise HTTPException(
@@ -3799,7 +4157,15 @@ async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
         }
         out["plans"]["optimize"] = _disabled_plan()
         out["plans"]["layer"] = _disabled_plan()
+    _save_preflight_report(out)
     return out
+
+async def _create_route_plan_preview_from_upload(file: UploadFile) -> dict:
+    token, safe_name, upload_size = await _save_preflight_upload_file(file)
+    report = await _build_route_plan_preview_from_saved(
+        token, safe_name, upload_size)
+    _record_preflight_history(report)
+    return report
 
 @app.post("/api/preflight")
 async def preflight(file: UploadFile = File(...)) -> dict:
@@ -3812,6 +4178,14 @@ async def route_plan_preview(file: UploadFile = File(...)) -> dict:
 _PREFLIGHT_JOBS: dict[str, dict] = {}
 _PREFLIGHT_JOBS_LOCK = asyncio.Lock()
 _PREFLIGHT_JOB_TTL = 600.0
+
+class RoutePlanUploadStartRequest(BaseModel):
+    filename: str
+    size: int
+    client_mtime: int | float | None = None
+
+class RoutePlanUploadCommitRequest(BaseModel):
+    token: str
 
 def _set_stage(state: dict, stage: str, percent: float) -> None:
     state["stage"]   = stage
@@ -3829,21 +4203,300 @@ def _stage_progress(state: dict, base: float, span: float):
         state["ts"] = time.time()
     return cb
 
-_PRINT_PREFS_LINE = ("SET_PRINT_PREFERENCES BED_LEVEL=0 "
-                     "FLOW_CALIBRATE=0 TIME_LAPSE_CAMERA=0")
+def _job_response(job_id: str, state: dict, *,
+                  include_artifacts: bool = True) -> dict:
+    result = state.get("result")
+    out = {
+        "job_id": job_id,
+        "kind": state.get("kind"),
+        "stage": state.get("stage"),
+        "percent": round(state.get("percent", 0.0), 1),
+        "done": bool(state.get("done")),
+        "error": state.get("error"),
+        "filename": state.get("filename"),
+        "mode": state.get("mode"),
+        "token": state.get("token"),
+        "result": result or None,
+    }
+    if include_artifacts:
+        out["source_map"] = (
+            (result or {}).get("source_map") or state.get("source_map") or {})
+        out["route_plan"] = (
+            (result or {}).get("route_plan") or state.get("route_plan") or {})
+    return out
+
+async def _run_route_plan_preview_job(job_id: str, token: str,
+                                      safe_name: str,
+                                      upload_size: int,
+                                      client_mtime: int | float | None = None
+                                      ) -> None:
+    state = _PREFLIGHT_JOBS[job_id]
+    try:
+        await asyncio.sleep(0)
+        _set_stage(state, "analyze", 5.0)
+        result = await _build_route_plan_preview_from_saved(
+            token, safe_name, upload_size)
+        state["result"] = result
+        state["source_map"] = result.get("source_map") or {}
+        state["route_plan"] = result.get("route_plan") or {}
+        _record_preflight_history(result, client_mtime=client_mtime)
+        _set_stage(state, "done", 100.0)
+        state["done"] = True
+    except HTTPException as exc:
+        detail = exc.detail
+        state["error"] = detail if isinstance(detail, str) else json.dumps(detail)
+        state["done"] = True
+        state["ts"] = time.time()
+    except Exception as exc:
+        state["error"] = str(exc)
+        state["done"] = True
+        state["ts"] = time.time()
+
+@app.post("/api/route-plan/preview/async")
+async def route_plan_preview_async(file: UploadFile = File(...)) -> dict:
+    _prune_old_jobs()
+    token, safe_name, upload_size = await _save_preflight_upload_file(file)
+    return _start_route_plan_preview_job(token, safe_name, upload_size)
+
+def _start_route_plan_preview_job(token: str, safe_name: str,
+                                  upload_size: int,
+                                  client_mtime: int | float | None = None
+                                  ) -> dict:
+    _prune_old_jobs()
+    job_id = uuid.uuid4().hex
+    _PREFLIGHT_JOBS[job_id] = {
+        "kind": "route_preview",
+        "stage": "queued",
+        "percent": 0.0,
+        "done": False,
+        "error": None,
+        "filename": safe_name,
+        "mode": "preview",
+        "token": token,
+        "size": upload_size,
+        "client_mtime": client_mtime,
+        "ts": time.time(),
+    }
+    asyncio.create_task(_run_route_plan_preview_job(
+        job_id, token, safe_name, upload_size, client_mtime))
+    return _job_response(job_id, _PREFLIGHT_JOBS[job_id])
+
+@app.post("/api/route-plan/preview/upload/start")
+async def route_plan_preview_upload_start(
+        req: RoutePlanUploadStartRequest) -> dict:
+    safe_name = _validate_preflight_filename(req.filename)
+    try:
+        total_size = int(req.size)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid upload size")
+    if total_size <= 0:
+        raise HTTPException(status_code=400, detail="empty file")
+    if total_size > _PREFLIGHT_MAX_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=(f"gcode too large for in-printer preflight "
+                    f"({total_size//1024//1024} MB > "
+                    f"{_PREFLIGHT_MAX_SIZE//1024//1024} MB limit)"))
+    _cleanup_preflight_dir()
+    _PREFLIGHT_DIR.mkdir(parents=True, exist_ok=True)
+    _prune_preflight_cache(
+        required_free=min(total_size + _PREFLIGHT_MIN_FREE_SIZE,
+                          _PREFLIGHT_MAX_CACHE_SIZE + _PREFLIGHT_MIN_FREE_SIZE),
+    )
+    token = uuid.uuid4().hex
+    (_PREFLIGHT_DIR / (token + ".part")).write_bytes(b"")
+    (_PREFLIGHT_DIR / (token + ".upload.json")).write_text(
+        json.dumps({
+            "token": token,
+            "filename": safe_name,
+            "size": total_size,
+            "offset": 0,
+            "client_mtime": req.client_mtime,
+            "created_at": time.time(),
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return {
+        "token": token,
+        "filename": safe_name,
+        "size": total_size,
+        "offset": 0,
+    }
+
+@app.post("/api/route-plan/preview/upload/chunk")
+async def route_plan_preview_upload_chunk(
+        token: str, offset: int, file: UploadFile = File(...)) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    meta_path = _PREFLIGHT_DIR / (token + ".upload.json")
+    part_path = _PREFLIGHT_DIR / (token + ".part")
+    if not meta_path.is_file() or not part_path.is_file():
+        raise HTTPException(status_code=404, detail="upload session not found")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        expected_size = int(meta.get("size") or 0)
+        expected_offset = int(meta.get("offset") or 0)
+        offset = int(offset)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid upload metadata")
+    if offset != expected_offset:
+        raise HTTPException(
+            status_code=409,
+            detail=f"unexpected upload offset {offset}, expected {expected_offset}")
+    written = 0
+    try:
+        with open(part_path, "ab") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if expected_offset + written > expected_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="chunk exceeds declared upload size")
+                out.write(chunk)
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            _raise_preflight_no_space()
+        raise
+    finally:
+        await file.close()
+    if written <= 0:
+        raise HTTPException(status_code=400, detail="empty chunk")
+    meta["offset"] = expected_offset + written
+    meta["updated_at"] = time.time()
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return {
+        "token": token,
+        "offset": meta["offset"],
+        "size": expected_size,
+        "done": meta["offset"] >= expected_size,
+    }
+
+@app.post("/api/route-plan/preview/upload/commit")
+async def route_plan_preview_upload_commit(
+        req: RoutePlanUploadCommitRequest) -> dict:
+    token = req.token
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    meta_path = _PREFLIGHT_DIR / (token + ".upload.json")
+    part_path = _PREFLIGHT_DIR / (token + ".part")
+    src_path = _PREFLIGHT_DIR / (token + ".gcode")
+    if not meta_path.is_file() or not part_path.is_file():
+        raise HTTPException(status_code=404, detail="upload session not found")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        safe_name = _validate_preflight_filename(str(meta.get("filename") or ""))
+        expected_size = int(meta.get("size") or 0)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid upload metadata")
+    actual_size = part_path.stat().st_size
+    if actual_size != expected_size:
+        raise HTTPException(
+            status_code=409,
+            detail=f"incomplete upload {actual_size}/{expected_size} bytes")
+    try:
+        part_path.rename(src_path)
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            _raise_preflight_no_space()
+        raise
+    (_PREFLIGHT_DIR / (token + ".name")).write_text(safe_name, encoding="utf-8")
+    try:
+        meta_path.unlink()
+    except OSError:
+        pass
+    _prune_preflight_cache(protected_token=token)
+    return _start_route_plan_preview_job(
+        token, safe_name, actual_size, meta.get("client_mtime"))
+
+@app.get("/api/route-plan/preview/status")
+async def route_plan_preview_status(job_id: str) -> dict:
+    state = _PREFLIGHT_JOBS.get(job_id)
+    if state is None or state.get("kind") != "route_preview":
+        raise HTTPException(status_code=404, detail="preview job not found")
+    return _job_response(job_id, state, include_artifacts=False)
+
+@app.get("/api/route-plan/history")
+async def route_plan_history() -> dict:
+    entries = _preflight_history_entries()
+    return {
+        "entries": entries[:_PREFLIGHT_HISTORY_MAX_ITEMS],
+        "cache_dir": str(_PREFLIGHT_DIR),
+    }
+
+@app.get("/api/route-plan/history/match")
+async def route_plan_history_match(filename: str, size: int,
+                                   client_mtime: int | float | None = None
+                                   ) -> dict:
+    entry = _preflight_history_match(filename, size, client_mtime)
+    return {
+        "matched": bool(entry),
+        "entry": entry,
+    }
+
+@app.get("/api/route-plan/history/report")
+async def route_plan_history_report(token: str) -> dict:
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise HTTPException(status_code=400, detail="invalid token")
+    if not _preflight_token_available(token):
+        raise HTTPException(status_code=404,
+                            detail="history cache expired; upload again")
+    report = _load_preflight_report(token)
+    if not report:
+        raise HTTPException(status_code=404,
+                            detail="history report missing; upload again")
+    return report
+
+_SNAPMAKER_STARTUP_MACROS_DISABLED_FOR_ROUTE_PLAN = {
+    "SET_PRINT_PREFERENCES",
+    "DEFECT_DETECTION_START",
+    "DEFECT_DETECTION_DETECT_BED",
+    "SM_PRINT_CHECK_SWITCH_EXTRUDER",
+    "SM_PRINT_EXTRUDER_PREHEAT",
+    "SM_PRINT_AUTO_FEED",
+    "SM_PRINT_FLOW_CALIBRATE",
+}
 
 def _prepend_print_prefs(in_path: str, out_path: str) -> None:
-    """Stream-copy in_path to out_path with the print-preference line
-    prepended at the very top (before the start gcode's calibration).
-    Any SET_PRINT_PREFERENCES the slicer already emits is commented out
-    so it can't override ours from further down the file."""
+    """Compatibility shim for the old set_prefs flag.
+
+    Snapmaker rejects SET_PRINT_PREFERENCES once a print file has started
+    executing, so route-plan printing must not prepend it into G-code.  Keep
+    this step as a sanitizer only: strip any slicer-provided preference line.
+    """
     with open(out_path, "w", encoding="utf-8", errors="replace") as out:
-        out.write("; multiACE preflight: print preferences\n")
-        out.write(_PRINT_PREFS_LINE + "\n")
+        out.write("; Colorful-U1 route-plan preference sanitizer\n")
         with open(in_path, "r", encoding="utf-8", errors="replace") as src:
             for line in src:
                 if line.lstrip().upper().startswith("SET_PRINT_PREFERENCES"):
-                    out.write("; multiACE disabled: " + line.lstrip())
+                    out.write("; Colorful-U1 disabled print preference: "
+                              + line.lstrip())
+                    continue
+                out.write(line)
+
+def _sanitize_route_plan_startup_gcode(in_path: str, out_path: str) -> None:
+    """Disable Snapmaker startup macros that fight source-graph routing.
+
+    Route-plan printing owns filament loading and tool/source mapping. The
+    slicer's stock startup block may still contain bed defect detection and
+    all-head native auto-feed/flow-calibration macros. On mixed ACE/native
+    prints those macros can move or probe the wrong physical tool before the
+    Colorful-U1 auto-load block is reached. Keep the original lines as
+    comments for diagnosis, but do not execute them.
+    """
+    with open(out_path, "w", encoding="utf-8", errors="replace") as out:
+        out.write("; Colorful-U1 route-plan startup safety\n")
+        with open(in_path, "r", encoding="utf-8", errors="replace") as src:
+            for line in src:
+                stripped = line.lstrip()
+                macro = stripped.split(None, 1)[0].upper() if stripped.strip() else ""
+                if macro in _SNAPMAKER_STARTUP_MACROS_DISABLED_FOR_ROUTE_PLAN:
+                    out.write("; Colorful-U1 disabled startup macro: "
+                              + stripped)
                     continue
                 out.write(line)
 
@@ -3864,6 +4517,7 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
                                   safe_name: str,
                                   set_prefs: bool = False) -> None:
     state = _PREFLIGHT_JOBS[job_id]
+    state["token"] = token
     pp = _load_post_processor()
     src = _PREFLIGHT_DIR / (token + ".gcode")
     source_map = _load_preflight_source_map(token)
@@ -3953,6 +4607,11 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         )
         cur, nxt = nxt, cur
 
+        _set_stage(state, "sanitize_startup", 82.0)
+        await asyncio.to_thread(
+            _sanitize_route_plan_startup_gcode, str(cur), str(nxt))
+        cur, nxt = nxt, cur
+
         if set_prefs:
             _set_stage(state, "print_prefs", 84.0)
             await asyncio.to_thread(
@@ -3997,10 +4656,15 @@ async def _run_preflight_pipeline(job_id: str, token: str, mode: str,
         state["source_map"] = _load_preflight_source_map(token) or source_map
         state["route_plan"] = _load_preflight_route_plan(token) or route_plan
         state["done"]     = True
+        _update_preflight_print_history(
+            token, job_id=job_id, status="done",
+            moonraker=state.get("moonraker"))
     except Exception as exc:
         state["error"] = str(exc)
         state["done"]  = True
         state["ts"]    = time.time()
+        _update_preflight_print_history(
+            token, job_id=job_id, status="error", error=str(exc))
     finally:
 
         for p in (tmp_a, tmp_b):
@@ -4091,6 +4755,18 @@ async def _apply_route_plan_tool_targets(token: str,
             detail="route plan validation failed: " + "; ".join(route_errors[:8]))
     _save_preflight_source_map(source_map)
     _save_preflight_route_plan(route_plan)
+    report = _load_preflight_report(token)
+    if report:
+        report.update({
+            "token": token,
+            "filename": safe_name,
+            "source_map": source_map,
+            "route_plan": route_plan,
+            "tool_targets": manual_targets,
+            "resolve_errors": [],
+        })
+        _save_preflight_report(report)
+        _record_preflight_history(report)
     return {
         "ok": True,
         "token": token,
@@ -4154,10 +4830,12 @@ async def _start_route_plan_print(token: str, *, set_prefs: bool = False,
         "error":    None,
         "filename": safe_name,
         "mode":     mode,
+        "token":    token,
         "ts":       time.time(),
         "source_map": _load_preflight_source_map(token),
         "route_plan": _load_preflight_route_plan(token),
     }
+    _update_preflight_print_history(token, job_id=job_id, status="queued")
     asyncio.create_task(_run_preflight_pipeline(
         job_id, token, mode, safe_name, set_prefs))
     return {"job_id": job_id, "filename": safe_name, "mode": mode}
@@ -4182,22 +4860,14 @@ async def route_plan_remap(req: RoutePlanRemapRequest) -> dict:
     return await _apply_route_plan_tool_targets(req.token, req.tool_targets)
 
 @app.get("/api/preflight/print/status")
-async def preflight_print_status(job_id: str) -> dict:
+async def preflight_print_status(job_id: str,
+                                 include_artifacts: int = 0) -> dict:
     state = _PREFLIGHT_JOBS.get(job_id)
     if state is None:
         raise HTTPException(status_code=404, detail="job not found")
 
-    return {
-        "job_id":  job_id,
-        "stage":   state.get("stage"),
-        "percent": round(state.get("percent", 0.0), 1),
-        "done":    bool(state.get("done")),
-        "error":   state.get("error"),
-        "filename": state.get("filename"),
-        "mode":    state.get("mode"),
-        "source_map": state.get("source_map") or {},
-        "route_plan": state.get("route_plan") or {},
-    }
+    return _job_response(
+        job_id, state, include_artifacts=bool(include_artifacts))
 
 @app.get("/api/preflight/source-map")
 async def preflight_source_map(token: str) -> dict:

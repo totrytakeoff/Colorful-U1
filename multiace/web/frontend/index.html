@@ -447,7 +447,33 @@
             <h2>上传 G-code</h2>
             <p>自动生成 route plan、检查映射和 source state，校验通过后才允许发送。</p>
             <button class="primary" @click="$refs.fileInput.click()" :disabled="busy.preview">{{ busy.preview ? '分析中' : '选择文件' }}</button>
+            <div v-if="preflight.previewJob" class="print-job">
+              <span>{{ preflight.previewJob.stage || 'queued' }}</span>
+              <div class="progress"><span :style="{width: (preflight.previewJob.percent || 0) + '%'}"></span></div>
+              <p v-if="preflight.previewJob.error" class="notice error">{{ preflight.previewJob.error }}</p>
+            </div>
           </div>
+
+          <article class="settings-card history-card">
+            <div class="card-title">
+              <h3>上传/打印历史</h3>
+              <button @click="loadRoutePlanHistory" :disabled="preflightHistory.loading">{{ preflightHistory.loading ? '刷新中' : '刷新' }}</button>
+            </div>
+            <p v-if="preflightHistory.error" class="notice error">{{ preflightHistory.error }}</p>
+            <p v-else-if="!preflightHistory.entries.length" class="muted-line">暂无历史。首次分析后会自动保存。</p>
+            <div v-else class="history-list">
+              <article v-for="entry in preflightHistory.entries" :key="entry.token" class="history-row" :class="{active: preflight.report && preflight.report.token === entry.token, unavailable: !entry.available}">
+                <div>
+                  <strong>{{ entry.filename }}</strong>
+                  <small>{{ formatBytes(entry.size) }} · {{ historySummary(entry) }}</small>
+                  <small>分析 {{ formatHistoryTime(entry.analyzed_at) }}<template v-if="entry.last_print_at"> · 打印 {{ formatHistoryTime(entry.last_print_at) }}</template></small>
+                  <small v-if="entry.last_print_error" class="history-error">{{ entry.last_print_error }}</small>
+                </div>
+                <span class="chip" :class="{bad: !entry.available}">{{ entry.available ? '可复用' : '已过期' }}</span>
+                <button @click="restoreRoutePlanHistoryFromClick(entry)" :disabled="busy.preview || busy.print || !entry.available">恢复</button>
+              </article>
+            </div>
+          </article>
 
           <article class="settings-card preview-card">
             <div class="card-title">
@@ -467,8 +493,9 @@
           <article v-if="preflight.report" class="settings-card">
             <div class="card-title">
               <h3>{{ preflight.report.filename }}</h3>
-              <span class="chip">{{ preflight.report.size || 0 }} bytes</span>
+              <span class="chip">{{ formatBytes(preflight.report.size || 0) }}</span>
             </div>
+            <p v-if="preflight.historyEntry" class="notice ok">已从上传/打印历史恢复，本次没有重复上传和重复分析。</p>
             <div class="check-grid">
               <div :class="checkClass(preflightStatus.ok)">
                 <strong>Mapping</strong><span>{{ mappingCheckLabel }}</span>
@@ -487,7 +514,6 @@
             <p v-if="preflightErrors.length" class="notice error">{{ preflightErrors.join('; ') }}</p>
             <p v-if="preflight.validation && !preflight.validation.ok && manualMappingTools.length" class="notice error">{{ (preflight.validation.errors || []).join('; ') }}</p>
             <div class="print-action-panel">
-              <label class="check-row"><input type="checkbox" v-model="preflight.setPrefs"> 写入打印偏好</label>
               <button class="primary print-button" @click="printRoutePlan" :disabled="busy.print || !canPrintRoutePlan">
                 {{ busy.print ? '发送中' : '发送打印' }}
               </button>
