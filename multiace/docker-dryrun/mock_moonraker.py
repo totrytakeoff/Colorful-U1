@@ -679,7 +679,16 @@ def _apply_script(script: str) -> None:
         GCODE_LOG.parent.mkdir(parents=True, exist_ok=True)
         with GCODE_LOG.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
-        if cmd == "ACE_LOAD_HEAD":
+        if cmd in ("COLORFUL_ROUTE_SELECT", "COLORFUL_U1_ROUTE_SELECT"):
+            head = int(args.get("HEAD", "0"))
+            if "ACE" in args or "SLOT" in args:
+                if "ACE" not in args or "SLOT" not in args:
+                    raise ValueError("route select requires both ACE and SLOT")
+                ace = int(args.get("ACE", "0"))
+                slot = int(args.get("SLOT", "0"))
+                _check_load_route(state, head, ace, slot)
+                _set_head_loaded(state, head, ace, slot)
+        elif cmd == "ACE_LOAD_HEAD":
             if "HEAD" not in args or "ACE" not in args or "SLOT" not in args:
                 raise ValueError("ACE_LOAD_HEAD requires HEAD, ACE and SLOT")
             head = int(args.get("HEAD", "0"))

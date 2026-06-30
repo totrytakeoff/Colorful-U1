@@ -2,6 +2,55 @@
 
 日期：2026-06-08
 
+## 2026-06-30 route-select 命令名与 P3 风扇过滤
+
+实机打印 `竖着.gcode` 时出现两类日志：
+
+```text
+Unknown command:"COLORFUL_U1"
+M106: Unsupported fan ID: 3
+extruder below minimum temp, temperature: 169.75
+```
+
+定位结论：
+
+- 后处理器写入了 `COLORFUL_U1_ROUTE_SELECT ...`。
+- Snapmaker/Klipper 的 G-code parser 按 `([A-Z_]+|[A-Z*/])` 拆命令，
+  `COLORFUL_U1_ROUTE_SELECT` 会被拆成命令 `COLORFUL_U1`，因此注册
+  `COLORFUL_U1_ROUTE_SELECT` 没有效果。
+- route-select 本应执行真实 head 选择和可选 `ACE_SWAP_HEAD`。它失效后，切片
+  G-code 仍继续执行换色后的冷却/挤出段，可能在已经被 `M104 S70 ... ;cooldown`
+  降温的喷嘴上挤出，最终触发 `min_extrude_temp=170` 保护。
+- `M106 P3 S200` 来自 Snapmaker Orca 的 `filament start gcode` 段；同一段前后
+  已经有 `M106 P2 ...` 和默认 `M106 ...`。当前实机 Klipper 不支持 fan id `P3`，
+  因此会持续报 `Unsupported fan ID: 3`。
+
+修复规则：
+
+- 新生成的 object-aware route 命令统一改为 `COLORFUL_ROUTE_SELECT`，避免命令名
+  中间出现数字。
+- Klipper 侧保留 `COLORFUL_U1` legacy shim，用于识别旧文件中的
+  `COLORFUL_U1_ROUTE_SELECT` 并转发到同一套 route-select 逻辑；旧文件仍建议重新
+  后处理生成。
+- 后处理器继续能解析旧 `COLORFUL_U1_ROUTE_SELECT`，用于去重/兼容历史文件。
+- 后处理器把 `M106 P3 ...` 改写为注释：
+
+```gcode
+; COLORFUL_FILTERED_UNSUPPORTED_FAN M106 P3 S200
+```
+
+选择过滤而不是映射的原因：
+
+- 当前文件中已经存在 `M106 P2 ...`，强行把 P3 映射到 P2 可能改变冷却语义。
+- P3 在当前固件上没有可执行对象，裸发送只会制造错误日志。
+- 注释保留原始命令，便于后续如果确认 P3 对应真实硬件通道，再显式实现映射。
+
+后续所有实机 G-code 回归必须断言：
+
+- 不再输出 `COLORFUL_U1_ROUTE_SELECT`。
+- 输出 `COLORFUL_ROUTE_SELECT`。
+- `M106 P3 ...` 不再作为可执行 G-code 进入最终文件。
+
 背景：在 Snapmaker U1 实机 `192.168.1.38` 上，用户通过
 `http://192.168.1.38/multiace/` Web 页面上传并发送打印时，连续触发
 Z 轴相关报错；同类任务通过官方切片软件直接发送可以正常打印。

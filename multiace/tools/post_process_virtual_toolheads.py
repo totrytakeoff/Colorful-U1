@@ -330,7 +330,7 @@ def _object_hex(object_name):
 
 def _route_select_command(head, ace=None, slot=None, object_name=None,
                           slicer_tool=None):
-    parts = ['COLORFUL_U1_ROUTE_SELECT']
+    parts = ['COLORFUL_ROUTE_SELECT']
     if slicer_tool is not None:
         parts.append('TOOL=%d' % int(slicer_tool))
     parts.append('HEAD=%d' % int(head))
@@ -398,7 +398,9 @@ def _parse_ace_route_command(cmd):
     if m_swap:
         return (int(m_swap.group(1)), int(m_swap.group(2)),
                 int(m_swap.group(3)))
-    m_route = re.match(r'^COLORFUL_U1_ROUTE_SELECT\b(.*)$', stripped)
+    m_route = re.match(
+        r'^(?:COLORFUL_ROUTE_SELECT|COLORFUL_U1_ROUTE_SELECT)\b(.*)$',
+        stripped)
     if not m_route:
         return None
     params = {}
@@ -511,6 +513,14 @@ def _initial_marker(head, ace, slot):
     return '; multiACE initial-load HEAD=%d ACE=%d SLOT=%d' % (
         head, ace, slot)
 
+def _filter_unsupported_fan_line(line):
+    stripped = str(line).strip()
+    if not re.match(r'^M106\b', stripped, re.IGNORECASE):
+        return line
+    if not re.search(r'(?<![A-Za-z])P3\b', stripped, re.IGNORECASE):
+        return line
+    return '; COLORFUL_FILTERED_UNSUPPORTED_FAN %s' % stripped
+
 def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
     ace_targets = _normalize_ace_targets(ace_targets)
     tool_targets = _normalize_tool_targets(tool_targets)
@@ -573,6 +583,9 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
 
     pre = re.sub(r'^T(1[0-5]|[0-9])\s*$',
                  _expand_initial, pre, flags=re.MULTILINE)
+    pre = '\n'.join(
+        _filter_unsupported_fan_line(line)
+        for line in pre.splitlines())
 
     change_target_re = re.compile(
         r'^;\s*Change Tool\s*(\d+)\s*->\s*Tool\s*(\d+)')
@@ -624,7 +637,7 @@ def rewrite(gcode, ace_targets=None, tool_targets=None, route_plan=None):
                         tool, route_cursor, ace_targets, tool_targets),
                     slicer_tool=tool, object_name=current_object))
             continue
-        body_lines.append(line)
+        body_lines.append(_filter_unsupported_fan_line(line))
     body = '\n'.join(body_lines)
 
     head_loaded = {}

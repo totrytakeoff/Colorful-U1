@@ -3,6 +3,7 @@ import logging.handlers
 import json
 import math
 import queue
+import re
 import threading
 import traceback
 import os
@@ -757,8 +758,11 @@ class MultiAce:
             'ACE_SWAP_HEAD', self.cmd_ACE_SWAP_HEAD,
             desc=self.cmd_ACE_SWAP_HEAD_help)
         self.gcode.register_command(
-            'COLORFUL_U1_ROUTE_SELECT', self.cmd_COLORFUL_U1_ROUTE_SELECT,
-            desc=self.cmd_COLORFUL_U1_ROUTE_SELECT_help)
+            'COLORFUL_ROUTE_SELECT', self.cmd_COLORFUL_ROUTE_SELECT,
+            desc=self.cmd_COLORFUL_ROUTE_SELECT_help)
+        self.gcode.register_command(
+            'COLORFUL_U1', self.cmd_COLORFUL_U1,
+            desc=self.cmd_COLORFUL_U1_help)
         self.gcode.register_command(
             'ACE_HEAD_STATUS', self.cmd_ACE_HEAD_STATUS,
             desc=self.cmd_ACE_HEAD_STATUS_help)
@@ -6257,9 +6261,9 @@ class MultiAce:
         self._audit_state('SWITCH_TARGET', {'target_ace': ace_index})
         return True
 
-    cmd_COLORFUL_U1_ROUTE_SELECT_help = (
+    cmd_COLORFUL_ROUTE_SELECT_help = (
         '[Colorful-U1] Object-aware route tool/source select. '
-        'Usage: COLORFUL_U1_ROUTE_SELECT TOOL=0 HEAD=0 [ACE=0 SLOT=0] '
+        'Usage: COLORFUL_ROUTE_SELECT TOOL=0 HEAD=0 [ACE=0 SLOT=0] '
         '[OBJECT_HEX=<utf8-hex>]')
     def _route_object_from_gcmd(self, gcmd):
         object_hex = str(gcmd.get('OBJECT_HEX', '') or '').strip()
@@ -6296,7 +6300,7 @@ class MultiAce:
             excluded_names = set(str(v) for v in excluded)
         return str(object_name) in excluded_names
 
-    def cmd_COLORFUL_U1_ROUTE_SELECT(self, gcmd):
+    def _run_colorful_route_select(self, gcmd):
         head = gcmd.get_int('HEAD')
         ace_index = gcmd.get_int('ACE', None)
         slot = gcmd.get_int('SLOT', None)
@@ -6315,11 +6319,42 @@ class MultiAce:
         if ace_index is not None or slot is not None:
             if ace_index is None or slot is None:
                 raise gcmd.error(
-                    '[Colorful-U1] COLORFUL_U1_ROUTE_SELECT requires both '
+                    '[Colorful-U1] COLORFUL_ROUTE_SELECT requires both '
                     'ACE and SLOT for ACE source routes')
             self.gcode.run_script_from_command(
                 'ACE_SWAP_HEAD HEAD=%d ACE=%d SLOT=%d'
                 % (head, ace_index, slot))
+
+    def cmd_COLORFUL_ROUTE_SELECT(self, gcmd):
+        self._run_colorful_route_select(gcmd)
+
+    cmd_COLORFUL_U1_help = (
+        '[Colorful-U1] Legacy compatibility for old '
+        'COLORFUL_U1_ROUTE_SELECT G-code')
+    def cmd_COLORFUL_U1(self, gcmd):
+        raw = ''
+        try:
+            raw = gcmd.get_raw_command_parameters()
+        except Exception:
+            raw = ''
+        if str(raw).lstrip().startswith('_ROUTE_SELECT'):
+            params = {}
+            for key, value in re.findall(
+                    r'([A-Z_]+)=([^ \t;]+)', str(raw).upper()):
+                params[key] = value.strip()
+            commandline = 'COLORFUL_ROUTE_SELECT ' + ' '.join(
+                '%s=%s' % (key, value)
+                for key, value in params.items())
+            clean_gcmd = self.gcode.create_gcode_command(
+                'COLORFUL_ROUTE_SELECT', commandline, params)
+            logging.info(
+                '[Colorful-U1] legacy COLORFUL_U1_ROUTE_SELECT received; '
+                're-run post-processor to emit COLORFUL_ROUTE_SELECT')
+            self._run_colorful_route_select(clean_gcmd)
+            return
+        raise gcmd.error(
+            '[Colorful-U1] Unknown legacy COLORFUL_U1 command. '
+            'Use COLORFUL_ROUTE_SELECT.')
 
     cmd_ACE_HEAD_STATUS_help = '[multiACE] Show active ACE, detected devices, and head-to-ACE/slot mapping'
     def cmd_ACE_HEAD_STATUS(self, gcmd):

@@ -517,7 +517,7 @@ def uploaded_content(filename: str) -> str:
 
 def route_select(head: int, ace: int | None = None, slot: int | None = None,
                  tool: int | None = None, obj: str | None = None) -> str:
-    parts = ["COLORFUL_U1_ROUTE_SELECT"]
+    parts = ["COLORFUL_ROUTE_SELECT"]
     if tool is not None:
         parts.append(f"TOOL={tool}")
     parts.append(f"HEAD={head}")
@@ -3318,6 +3318,59 @@ def test_route_plan_rewrite_wraps_object_route_select() -> None:
     assert_true(active == 1, f"object route active swap mismatch: {active}")
 
 
+def test_route_select_command_name_and_fan_filter() -> None:
+    pp = load_postprocessor()
+    route_plan = {
+        "version": 2,
+        "events": [{
+            "index": 0,
+            "event_type": "tool_select",
+            "slicer_tool": 1,
+            "source": "ace:0:1",
+            "head": "head:0",
+            "steps": [
+                {"kind": "select_head", "head": "head:0", "command": "T0"},
+                {
+                    "kind": "swap_source",
+                    "source": "ace:0:1",
+                    "head": "head:0",
+                    "ace": 0,
+                    "slot": 1,
+                    "command": "ACE_SWAP_HEAD HEAD=0 ACE=0 SLOT=1",
+                },
+            ],
+            "target": {
+                "kind": "ace", "head": 0, "source": "ace:0:1",
+                "ace": 0, "slot": 1,
+            },
+        }],
+    }
+    src = gcode(
+        "PLA;PETG",
+        "#dc2828;#1e78dc",
+        """
+        ; Change Tool 0 -> Tool 1
+        T1
+        M106 P2 S178
+        M106 P3 S200
+        G1 X10 Y10 E1
+        """,
+    )
+    out, active, _skipped, _swapbacks = pp.rewrite(src, route_plan=route_plan)
+    assert_true(route_select(0, ace=0, slot=1, tool=1) in out,
+                f"route select should use Klipper-safe command name: {out}")
+    assert_true("COLORFUL_U1_ROUTE_SELECT" not in out,
+                f"legacy command name should not be emitted: {out}")
+    assert_true("M106 P2 S178" in out,
+                f"supported fan channel should be preserved: {out}")
+    assert_true("; COLORFUL_FILTERED_UNSUPPORTED_FAN M106 P3 S200" in out,
+                f"unsupported P3 fan command should be filtered: {out}")
+    assert_true(active == 1, f"active route count mismatch: {active}")
+    assert_true(pp._parse_ace_route_command(
+        "COLORFUL_U1_ROUTE_SELECT TOOL=1 HEAD=0 ACE=0 SLOT=1"
+    ) == (0, 0, 1), "legacy route command should remain parseable")
+
+
 def test_route_plan_rewrite_forces_physical_heater_map() -> None:
     pp = load_postprocessor()
     route_plan = {
@@ -3780,6 +3833,7 @@ def main() -> int:
         test_native_slot_empty_when_head_current_source_is_ace,
         test_route_plan_only_rewrite,
         test_route_plan_rewrite_wraps_object_route_select,
+        test_route_select_command_name_and_fan_filter,
         test_route_plan_rewrite_forces_physical_heater_map,
         test_route_plan_only_rewrite_rejects_missing_event,
         test_route_plan_only_rewrite_rejects_missing_target,
