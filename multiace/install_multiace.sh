@@ -414,6 +414,7 @@ p, authline = sys.argv[1], sys.argv[2]
 s = open(p).read()
 auth = (authline + "\n") if authline else ""
 block = ("    location /multiace/ {\n" + auth +
+         "        access_log off;\n"
          "        proxy_pass http://127.0.0.1:7126/;\n"
          "        proxy_http_version 1.1;\n"
          "        proxy_set_header Host $host;\n"

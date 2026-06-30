@@ -4,6 +4,7 @@ const API = `${BASE}/api`;
 const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
              + location.host + `${BASE}/ws`;
 const SCREEN = "/screen";
+const SCREEN_POLL_MS = 1000;
 createApp({
   setup() {
     const _validTabs = new Set(["dashboard", "config"]);
@@ -1869,10 +1870,15 @@ createApp({
     let screenTimer = null;
     function _updateScreenTimer() {
       clearInterval(screenTimer);
-      const wantPoll = screenAvailable.value && screenPopout.value;
-      if (wantPoll) screenTimer = setInterval(pollScreen, 200);
+      screenTimer = null;
+      const wantPoll = screenAvailable.value && screenPopout.value && !document.hidden;
+      if (wantPoll) {
+        pollScreen();
+        screenTimer = setInterval(pollScreen, SCREEN_POLL_MS);
+      }
     }
     watch([screenPopout, screenAvailable], _updateScreenTimer, {immediate: true});
+    document.addEventListener("visibilitychange", _updateScreenTimer);
     const uploading = ref(false);
     const uploadInput = ref(null);
     const preflight = reactive({
