@@ -3,6 +3,7 @@ const { createApp, ref, reactive, computed, onMounted, watch, nextTick } = Vue;
 const BASE = location.pathname.startsWith("/multiace/") ? "/multiace" : "";
 const API = `${BASE}/api`;
 const SCREEN = "/screen";
+const SCREEN_POLL_MS = 1000;
 const GCODE_PREVIEW_BYTES = 16 * 1024 * 1024;
 const GCODE_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MATERIAL_OPTIONS = [
@@ -869,7 +870,7 @@ createApp({
       return [screenCanvas.value, floatScreenCanvas.value].filter(Boolean);
     }
     async function pollScreen() {
-      if (screenBusy || !screenAvailable.value) return;
+      if (screenBusy || !screenAvailable.value || document.hidden) return;
       const canvases = liveScreenCanvases();
       if (!canvases.length) return;
       screenBusy = true;
@@ -902,7 +903,10 @@ createApp({
     }
     function startScreenPolling() {
       clearInterval(screenTimer);
-      screenTimer = setInterval(pollScreen, 250);
+      screenTimer = 0;
+      if (document.hidden) return;
+      pollScreen();
+      screenTimer = setInterval(pollScreen, SCREEN_POLL_MS);
     }
     function screenCoords(ev) {
       const canvas = ev.currentTarget;
@@ -1924,6 +1928,7 @@ createApp({
       await Promise.allSettled([loadConfig(), refreshDebugState()]);
       await loadRoutePlanHistory();
       startScreenPolling();
+      document.addEventListener("visibilitychange", startScreenPolling);
       setInterval(() => {
         if (!busy.refresh) Promise.allSettled([reloadState(), reloadSourceState(), reloadOperation()]);
       }, 3000);
